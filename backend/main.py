@@ -23,6 +23,8 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_CALLER_ID = os.getenv("TWILIO_CALLER_ID")
 TWILIO_TWIML_APP_SID = os.getenv("TWILIO_TWIML_APP_SID")
+TWILIO_API_KEY_SID = os.getenv("TWILIO_API_KEY_SID")
+TWILIO_API_KEY_SECRET = os.getenv("TWILIO_API_KEY_SECRET")
 GOOGLE_SHEETS_API_KEY = os.getenv("GOOGLE_SHEETS_API_KEY")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
@@ -72,9 +74,9 @@ async def generate_tts(req: TTSRequest):
 
 @app.get("/api/twilio/token")
 async def get_twilio_token():
-    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_TWIML_APP_SID]):
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, TWILIO_TWIML_APP_SID]):
         raise HTTPException(status_code=500, detail="Twilio credentials not set in .env")
-    token = AccessToken(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_TWIML_APP_SID, identity="odelyn")
+    token = AccessToken(TWILIO_ACCOUNT_SID, TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, identity="odelyn")
     grant = VoiceGrant(outgoing_application_sid=TWILIO_TWIML_APP_SID, incoming_allow=False)
     token.add_grant(grant)
     return JSONResponse({"token": token.to_jwt()})

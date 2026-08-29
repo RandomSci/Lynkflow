@@ -427,16 +427,16 @@ async function initTwilio() {
     const res = await fetch(`${API}/api/twilio/token`);
     const data = await res.json();
     twilioDevice = new Twilio.Device(data.token, { codecPreferences: ['opus', 'pcmu'] });
-    twilioDevice.on('ready', () => updateDialerStatus('Ready to call', 'ready'));
+    await twilioDevice.register();
+    updateDialerStatus('Ready to call', 'ready');
     twilioDevice.on('error', (err) => updateDialerStatus(`Error: ${err.message}`, 'error'));
-    twilioDevice.on('connect', () => updateDialerStatus('Call connected', 'active'));
     twilioDevice.on('disconnect', () => {
       updateDialerStatus('Call ended', 'ready');
       activeCall = null;
       updateCallBtn(false);
     });
   } catch (e) {
-    updateDialerStatus('Failed to connect to Twilio', 'error');
+    updateDialerStatus(`Failed to connect: ${e.message}`, 'error');
   }
 }
 
@@ -569,9 +569,18 @@ function handleCallBtn() {
   const number = document.getElementById('dialerInput')?.value.trim();
   if (!number) return updateDialerStatus('Enter a phone number first', 'error');
   if (!twilioDevice) return updateDialerStatus('Twilio not ready yet', 'error');
-  activeCall = twilioDevice.connect({ To: number });
-  updateCallBtn(true);
-  updateDialerStatus(`Calling ${number}...`, 'calling');
+  twilioDevice.connect({ params: { To: number } }).then(call => {
+    activeCall = call;
+    updateCallBtn(true);
+    updateDialerStatus(`Calling ${number}...`, 'calling');
+    call.on('accept', () => updateDialerStatus('Call connected', 'active'));
+    call.on('disconnect', () => {
+      updateDialerStatus('Call ended', 'ready');
+      activeCall = null;
+      updateCallBtn(false);
+    });
+    call.on('error', (err) => updateDialerStatus(`Call error: ${err.message}`, 'error'));
+  }).catch(err => updateDialerStatus(`Failed to call: ${err.message}`, 'error'));
 }
 
 init();
