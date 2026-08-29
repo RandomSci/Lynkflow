@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lynkflow — Agent Training Hub</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">
+        <div class="logo-mark">L</div>
+        <div>
+          <div class="logo-name">Lynkflow</div>
+          <div class="logo-sub">Training Hub</div>
+        </div>
+      </div>
+      <button class="theme-toggle" id="themeToggle" title="Toggle theme">☀️</button>
+    </div>
+
+    <nav class="sidebar-nav" id="sidebarNav"></nav>
+
+    <div class="sidebar-footer">
+      <div class="agent-badge">
+        <div class="agent-avatar">O</div>
+        <div>
+          <div class="agent-name">Odelyn Jayme</div>
+          <div class="agent-role">Sales Agent</div>
+        </div>
+        <div class="status-dot"></div>
+      </div>
+    </div>
+  </aside>
+
+  <div class="mobile-topbar">
+    <button class="menu-btn" id="menuBtn">☰</button>
+    <div class="mobile-logo">Lynkflow Training</div>
+  </div>
+
+  <main class="main">
+    <div class="content-area" id="contentArea">
+      <div class="welcome-screen">
+        <div class="welcome-eyebrow">Agent Training Portal</div>
+        <h1 class="welcome-title">Ready to close some plumbers?</h1>
+        <p class="welcome-desc">Pick a module from the sidebar. Go in order if it's your first time. Each section has the script, sample audio, and everything you need to handle any situation on a call.</p>
+        <div class="welcome-grid">
+          <div class="step-card"><span class="step-num">1</span> Read the overview</div>
+          <div class="step-card"><span class="step-num">2</span> Study the script</div>
+          <div class="step-card"><span class="step-num">3</span> Play the sample</div>
+          <div class="step-card"><span class="step-num">4</span> Practice out loud</div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div class="overlay" id="overlay"></div>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
