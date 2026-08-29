@@ -526,7 +526,7 @@ function renderLeads(list) {
     el.innerHTML = `<div class="lead-loading">No leads found.</div>`;
     return;
   }
-  el.innerHTML = list.map((l, i) => `
+  el.innerHTML = list.map((l) => `
     <div class="lead-row" onclick="selectLead(${leads.indexOf(l)})">
       <div class="lead-main">
         <div class="lead-name">${l['Name'] || 'Unknown'}</div>
