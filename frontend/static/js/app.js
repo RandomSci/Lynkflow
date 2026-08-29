@@ -471,6 +471,7 @@ async function loadDialer() {
       <div class="card dialer-card">
         <div class="card-label">Active Call</div>
         <div id="dialerStatus" class="dialer-status dialer-status--loading">Connecting to Twilio...</div>
+        <div class="dialer-caller-id">Calling from: <strong>+1 (978) 684-3590</strong></div>
         <div class="dialer-number-row">
           <input id="dialerInput" class="dialer-input" type="tel" placeholder="+1 (555) 000-0000" />
           <button id="callBtn" class="call-btn call-btn--start" onclick="handleCallBtn()">📞 Call</button>
@@ -573,14 +574,30 @@ function handleCallBtn() {
     activeCall = call;
     updateCallBtn(true);
     updateDialerStatus(`Calling ${number}...`, 'calling');
-    call.on('accept', () => updateDialerStatus('Call connected', 'active'));
+    call.on('ringing', () => updateDialerStatus('Ringing...', 'calling'));
+    call.on('accept', () => updateDialerStatus('Call in progress', 'active'));
     call.on('disconnect', () => {
       updateDialerStatus('Call ended', 'ready');
       activeCall = null;
       updateCallBtn(false);
+      markCurrentLeadCalled();
     });
     call.on('error', (err) => updateDialerStatus(`Call error: ${err.message}`, 'error'));
   }).catch(err => updateDialerStatus(`Failed to call: ${err.message}`, 'error'));
 }
 
 init();
+function markCurrentLeadCalled() {
+  const raw = (document.getElementById('dialerInput')?.value || '').replace(/\D/g, '');
+  const number = raw.length === 11 && raw.startsWith('1') ? raw.slice(1) : raw;
+  if (!number) return;
+  leads = leads.map(l => {
+    const lp = (l['Phone'] || '').replace(/\D/g, '');
+    const lp10 = lp.length === 11 && lp.startsWith('1') ? lp.slice(1) : lp;
+    if (lp10 === number) return { ...l, Status: 'Called' };
+    return l;
+  });
+  const searchVal = document.getElementById('leadSearch')?.value || '';
+  if (searchVal) filterLeads();
+  else renderLeads(leads);
+}

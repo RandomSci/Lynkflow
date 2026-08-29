@@ -600,3 +600,109 @@ audio { width: 100%; height: 38px; border-radius: var(--radius-sm); accent-color
 
 .fade-in { animation: fadeIn 0.2s ease; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+/* DIALER */
+.dialer-status {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 14px;
+}
+.dialer-status--ready { background: var(--green-dim); color: var(--green); }
+.dialer-status--loading { background: var(--tag-bg); color: var(--text-2); }
+.dialer-status--active { background: var(--green-dim); color: var(--green); }
+.dialer-status--calling { background: var(--accent-dim); color: var(--accent); }
+.dialer-status--error { background: rgba(239,68,68,0.1); color: var(--red); }
+.dialer-number-row { display: flex; gap: 10px; align-items: center; }
+.dialer-input {
+  flex: 1;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--text);
+  outline: none;
+  transition: border-color var(--transition);
+}
+.dialer-input:focus { border-color: var(--border-focus); }
+.call-btn {
+  padding: 10px 20px;
+  border-radius: var(--radius-sm);
+  border: none;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all var(--transition);
+  white-space: nowrap;
+}
+.call-btn--start { background: var(--green); color: #fff; }
+.call-btn--start:hover { opacity: 0.85; }
+.call-btn--end { background: var(--red); color: #fff; }
+.call-btn--end:hover { opacity: 0.85; }
+.active-lead-info {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: var(--bg-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+.active-lead-name { font-size: 15px; font-weight: 700; margin-bottom: 3px; }
+.active-lead-meta { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+.active-lead-meta a { color: var(--accent); text-decoration: none; }
+.lead-search-row { margin-bottom: 12px; }
+.lead-search-row .dialer-input { width: 100%; flex: none; }
+.lead-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 480px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.lead-loading { padding: 20px; text-align: center; font-size: 13px; color: var(--text-3); }
+.lead-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background var(--transition);
+  gap: 12px;
+}
+.lead-row:last-child { border-bottom: none; }
+.lead-row:hover { background: var(--bg-3); }
+.lead-row.selected { background: var(--accent-dim); }
+.lead-main { flex: 1; min-width: 0; }
+.lead-name { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lead-meta { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+.lead-right { flex-shrink: 0; text-align: right; }
+.lead-phone { font-size: 12px; font-family: monospace; color: var(--text-2); margin-bottom: 4px; }
+.lead-status-pill {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 100px;
+  background: var(--tag-bg);
+  color: var(--tag-text);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.lead-status-pill.called { background: var(--accent-dim); color: var(--accent); }
+.lead-status-pill.sale { background: var(--green-dim); color: var(--green); }
+.lead-status-pill.dnc { background: rgba(239,68,68,0.1); color: var(--red); }
+.dialer-caller-id {
+  font-size: 12px;
+  color: var(--text-2);
+  margin-bottom: 10px;
+  padding: 6px 10px;
+  background: var(--bg-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+.dialer-caller-id strong { color: var(--text); }

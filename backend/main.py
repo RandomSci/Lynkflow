@@ -1,7 +1,7 @@
 import os
 import hashlib
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,7 +40,11 @@ class TTSRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return FileResponse(Path(__file__).parent.parent / "frontend" / "index.html")
+    response = FileResponse(Path(__file__).parent.parent / "frontend" / "index.html")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.post("/api/tts")
@@ -83,12 +87,14 @@ async def get_twilio_token():
 
 
 @app.post("/api/twilio/voice")
-async def twiml_voice(To: str = ""):
+async def twiml_voice(request: Request):
+    from fastapi.responses import Response
+    form = await request.form()
+    to = form.get("To", "")
     response = VoiceResponse()
     dial = Dial(caller_id=TWILIO_CALLER_ID)
-    dial.number(To)
+    dial.number(to)
     response.append(dial)
-    from fastapi.responses import Response
     return Response(content=str(response), media_type="application/xml")
 
 
