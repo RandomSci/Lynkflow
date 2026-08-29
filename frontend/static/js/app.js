@@ -44,6 +44,7 @@ function renderNav() {
     { label: 'Handling', ids: ['objections', 'faqs', 'difficult_calls'] },
     { label: 'Closing', ids: ['close', 'voicemail', 'callback'] },
     { label: 'Reference', ids: ['dispositions'] },
+    { label: 'Practice', ids: ['simulations'] },
   ];
 
   sections.forEach(sec => {
@@ -101,6 +102,7 @@ function loadModule(id) {
     difficult_calls: buildDifficultCallsPage,
     faqs: buildFaqsPage,
     close: buildClosePage,
+    simulations: buildSimulationsPage,
   };
 
   const builder = builders[mod.id] || buildStandardPage;
@@ -602,4 +604,72 @@ function markCurrentLeadCalled() {
   const searchVal = document.getElementById('leadSearch')?.value || '';
   if (searchVal) filterLeads();
   else renderLeads(leads);
+}
+
+function buildSimulationsPage(mod) {
+  const frag = document.createDocumentFragment();
+  frag.appendChild(moduleHeader(mod));
+  frag.appendChild(card('Overview', `<p class="explanation-text">${mod.explanation}</p>`));
+  frag.appendChild(card('Key tips', tipsHtml(mod.tips)));
+
+  const simCard = document.createElement('div');
+  simCard.className = 'card';
+  simCard.innerHTML = `<div class="card-label">Choose a scenario</div>`;
+
+  const tabs = document.createElement('div');
+  tabs.className = 'objection-tabs';
+  mod.scenarios.forEach((scenario, i) => {
+    const tab = document.createElement('button');
+    tab.className = 'obj-tab' + (i === 0 ? ' active' : '');
+    tab.textContent = scenario.label;
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.obj-tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      renderSimContent(scenario);
+    });
+    tabs.appendChild(tab);
+  });
+  simCard.appendChild(tabs);
+
+  const simContent = document.createElement('div');
+  simContent.id = 'simContent';
+  simCard.appendChild(simContent);
+  frag.appendChild(simCard);
+
+  setTimeout(() => renderSimContent(mod.scenarios[0]), 0);
+  return frag;
+}
+
+function renderSimContent(scenario) {
+  const wrap = document.getElementById('simContent');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+
+  const desc = document.createElement('p');
+  desc.className = 'explanation-text';
+  desc.style.marginBottom = '16px';
+  desc.textContent = scenario.description;
+  wrap.appendChild(desc);
+
+  scenario.exchanges.forEach(ex => {
+    const row = document.createElement('div');
+    row.className = `sim-row sim-row--${ex.speaker}`;
+
+    if (ex.speaker === 'plumber') {
+      row.innerHTML = `
+        <div class="sim-speaker sim-speaker--plumber">🔧 Plumber says:</div>
+        <div class="sim-text sim-text--plumber">${ex.text}</div>
+      `;
+    } else {
+      const isNote = !ex.audio_id;
+      const playSection = !isNote ? buildPlaySection(ex.audio_id, ex.text, "Play Odelyn's response") : '';
+      row.innerHTML = `
+        <div class="sim-speaker sim-speaker--odelyn">${isNote ? '📋 Note:' : '🎙️ Odelyn says:'}</div>
+        <div class="sim-text sim-text--odelyn">${ex.text}</div>
+        ${playSection}
+      `;
+    }
+    wrap.appendChild(row);
+    row.querySelectorAll('.play-btn').forEach(btn => btn.addEventListener('click', () => handlePlay(btn)));
+  });
 }
