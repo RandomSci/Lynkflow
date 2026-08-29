@@ -8,6 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from dotenv import load_dotenv
+from twilio.jwt.access_token import AccessToken
+from twilio.jwt.access_token.grants import VoiceGrant
+from twilio.twiml.voice_response import VoiceResponse, Dial
 
 load_dotenv()
 
@@ -15,6 +18,13 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 AUDIO_CACHE_DIR = Path(__file__).parent.parent / "frontend" / "static" / "audio"
 AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_CALLER_ID = os.getenv("TWILIO_CALLER_ID")
+TWILIO_TWIML_APP_SID = os.getenv("TWILIO_TWIML_APP_SID")
+GOOGLE_SHEETS_API_KEY = os.getenv("GOOGLE_SHEETS_API_KEY")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -58,6 +68,50 @@ async def generate_tts(req: TTSRequest):
 
     audio_path.write_bytes(resp.content)
     return JSONResponse({"url": f"/static/audio/{cache_key}.mp3", "cached": False})
+
+
+@app.get("/api/twilio/token")
+async def get_twilio_token():
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_TWIML_APP_SID]):
+        raise HTTPException(status_code=500, detail="Twilio credentials not set in .env")
+    token = AccessToken(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_TWIML_APP_SID, identity="odelyn")
+    grant = VoiceGrant(outgoing_application_sid=TWILIO_TWIML_APP_SID, incoming_allow=False)
+    token.add_grant(grant)
+    return JSONResponse({"token": token.to_jwt()})
+
+
+@app.post("/api/twilio/voice")
+async def twiml_voice(To: str = ""):
+    response = VoiceResponse()
+    dial = Dial(caller_id=TWILIO_CALLER_ID)
+    dial.number(To)
+    response.append(dial)
+    from fastapi.responses import Response
+    return Response(content=str(response), media_type="application/xml")
+
+
+@app.get("/api/leads")
+async def get_leads():
+    if not GOOGLE_SHEETS_API_KEY or not GOOGLE_SHEET_ID:
+        raise HTTPException(status_code=500, detail="Google Sheets credentials not set in .env")
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/Sheet1?key={GOOGLE_SHEETS_API_KEY}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Sheets error: {resp.text}")
+    data = resp.json()
+    rows = data.get("values", [])
+    if len(rows) < 2:
+        return JSONResponse([])
+    headers = rows[0]
+    leads = []
+    for row in rows[1:]:
+        lead = {}
+        for i, h in enumerate(headers):
+            lead[h.strip()] = row[i].strip() if i < len(row) else ""
+        if lead.get("Phone"):
+            leads.append(lead)
+    return JSONResponse(leads)
 
 
 @app.get("/api/modules")

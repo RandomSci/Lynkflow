@@ -2,6 +2,9 @@ const API = '';
 let modules = [];
 let activeModuleId = null;
 const THEME_KEY = 'lynkflow_theme';
+let twilioDevice = null;
+let activeCall = null;
+let leads = [];
 
 async function init() {
   applyTheme(localStorage.getItem(THEME_KEY) || 'dark');
@@ -61,6 +64,18 @@ function renderNav() {
       nav.appendChild(item);
     });
   });
+
+  const dialerLabel = document.createElement('div');
+  dialerLabel.className = 'nav-section-label';
+  dialerLabel.textContent = 'Live Calling';
+  nav.appendChild(dialerLabel);
+
+  const dialerItem = document.createElement('div');
+  dialerItem.className = 'nav-item';
+  dialerItem.dataset.id = 'dialer';
+  dialerItem.innerHTML = `<span class="nav-icon">📞</span><span>Lead Dialer</span>`;
+  dialerItem.addEventListener('click', () => { loadDialer(); closeSidebar(); });
+  nav.appendChild(dialerItem);
 }
 
 function setActiveNav(id) {
@@ -405,6 +420,158 @@ function toggleSidebar() {
 function closeSidebar() {
   document.getElementById('sidebar')?.classList.remove('open');
   document.getElementById('overlay')?.classList.remove('visible');
+}
+
+async function initTwilio() {
+  try {
+    const res = await fetch(`${API}/api/twilio/token`);
+    const data = await res.json();
+    twilioDevice = new Twilio.Device(data.token, { codecPreferences: ['opus', 'pcmu'] });
+    twilioDevice.on('ready', () => updateDialerStatus('Ready to call', 'ready'));
+    twilioDevice.on('error', (err) => updateDialerStatus(`Error: ${err.message}`, 'error'));
+    twilioDevice.on('connect', () => updateDialerStatus('Call connected', 'active'));
+    twilioDevice.on('disconnect', () => {
+      updateDialerStatus('Call ended', 'ready');
+      activeCall = null;
+      updateCallBtn(false);
+    });
+  } catch (e) {
+    updateDialerStatus('Failed to connect to Twilio', 'error');
+  }
+}
+
+function updateDialerStatus(msg, state) {
+  const el = document.getElementById('dialerStatus');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = `dialer-status dialer-status--${state}`;
+}
+
+function updateCallBtn(calling) {
+  const btn = document.getElementById('callBtn');
+  if (!btn) return;
+  btn.textContent = calling ? '⏹ End Call' : '📞 Call';
+  btn.className = calling ? 'call-btn call-btn--end' : 'call-btn call-btn--start';
+}
+
+async function loadDialer() {
+  setActiveNav('dialer');
+  const area = document.getElementById('contentArea');
+  area.innerHTML = '';
+  area.className = 'content-area fade-in';
+
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `
+    <div class="module-header">
+      <div class="module-eyebrow">Live Calling</div>
+      <div class="module-title">📞 Lead Dialer</div>
+    </div>
+
+    <div class="dialer-top">
+      <div class="card dialer-card">
+        <div class="card-label">Active Call</div>
+        <div id="dialerStatus" class="dialer-status dialer-status--loading">Connecting to Twilio...</div>
+        <div class="dialer-number-row">
+          <input id="dialerInput" class="dialer-input" type="tel" placeholder="+1 (555) 000-0000" />
+          <button id="callBtn" class="call-btn call-btn--start" onclick="handleCallBtn()">📞 Call</button>
+        </div>
+        <div id="activeLeadInfo" class="active-lead-info" style="display:none"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-label">Lead List <span id="leadCount" style="font-weight:400;color:var(--text-3)"></span></div>
+      <div class="lead-search-row">
+        <input id="leadSearch" class="dialer-input" placeholder="Search by name, city, state..." oninput="filterLeads()" />
+      </div>
+      <div id="leadList" class="lead-list">
+        <div class="lead-loading">Loading leads...</div>
+      </div>
+    </div>
+  `;
+  area.appendChild(wrap);
+
+  if (!twilioDevice) await initTwilio();
+  else updateDialerStatus('Ready to call', 'ready');
+
+  await fetchLeads();
+}
+
+async function fetchLeads() {
+  try {
+    const res = await fetch(`${API}/api/leads`);
+    leads = await res.json();
+    document.getElementById('leadCount').textContent = `— ${leads.length} leads`;
+    renderLeads(leads);
+  } catch (e) {
+    document.getElementById('leadList').innerHTML = `<div class="lead-loading">Failed to load leads.</div>`;
+  }
+}
+
+function filterLeads() {
+  const q = document.getElementById('leadSearch')?.value.toLowerCase() || '';
+  const filtered = leads.filter(l =>
+    (l['Name'] || '').toLowerCase().includes(q) ||
+    (l['City'] || '').toLowerCase().includes(q) ||
+    (l['State'] || '').toLowerCase().includes(q) ||
+    (l['Category'] || '').toLowerCase().includes(q)
+  );
+  renderLeads(filtered);
+}
+
+function renderLeads(list) {
+  const el = document.getElementById('leadList');
+  if (!el) return;
+  if (!list.length) {
+    el.innerHTML = `<div class="lead-loading">No leads found.</div>`;
+    return;
+  }
+  el.innerHTML = list.map((l, i) => `
+    <div class="lead-row" onclick="selectLead(${leads.indexOf(l)})">
+      <div class="lead-main">
+        <div class="lead-name">${l['Name'] || 'Unknown'}</div>
+        <div class="lead-meta">${[l['City'], l['State']].filter(Boolean).join(', ')} ${l['Category'] ? '· ' + l['Category'] : ''}</div>
+      </div>
+      <div class="lead-right">
+        <div class="lead-phone">${l['Phone'] || ''}</div>
+        <div class="lead-status-pill ${(l['Status'] || '').toLowerCase()}">${l['Status'] || 'New'}</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function selectLead(idx) {
+  const lead = leads[idx];
+  if (!lead) return;
+  const phone = lead['Phone'].replace(/\D/g, '');
+  const formatted = phone.startsWith('1') ? `+${phone}` : `+1${phone}`;
+  document.getElementById('dialerInput').value = formatted;
+
+  const info = document.getElementById('activeLeadInfo');
+  info.style.display = 'block';
+  info.innerHTML = `
+    <div class="active-lead-name">${lead['Name'] || 'Unknown'}</div>
+    <div class="active-lead-meta">${[lead['Address'], lead['City'], lead['State']].filter(Boolean).join(', ')}</div>
+    ${lead['Website'] ? `<div class="active-lead-meta"><a href="${lead['Website']}" target="_blank">${lead['Website']}</a></div>` : ''}
+  `;
+
+  document.querySelectorAll('.lead-row').forEach(r => r.classList.remove('selected'));
+  document.querySelectorAll('.lead-row')[leads.indexOf(lead)] ?.classList.add('selected');
+}
+
+function handleCallBtn() {
+  if (activeCall) {
+    activeCall.disconnect();
+    activeCall = null;
+    updateCallBtn(false);
+    return;
+  }
+  const number = document.getElementById('dialerInput')?.value.trim();
+  if (!number) return updateDialerStatus('Enter a phone number first', 'error');
+  if (!twilioDevice) return updateDialerStatus('Twilio not ready yet', 'error');
+  activeCall = twilioDevice.connect({ To: number });
+  updateCallBtn(true);
+  updateDialerStatus(`Calling ${number}...`, 'calling');
 }
 
 init();
