@@ -565,6 +565,8 @@ function handleCallBtn() {
     activeCall.disconnect();
     activeCall = null;
     updateCallBtn(false);
+    updateDialerStatus('Call ended', 'ready');
+    markCurrentLeadCalled();
     return;
   }
   const number = document.getElementById('dialerInput')?.value.trim();
