@@ -54,6 +54,9 @@ class AgentCallHandler:
         self._last_partial = 0.0
         self._fanout_buf: list = []
         self._fanout_inflight = 0
+        self._speak_started = 0.0
+        self._nudges = 0
+        self._last_turn = time.time()
 
         self.stream_sid: Optional[str] = None
         self.call_sid:   Optional[str] = None
@@ -66,7 +69,7 @@ class AgentCallHandler:
         self._call_start  = time.time()
         self._speak_seq     = 0
         self._loud_frames   = 0      # consecutive frames above threshold
-        self._vad_threshold = 1800    # RMS level that counts as speech
+        self._vad_threshold = 2500    # RMS level that counts as speech
 
         self.end_phrases = [
             p.strip().lower()
@@ -110,16 +113,42 @@ class AgentCallHandler:
             await self._cleanup()
 
     async def _watchdog(self):
-        """Enforce silence timeout and max call duration."""
+        """Silence nudges, silence timeout, and max call duration."""
+        NUDGES = [
+            "Hello, can you hear me okay?",
+            "Sorry, I think we might have a bad connection. Are you still there?",
+        ]
         while not self._stop:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             now = time.time()
+
             if self.cfg.max_duration_s and (now - self._call_start) > self.cfg.max_duration_s:
                 print("[WATCHDOG] max duration reached")
                 await self._hangup()
                 break
-            if (self.cfg.silence_timeout_s
-                    and not self.is_speaking
+
+            # Nudge on dead air — only when the agent isn't speaking and the
+            # conversation has actually started
+            quiet = now - self._last_turn
+            if (not self.is_speaking and self.conversation and quiet > 6
+                    and self._nudges < len(NUDGES)):
+                line = NUDGES[self._nudges]
+                self._nudges += 1
+                self._last_turn = now
+                print(f"[NUDGE {self._nudges}] {line}")
+                self.conversation.append({"role": "assistant", "content": line})
+                await self._push_transcript("agent", line)
+                self._speak_seq += 1
+                await self._speak_chunk(line, self._speak_seq)
+                continue
+
+            # Give up after both nudges go unanswered
+            if self._nudges >= len(NUDGES) and quiet > 8:
+                print("[WATCHDOG] no response after nudges — hanging up")
+                await self._hangup()
+                break
+
+            if (self.cfg.silence_timeout_s and not self.is_speaking
                     and (now - self._last_audio) > self.cfg.silence_timeout_s):
                 print("[WATCHDOG] silence timeout")
                 await self._hangup()
@@ -183,7 +212,10 @@ class AgentCallHandler:
             if self.listeners:
                 self._fanout_nowait(payload, "prospect")
 
-            if self.is_speaking and self.cfg.allow_interruption:
+            # Grace period — never let barge-in kill the agent's first words.
+            # Echo and trailing speech from the prospect cause false triggers.
+            grace_ok = (time.time() - self._speak_started) > 0.9
+            if self.is_speaking and self.cfg.allow_interruption and grace_ok:
                 try:
                     pcm = audioop.ulaw2lin(raw, 2)
                     rms = audioop.rms(pcm, 2)
@@ -231,11 +263,15 @@ class AgentCallHandler:
         ]
         await self._push_transcript("agent", opening)
         self._speak_seq += 1
+        self._last_turn = time.time()
         await self._speak_chunk(opening, self._speak_seq)
 
     async def _handle_transcript(self, text: str):
         if not text.strip() or self._stop:
             return
+
+        self._last_turn = time.time()
+        self._nudges = 0
 
         if self._looks_like_ivr(text):
             self._ivr_hits += 1
@@ -248,11 +284,7 @@ class AgentCallHandler:
 
         self.conversation.append({"role": "user", "content": text})
 
-        my_seq = self._speak_seq
         response = await self._respond()
-        if my_seq != self._speak_seq and self._speak_seq > my_seq + 1:
-            print("[SKIP] superseded by newer turn")
-            return
         if not response:
             return
 
@@ -350,6 +382,7 @@ class AgentCallHandler:
             return
 
         self.is_speaking = True
+        self._speak_started = time.time()
         await self._push_status("speaking", "Agent speaking…")
 
         t0 = time.time()
@@ -486,7 +519,9 @@ class AgentCallHandler:
                     continue
 
                 # Barge-in — cancel current speech immediately
-                if self.is_speaking and self.cfg.allow_interruption and len(text) > 2:
+                grace_ok = (time.time() - self._speak_started) > 0.9
+                if (self.is_speaking and self.cfg.allow_interruption
+                        and grace_ok and len(text) > 4):
                     print(f"[DG] barge-in: {text}")
                     self._speak_seq += 1        # invalidates in-flight TTS
                     await self._stop_speaking()
