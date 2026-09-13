@@ -51,6 +51,7 @@ class AgentCallHandler:
         self.status_queue = status_queue
         self._ivr_hits = 0
         self.listeners: set = set()      # browser WebSockets listening in
+        self._last_partial = 0.0
 
         self.stream_sid: Optional[str] = None
         self.call_sid:   Optional[str] = None
@@ -283,11 +284,14 @@ class AgentCallHandler:
 
                         full += tok
                         buf  += tok
-                        # Stream partial agent text to the UI as it generates
-                        await self.status_queue.put({
-                            "type": "transcript_partial", "speaker": "agent",
-                            "text": full, "ts": datetime.now().strftime("%H:%M:%S"),
-                        })
+                        # Throttle partial updates to ~7/sec instead of per-token
+                        now = time.time()
+                        if now - self._last_partial > 0.15:
+                            self._last_partial = now
+                            await self.status_queue.put({
+                                "type": "transcript_partial", "speaker": "agent",
+                                "text": full, "ts": datetime.now().strftime("%H:%M:%S"),
+                            })
 
                         # Flush on sentence boundary (or early on first chunk)
                         limit = 25 if first_chunk else 90

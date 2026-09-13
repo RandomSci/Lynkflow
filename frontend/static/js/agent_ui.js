@@ -387,7 +387,15 @@ function startListening(callSid) {
     listenTime += buf.duration;
   };
 
-  listenSocket.onclose = () => { listenSocket = null; };
+  listenSocket.onclose = () => {
+    listenSocket = null;
+    // Call may still be ringing — the handler doesn't exist until answered.
+    if (agentCallSid) {
+      setTimeout(() => { if (agentCallSid && !listenSocket) startListening(agentCallSid); }, 1500);
+    } else {
+      setListenBtn(false);
+    }
+  };
   setListenBtn(true);
 }
 
@@ -555,6 +563,10 @@ function connectAgentEvents(callSid) {
       updateDialerStatus(data.message, map[data.state] || 'active');
       setAgentIndicator(data.state);
 
+      if (data.state === 'active' && !listenSocket && agentCallSid) {
+        startListening(agentCallSid);
+      }
+
       if (data.state === 'ended') {
         disconnectAgentEvents();
         agentCallSid = null;
@@ -690,10 +702,6 @@ async function injectAgentUI() {
   const dialerTop = document.querySelector('.dialer-top');
   if (!dialerTop) return;
   dialerTop.parentNode.insertBefore(buildAgentBar(), dialerTop);
-  panel.querySelector('#listenBtn').addEventListener('click', () => {
-    if (listenSocket) stopListening();
-    else if (agentCallSid) startListening(agentCallSid);
-  });
   dialerTop.after(buildTranscriptPanel());
   dialerTop.after(buildAgentOptions());
   applyAgentMode();
