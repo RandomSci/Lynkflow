@@ -121,16 +121,13 @@ class AgentCallHandler:
 
     # ── Twilio events ────────────────────────────────────────────────────────
 
-    async def _fanout(self, payload_b64: str, who: str):
-        """Push a frame to browser listeners — fire and forget, never blocks."""
+    def _fanout_nowait(self, payload_b64: str, who: str):
+        """Fire-and-forget frame push to browser listeners. Never awaits."""
         if not self.listeners:
             return
         msg = json.dumps({"t": who, "a": payload_b64})
         for ws in list(self.listeners):
-            try:
-                asyncio.create_task(self._safe_send(ws, msg))
-            except Exception:
-                self.listeners.discard(ws)
+            asyncio.create_task(self._safe_send(ws, msg))
 
     async def _safe_send(self, ws, msg: str):
         try:
@@ -146,8 +143,17 @@ class AgentCallHandler:
 
         elif evt == "start":
             self.stream_sid = data.get("streamSid")
-            self.call_sid   = data.get("start", {}).get("callSid")
-            print(f"[STREAM START] {self.call_sid}")
+            start = data.get("start", {})
+            self.call_sid = start.get("callSid")
+            cp = start.get("customParameters", {}) or {}
+            if cp:
+                self.lead_info = {
+                    "Name":     cp.get("name", ""),
+                    "Phone":    cp.get("phone", ""),
+                    "City":     cp.get("city", ""),
+                    "Category": cp.get("category", ""),
+                }
+            print(f"[STREAM START] {self.call_sid} lead={self.lead_info}")
             await self._push_status("active", "Call active")
             await self._begin_conversation()
 
@@ -158,7 +164,7 @@ class AgentCallHandler:
                 return
             raw = base64.b64decode(payload)
             if self.listeners:
-                asyncio.create_task(self._fanout(payload, "prospect"))
+                self._fanout_nowait(payload, "prospect")
 
             if self.is_speaking and self.cfg.allow_interruption:
                 try:
@@ -373,9 +379,11 @@ class AgentCallHandler:
                                 "media":     {"payload": frame_b64},
                             }))
                             if self.listeners:
-                                asyncio.create_task(self._fanout(frame_b64, "agent"))
+                                self._fanout_nowait(frame_b64, "agent")
                             sent += 1
-                            await asyncio.sleep(0.019)
+                        # No sleep — Twilio buffers and plays at the correct rate.
+                        # Pacing here only introduces jitter.
+                        await asyncio.sleep(0)
 
             print(f"[TTS] {sent} frames in {time.time()-t0:.2f}s :: {text[:50]}")
 
@@ -383,6 +391,9 @@ class AgentCallHandler:
             print(f"[TTS EXCEPTION] {e}")
         finally:
             if seq == self._speak_seq:
+                # Audio is buffered in Twilio — hold the speaking flag for its
+                # real duration so barge-in and turn-taking stay accurate.
+                await asyncio.sleep(sent * 0.020)
                 self.is_speaking = False
                 self._last_audio = time.time()
                 if not self._stop:
@@ -408,7 +419,8 @@ class AgentCallHandler:
 
         url = (
             "wss://api.deepgram.com/v1/listen"
-            "?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2"
+            "?encoding=mulaw&sample_rate=8000&channels=1&model=nova-3&language=en-US"
+            "&smart_format=true&punctuate=true&filler_words=false"
             f"&endpointing={self.cfg.endpointing_ms}"
             f"&utterance_end_ms={self.cfg.utterance_end_ms}"
             "&interim_results=true"

@@ -957,11 +957,20 @@ async def agent_twiml(request: Request):
         f"?phone={phone}&amp;name={name}&amp;city={city}&amp;category={category}"
     )
 
+    def xml_esc(s: str) -> str:
+        return (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<Response>'
         '<Connect>'
-        f'<Stream url="{stream_url}" />'
+        f'<Stream url="{ws_base}/ws/agent/stream">'
+        f'<Parameter name="phone" value="{xml_esc(params.get("phone",""))}" />'
+        f'<Parameter name="name" value="{xml_esc(params.get("name",""))}" />'
+        f'<Parameter name="city" value="{xml_esc(params.get("city",""))}" />'
+        f'<Parameter name="category" value="{xml_esc(params.get("category",""))}" />'
+        '</Stream>'
         '</Connect>'
         '</Response>'
     )
