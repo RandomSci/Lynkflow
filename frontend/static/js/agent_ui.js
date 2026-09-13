@@ -123,6 +123,23 @@ function buildAgentOptions() {
       </div>
 
       <div class="agent-opt-group">
+        <div class="agent-opt-label">
+          Custom Voice ID
+          <span class="agent-opt-hint">Paste any ElevenLabs voice ID to override the picks above</span>
+        </div>
+        <div class="agent-custom-voice">
+          <input type="text" id="optCustomVoice" class="agent-select"
+                 placeholder="e.g. 21m00Tcm4TlvDq8ikWAM"
+                 value="${escAttr(agentConfig.voice_id || '')}" />
+          <button class="agent-apply-btn" id="applyCustomVoice">Apply</button>
+        </div>
+        <div class="agent-current-voice">
+          Active: <strong id="activeVoiceLabel">${escAttr(agentConfig.voice_name || 'Custom')}</strong>
+          <span class="agent-voice-id-mono">${escAttr(agentConfig.voice_id || '')}</span>
+        </div>
+      </div>
+
+      <div class="agent-opt-group">
         <div class="agent-opt-label">Tone</div>
         <div class="agent-tone-row" id="toneRow"></div>
       </div>
@@ -216,9 +233,31 @@ function buildAgentOptions() {
       el.classList.add('selected');
       agentConfig.voice_id = v.id;
       agentConfig.voice_name = v.name;
+      const inp = p.querySelector('#optCustomVoice');
+      if (inp) inp.value = v.id;
+      updateActiveVoiceLabel(p);
     });
     vGrid.appendChild(el);
   });
+
+  // Custom voice ID
+  const applyBtn = p.querySelector('#applyCustomVoice');
+  if (applyBtn) {
+    applyBtn.addEventListener('click', () => {
+      const id = p.querySelector('#optCustomVoice').value.trim();
+      if (!id) return;
+      agentConfig.voice_id = id;
+      const known = VOICES.find(v => v.id === id);
+      agentConfig.voice_name = known ? known.name : 'Custom';
+      vGrid.querySelectorAll('.agent-voice-card').forEach(c => c.classList.remove('selected'));
+      if (known) {
+        [...vGrid.children].find(c =>
+          c.querySelector('.agent-voice-name').textContent === known.name
+        )?.classList.add('selected');
+      }
+      updateActiveVoiceLabel(p);
+    });
+  }
 
   // Tone buttons
   const tRow = p.querySelector('#toneRow');
@@ -254,6 +293,12 @@ function buildAgentOptions() {
     agentConfig.similarity_boost  = parseFloat(p.querySelector('#optSimilarity').value);
     agentConfig.style             = parseFloat(p.querySelector('#optStyle').value);
     agentConfig.speaking_rate     = parseFloat(p.querySelector('#optRate').value);
+    const customId = p.querySelector('#optCustomVoice')?.value.trim();
+    if (customId) {
+      agentConfig.voice_id = customId;
+      const known = VOICES.find(v => v.id === customId);
+      agentConfig.voice_name = known ? known.name : 'Custom';
+    }
     agentConfig.endpointing_ms    = parseInt(p.querySelector('#optEndpointing').value);
     agentConfig.utterance_end_ms  = parseInt(p.querySelector('#optUtteranceEnd').value);
     agentConfig.silence_timeout_s = parseInt(p.querySelector('#optSilenceTimeout').value);
@@ -304,6 +349,13 @@ function escAttr(s) {
 function toggleAgentOptions() {
   const p = document.getElementById('agentOptionsPanel');
   if (p) p.style.display = p.style.display === 'none' ? 'block' : 'none';
+}
+
+function updateActiveVoiceLabel(panel) {
+  const lbl = panel.querySelector('#activeVoiceLabel');
+  const mono = panel.querySelector('.agent-voice-id-mono');
+  if (lbl)  lbl.textContent = agentConfig.voice_name || 'Custom';
+  if (mono) mono.textContent = agentConfig.voice_id || '';
 }
 
 // ── Mode switching ──────────────────────────────────────────────────────────

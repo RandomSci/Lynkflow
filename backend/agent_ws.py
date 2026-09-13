@@ -146,6 +146,8 @@ class AgentCallHandler:
                   + context + f"\n\nTONE: {tone_note}"
 
         opening = render_template(self.cfg.first_message, self.lead_info)
+        print(f"[LEAD] {self.lead_info}")
+        print(f"[OPENING] {opening}")
 
         self.conversation = [
             {"role": "system",    "content": system},
@@ -162,24 +164,17 @@ class AgentCallHandler:
         await self._push_transcript("prospect", text)
         self.conversation.append({"role": "user", "content": text})
 
-        response = await self._gpt()
+        response = await self._respond()
         if not response:
             return
 
-        hangup = "[HANGUP]" in response
-        clean  = response.replace("[HANGUP]", "").strip()
-
-        # Detect configured end-call phrases
-        low = clean.lower()
-        if any(p in low for p in self.end_phrases):
-            hangup = True
-
+        clean = response.replace("[HANGUP]", "").strip()
         if clean:
             self.conversation.append({"role": "assistant", "content": clean})
             await self._push_transcript("agent", clean)
-            await self._speak(clean)
 
-        if hangup:
+        low = clean.lower()
+        if "[HANGUP]" in response or any(p in low for p in self.end_phrases):
             await asyncio.sleep(1)
             await self._hangup()
 
