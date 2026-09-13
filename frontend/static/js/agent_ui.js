@@ -10,6 +10,7 @@ let listenSocket = null;
 let listenCtx = null;
 let listenTime = 0;
 let listenRetries = 0;
+let agentCallActive = false;
 
 const VOICES = [
   { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah',   desc: 'Warm, professional female' },
@@ -396,16 +397,15 @@ function startListening(callSid) {
 
   listenSocket.onclose = () => {
     listenSocket = null;
-    if (agentCallSid && listenRetries < 20) {
+    if (agentCallActive && agentCallSid && listenRetries < 8) {
       listenRetries++;
       setTimeout(() => {
-        if (agentCallSid && !listenSocket) startListening(agentCallSid);
+        if (agentCallActive && agentCallSid && !listenSocket) startListening(agentCallSid);
       }, 2000);
     } else {
       setListenBtn(false);
     }
   };
-  setListenBtn(true);
 }
 
 function stopListening() {
@@ -540,7 +540,8 @@ async function handleAgentCallBtn() {
 
 async function endAgentCall() {
   const sid = agentCallSid;
-  agentCallSid = null;         
+  agentCallSid = null;
+  agentCallActive = false;
   disconnectAgentEvents();
   updateAgentCallBtn(false);
   updateDialerStatus('Ending call…', 'ready');
@@ -554,6 +555,7 @@ async function endAgentCall() {
   updateDialerStatus('Call ended', 'ready');
   showDispositionPanel();
 }
+
 
 function updateAgentCallBtn(calling) {
   const btn = document.getElementById('callBtn');
@@ -580,6 +582,16 @@ function connectAgentEvents(callSid) {
       setAgentIndicator(data.state);
 
       if (data.state === 'connecting') startRingback();
+      if (data.state === 'active') {
+        stopRingback();
+        playAnswered();
+        agentCallActive = true;
+      }
+      if (data.state === 'ended') {
+        stopRingback();
+        playEnded();
+        agentCallActive = false;
+      }
       if (data.state === 'active') { stopRingback(); playAnswered(); }
       if (data.state === 'ended')  { stopRingback(); playEnded(); }
 
@@ -617,6 +629,9 @@ function connectAgentEvents(callSid) {
 }
 
 function disconnectAgentEvents() {
+  agentCallActive = false;
+  stopRingback();
+  stopListening();
   if (agentCallTimeout) { clearTimeout(agentCallTimeout); agentCallTimeout = null; }
   if (agentEventSource) { agentEventSource.close(); agentEventSource = null; }
 }

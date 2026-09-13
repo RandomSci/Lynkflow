@@ -53,6 +53,7 @@ class AgentCallHandler:
         self.listeners: set = set()      # browser WebSockets listening in
         self._last_partial = 0.0
         self._fanout_buf: list = []
+        self._fanout_inflight = 0
 
         self.stream_sid: Optional[str] = None
         self.call_sid:   Optional[str] = None
@@ -127,23 +128,30 @@ class AgentCallHandler:
     # ── Twilio events ────────────────────────────────────────────────────────
 
     def _fanout_nowait(self, payload_b64: str, who: str):
-        """Buffer frames; flushed in batches to avoid task-per-frame overhead."""
+        """Buffer frames; flush in batches. Drops frames if listeners lag."""
         if not self.listeners:
+            self._fanout_buf.clear()
             return
         self._fanout_buf.append((who, payload_b64))
-        if len(self._fanout_buf) >= 25:          # ~500ms of audio
+        if len(self._fanout_buf) >= 25:
             batch, self._fanout_buf = self._fanout_buf, []
-            asyncio.create_task(self._flush_fanout(batch))
+            if self._fanout_inflight < 3:      # never queue more than 3 batches
+                self._fanout_inflight += 1
+                asyncio.create_task(self._flush_fanout(batch))
 
     async def _flush_fanout(self, batch):
-        if not self.listeners or not batch:
-            return
-        msg = json.dumps({"batch": [{"t": w, "a": a} for w, a in batch]})
-        for ws in list(self.listeners):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                self.listeners.discard(ws)
+        try:
+            if not self.listeners or not batch:
+                return
+            msg = json.dumps({"batch": [{"t": w, "a": a} for w, a in batch]})
+            for ws in list(self.listeners):
+                try:
+                    await ws.send_text(msg)
+                except Exception:
+                    self.listeners.discard(ws)
+        finally:
+            self._fanout_inflight = max(0, self._fanout_inflight - 1)
+
     async def _on_twilio_event(self, data: dict):
         evt = data.get("event")
 
@@ -327,8 +335,8 @@ class AgentCallHandler:
         if buf.strip() and not self._stop and seq == self._speak_seq:
             await self._speak_chunk(buf.strip(), seq)
 
-        final = full.strip()
-        if final:
+        final = full.strip().replace("[HANGUP]", "").strip()
+        if final and len(final) > 1:
             await self.status_queue.put({
                 "type": "transcript_final", "speaker": "agent",
                 "text": final.replace("[HANGUP]", "").strip(),
