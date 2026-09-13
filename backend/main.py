@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 import asyncio
 import json
 import os
@@ -11,14 +13,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Res
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
-from dotenv import load_dotenv
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse, Dial
 from agent_config import AgentConfig, load_agent_config, save_agent_config as _save_agent_config
 from agent_ws import AgentCallHandler
 
-load_dotenv()
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")

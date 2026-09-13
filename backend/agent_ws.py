@@ -14,10 +14,12 @@ import json
 import os
 from datetime import datetime
 from typing import Optional
-
+from dotenv import load_dotenv
 import httpx
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
+
+load_dotenv()
 
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
