@@ -809,11 +809,11 @@ function showDispositionPanel() {
         const leadPhone = (document.getElementById('dialerInput')?.value || '').trim();
         // Pass the full lead object so the backend can update only specific cells
         // without wiping Phone, Address, and other columns (the original bug)
-        const fullLead = leads.find(l => {
-          const lp = (l['Phone'] || '').replace(/\D/g, '');
-          const dp = leadPhone.replace(/\D/g, '');
-          return lp && dp && (lp === dp || dp.endsWith(lp) || lp.endsWith(dp));
-        }) || leads.find(l => l['Name'] === leadName) || {};
+        const fullLead = (typeof findLeadByPhone === 'function'
+                            ? findLeadByPhone(leadPhone)
+                            : null)
+                         || leads.find(l => l['Name'] === leadName)
+                         || {};
         await fetch('/api/update-lead', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

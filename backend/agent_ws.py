@@ -83,7 +83,6 @@ class AgentCallHandler:
             pass
         finally:
             await self._cleanup()
-            await self._push_status("ended", "Call ended")
 
     async def _watchdog(self):
         """Enforce silence timeout and max call duration."""
@@ -118,8 +117,6 @@ class AgentCallHandler:
 
         elif evt == "media":
             self._last_audio = time.time()
-            # ALWAYS forward audio — Deepgram closes the socket if it goes
-            # ~10s without data. Barge-in is handled in the listener instead.
             if self.dg_ws:
                 payload = data.get("media", {}).get("payload", "")
                 if payload:
@@ -129,9 +126,8 @@ class AgentCallHandler:
                         print(f"[DG SEND] {e}")
 
         elif evt == "stop":
-            print("[STREAM STOP]")
+            print("[STREAM STOP] media stream closed")
             self._stop = True
-            await self._push_status("ended", "Call ended")
 
     # ── Conversation ─────────────────────────────────────────────────────────
 

@@ -346,6 +346,25 @@ function escAttr(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function findLeadByPhone(number) {
+  const dp = String(number || '').replace(/\D/g, '');
+  if (!dp || typeof leads === 'undefined' || !leads.length) return null;
+
+  const tail = s => {
+    const d = String(s || '').replace(/\D/g, '');
+    return d.length > 10 ? d.slice(-10) : d;
+  };
+  const target = tail(dp);
+
+  return leads.find(l => {
+    const lp = tail(l['Phone']);
+    return lp && lp === target;
+  }) || leads.find(l => {
+    const lp = String(l['Phone'] || '').replace(/\D/g, '');
+    return lp && (lp === dp || dp.endsWith(lp) || lp.endsWith(dp));
+  }) || null;
+}
+
 function toggleAgentOptions() {
   const p = document.getElementById('agentOptionsPanel');
   if (p) p.style.display = p.style.display === 'none' ? 'block' : 'none';
@@ -403,11 +422,8 @@ async function handleAgentCallBtn() {
     return;
   }
 
-  const dp = number.replace(/\D/g, '');
-  const lead = leads.find(l => {
-    const lp = (l['Phone'] || '').replace(/\D/g, '');
-    return lp && (lp === dp || dp.endsWith(lp) || lp.endsWith(dp));
-  }) || {};
+  const lead = findLeadByPhone(number) || {};
+  console.log('[AGENT] matched lead:', lead);
 
   clearTranscript();
   updateDialerStatus('Starting agent call…', 'calling');
