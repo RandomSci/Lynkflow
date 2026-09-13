@@ -41,6 +41,7 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent.parent / "front
 # ── Agent call state (in-memory per server process) ──────────────────────────
 _agent_events: dict[str, list] = {}       # call_sid → buffered events
 _agent_queues: dict[str, asyncio.Queue] = {}  # call_sid → live queue for SSE
+_agent_handlers: dict = {}     # call_sid -> AgentCallHandler
 
 
 class TTSRequest(BaseModel):
@@ -1026,6 +1027,14 @@ async def agent_stream(websocket: WebSocket):
         status_queue = status_queue,
     )
 
+    async def _register():
+        while not handler.call_sid and not handler._stop:
+            await asyncio.sleep(0.1)
+        if handler.call_sid:
+            _agent_handlers[handler.call_sid] = handler
+
+    asyncio.create_task(_register())
+
     async def _relay_status():
         """Forward status/transcript events to the per-call SSE queue."""
         while True:
@@ -1052,7 +1061,11 @@ async def agent_stream(websocket: WebSocket):
                 print(f"Relay error: {e}")
                 break
 
-    await asyncio.gather(handler.run(), _relay_status())
+    try:
+        await asyncio.gather(handler.run(), _relay_status())
+    finally:
+        if handler.call_sid:
+            _agent_handlers.pop(handler.call_sid, None)
 
 
 @app.get("/api/agent/events/{call_sid}")
@@ -1104,3 +1117,23 @@ async def reset_agent_config():
     fresh = AgentConfig(enabled=cfg.enabled, base_url=cfg.base_url)
     _save_agent_config(fresh)
     return JSONResponse({"success": True})
+
+@app.websocket("/ws/agent/listen/{call_sid}")
+async def agent_listen(websocket: WebSocket, call_sid: str):
+    await websocket.accept()
+    handler = _agent_handlers.get(call_sid)
+    if not handler:
+        await websocket.send_text(json.dumps({"error": "call not found"}))
+        await websocket.close()
+        return
+
+    handler.listeners.add(websocket)
+    print(f"[LISTEN] browser attached to {call_sid}")
+    try:
+        while True:
+            await websocket.receive_text()   # keepalive
+    except Exception:
+        pass
+    finally:
+        handler.listeners.discard(websocket)
+        print(f"[LISTEN] browser detached from {call_sid}")

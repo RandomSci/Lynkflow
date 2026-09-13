@@ -6,6 +6,9 @@ let agentConfig = {};
 let agentCallSid = null;
 let agentEventSource = null;
 let agentCallTimeout = null;
+let listenSocket = null;
+let listenCtx = null;
+let listenTime = 0;
 
 const VOICES = [
   { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah',   desc: 'Warm, professional female' },
@@ -342,6 +345,65 @@ function slider(id, label, value, min, max, step, hint, isInt) {
   `;
 }
 
+// μ-law decode table
+const MULAW = (() => {
+  const t = new Int16Array(256);
+  for (let i = 0; i < 256; i++) {
+    let u = ~i & 0xff;
+    let sign = u & 0x80, exp = (u >> 4) & 0x07, mant = u & 0x0f;
+    let s = ((mant << 3) + 0x84) << exp;
+    s -= 0x84;
+    t[i] = sign ? -s : s;
+  }
+  return t;
+})();
+
+function startListening(callSid) {
+  if (listenSocket) stopListening();
+  listenCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
+  listenTime = listenCtx.currentTime;
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  listenSocket = new WebSocket(`${proto}://${location.host}/ws/agent/listen/${callSid}`);
+
+  listenSocket.onmessage = (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (!m.a || !listenCtx) return;
+
+    const bin = atob(m.a);
+    const buf = listenCtx.createBuffer(1, bin.length, 8000);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < bin.length; i++) ch[i] = MULAW[bin.charCodeAt(i)] / 32768;
+
+    const src = listenCtx.createBufferSource();
+    src.buffer = buf;
+    const gain = listenCtx.createGain();
+    gain.gain.value = m.t === 'agent' ? 0.8 : 1.0;
+    src.connect(gain).connect(listenCtx.destination);
+
+    const now = listenCtx.currentTime;
+    if (listenTime < now) listenTime = now + 0.05;
+    src.start(listenTime);
+    listenTime += buf.duration;
+  };
+
+  listenSocket.onclose = () => { listenSocket = null; };
+  setListenBtn(true);
+}
+
+function stopListening() {
+  if (listenSocket) { listenSocket.close(); listenSocket = null; }
+  if (listenCtx) { listenCtx.close(); listenCtx = null; }
+  setListenBtn(false);
+}
+
+function setListenBtn(on) {
+  const b = document.getElementById('listenBtn');
+  if (!b) return;
+  b.textContent = on ? '\u{1F507} Stop Listening' : '\u{1F50A} Listen In';
+  b.classList.toggle('listening', on);
+}
+
 function escAttr(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -528,6 +590,7 @@ function buildTranscriptPanel() {
   panel.innerHTML = `
     <div class="card-label">
       Live Transcript
+      <button class="listen-btn" id="listenBtn">&#128266; Listen In</button>
       <span class="agent-indicator" id="agentIndicator">
         <span class="agent-indicator-dot"></span>
         <span class="agent-indicator-text">Idle</span>
@@ -537,6 +600,12 @@ function buildTranscriptPanel() {
       <div class="agent-transcript-empty">Transcript appears here once the call starts.</div>
     </div>
   `;
+
+  panel.querySelector('#listenBtn').addEventListener('click', () => {
+    if (listenSocket) stopListening();
+    else if (agentCallSid) startListening(agentCallSid);
+  });
+
   return panel;
 }
 
@@ -621,6 +690,10 @@ async function injectAgentUI() {
   const dialerTop = document.querySelector('.dialer-top');
   if (!dialerTop) return;
   dialerTop.parentNode.insertBefore(buildAgentBar(), dialerTop);
+  panel.querySelector('#listenBtn').addEventListener('click', () => {
+    if (listenSocket) stopListening();
+    else if (agentCallSid) startListening(agentCallSid);
+  });
   dialerTop.after(buildTranscriptPanel());
   dialerTop.after(buildAgentOptions());
   applyAgentMode();

@@ -50,6 +50,7 @@ class AgentCallHandler:
         self.lead_info    = lead_info
         self.status_queue = status_queue
         self._ivr_hits = 0
+        self.listeners: set = set()      # browser WebSockets listening in
 
         self.stream_sid: Optional[str] = None
         self.call_sid:   Optional[str] = None
@@ -119,6 +120,20 @@ class AgentCallHandler:
 
     # ── Twilio events ────────────────────────────────────────────────────────
 
+    async def _fanout(self, payload_b64: str, who: str):
+        """Push a base64 mulaw frame to every browser listener."""
+        if not self.listeners:
+            return
+        msg = json.dumps({"t": who, "a": payload_b64})
+        dead = []
+        for ws in list(self.listeners):
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.listeners.discard(ws)
+
     async def _on_twilio_event(self, data: dict):
         evt = data.get("event")
 
@@ -138,6 +153,7 @@ class AgentCallHandler:
             if not payload:
                 return
             raw = base64.b64decode(payload)
+            await self._fanout(payload, "prospect")
 
             if self.is_speaking and self.cfg.allow_interruption:
                 try:
@@ -342,11 +358,13 @@ class AgentCallHandler:
                         for i in range(0, n, 160):
                             if self._stop or seq != self._speak_seq or not self.is_speaking:
                                 return
+                            frame_b64 = base64.b64encode(data[i:i+160]).decode()
                             await self.twilio_ws.send_text(json.dumps({
                                 "event":     "media",
                                 "streamSid": self.stream_sid,
-                                "media":     {"payload": base64.b64encode(data[i:i+160]).decode()},
+                                "media":     {"payload": frame_b64},
                             }))
+                            await self._fanout(frame_b64, "agent")
                             sent += 1
                             await asyncio.sleep(0.019)
 
