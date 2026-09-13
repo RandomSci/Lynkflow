@@ -82,6 +82,10 @@ class AgentCallHandler:
         "please listen", "options have changed", "please hold",
         "leave a message", "after the tone", "business hours are",
         "answering service", "please stay on the line",
+        "unable to take your call", "leave your name",
+        "brief description", "call you back as soon as",
+        "thank you for calling", "we are currently closed",
+        "at the tone", "record your message",
     ]
 
     def _looks_like_ivr(self, text: str) -> bool:
@@ -223,7 +227,7 @@ class AgentCallHandler:
         if self._looks_like_ivr(text):
             self._ivr_hits += 1
             print(f"[IVR] detected ({self._ivr_hits}): {text[:60]}")
-            if self._ivr_hits >= 2:
+            if self._ivr_hits >= 1:
                 print("[IVR] phone tree confirmed — hanging up")
                 await self._push_status("ended", "IVR / phone tree")
                 await self._hangup()
@@ -401,6 +405,9 @@ class AgentCallHandler:
 
     async def _stop_speaking(self):
         self.is_speaking = False
+        await self.status_queue.put({
+            "type": "transcript_cancel", "speaker": "agent",
+        })
         if self.stream_sid:
             try:
                 await self.twilio_ws.send_text(json.dumps({

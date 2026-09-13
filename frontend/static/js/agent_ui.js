@@ -591,6 +591,24 @@ function connectAgentEvents(callSid) {
     if (data.type === 'transcript_final') {
       finalizePartial(data.speaker, data.text, data.ts);
     }
+    if (data.type === 'transcript_cancel') {
+      const wrap = document.getElementById('agentTranscript');
+      const rows = wrap?.querySelectorAll(`.agent-msg--partial[data-speaker="${data.speaker}"]`);
+      const row = rows?.[rows.length - 1];
+      if (row) {
+        row.classList.remove('agent-msg--partial');
+        row.removeAttribute('data-speaker');
+      }
+    }
+    if (data.type === 'transcript_cancel') {
+      const wrap = document.getElementById('agentTranscript');
+      const rows = wrap?.querySelectorAll(`.agent-msg--partial[data-speaker="${data.speaker}"]`);
+      const row = rows?.[rows.length - 1];
+      if (row) {
+        row.classList.remove('agent-msg--partial');
+        row.removeAttribute('data-speaker');
+      }
+    }
   };
 }
 
@@ -650,8 +668,19 @@ function upsertPartial(speaker, text, ts) {
   if (!wrap) return;
   wrap.querySelector('.agent-transcript-empty')?.remove();
 
-  let row = wrap.querySelector(`.agent-msg--partial[data-speaker="${speaker}"]`);
-  if (!row) {
+  // Only the LAST row can be a live partial. If the last row belongs to the
+  // other speaker, close it out and start a fresh row.
+  const last = wrap.lastElementChild;
+  let row = null;
+
+  if (last && last.classList.contains('agent-msg--partial')
+           && last.dataset.speaker === speaker) {
+    row = last;
+  } else {
+    if (last && last.classList.contains('agent-msg--partial')) {
+      last.classList.remove('agent-msg--partial');
+      last.removeAttribute('data-speaker');
+    }
     row = document.createElement('div');
     row.className = `agent-msg agent-msg--${speaker} agent-msg--partial`;
     row.dataset.speaker = speaker;
@@ -664,6 +693,7 @@ function upsertPartial(speaker, text, ts) {
     `;
     wrap.appendChild(row);
   }
+
   row.querySelector('.agent-msg-text').textContent = text;
   wrap.scrollTop = wrap.scrollHeight;
 }
@@ -671,11 +701,15 @@ function upsertPartial(speaker, text, ts) {
 function finalizePartial(speaker, text, ts) {
   const wrap = document.getElementById('agentTranscript');
   if (!wrap) return;
-  const row = wrap.querySelector(`.agent-msg--partial[data-speaker="${speaker}"]`);
+
+  const rows = wrap.querySelectorAll(`.agent-msg--partial[data-speaker="${speaker}"]`);
+  const row = rows[rows.length - 1];
+
   if (row) {
     row.classList.remove('agent-msg--partial');
     row.removeAttribute('data-speaker');
     row.querySelector('.agent-msg-text').textContent = text;
+    if (ts) row.querySelector('.agent-msg-ts').textContent = ts;
   } else {
     appendTranscript(speaker, text, ts);
   }
