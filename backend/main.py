@@ -930,30 +930,39 @@ async def agent_twiml(request: Request):
     TwiML returned to Twilio when the outbound call connects.
     Opens a bidirectional Media Stream WebSocket to this server.
     """
+    from xml.sax.saxutils import escape
+
     params = dict(request.query_params)
-    phone    = urllib.parse.quote(params.get("phone", ""))
-    name     = urllib.parse.quote(params.get("name", ""))
-    city     = urllib.parse.quote(params.get("city", ""))
-    category = urllib.parse.quote(params.get("category", ""))
+    # query_params are ALREADY decoded by Starlette — re-encode once for the URL
+    phone    = urllib.parse.quote(params.get("phone", ""),    safe="")
+    name     = urllib.parse.quote(params.get("name", ""),     safe="")
+    city     = urllib.parse.quote(params.get("city", ""),     safe="")
+    category = urllib.parse.quote(params.get("category", ""), safe="")
 
     cfg = load_agent_config()
     base_url = cfg.base_url.rstrip("/")
 
-    # Convert http(s) to ws(s)
+    if not base_url:
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>Agent base URL is not configured.</Say></Response>',
+            media_type="text/xml",
+        )
+
     ws_base = base_url.replace("https://", "wss://").replace("http://", "ws://")
     stream_url = (
         f"{ws_base}/ws/agent/stream"
-        f"?phone={phone}&name={name}&city={city}&category={category}"
+        f"?phone={phone}&amp;name={name}&amp;city={city}&amp;category={category}"
     )
 
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Connect>
-        <Stream url="{stream_url}" />
-    </Connect>
-</Response>"""
-    return Response(content=twiml, media_type="application/xml")
-
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Response>'
+        '<Connect>'
+        f'<Stream url="{stream_url}" />'
+        '</Connect>'
+        '</Response>'
+    )
+    return Response(content=twiml, media_type="text/xml")
 
 @app.post("/api/agent/call-status")
 async def agent_call_status(request: Request):
