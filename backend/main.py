@@ -983,9 +983,14 @@ async def agent_call_status(request: Request):
     call_status = form.get("CallStatus", "")
     print(f"[CALL STATUS] {call_sid} → {call_status}")
 
-    if call_status in ("completed", "failed", "busy", "no-answer", "canceled"):
-        if call_sid not in _agent_queues:
-            _agent_queues[call_sid] = asyncio.Queue()
+    if call_sid not in _agent_queues:
+        _agent_queues[call_sid] = asyncio.Queue()
+
+    if call_status in ("initiated", "ringing"):
+        await _agent_queues[call_sid].put({
+            "type": "status", "state": "connecting", "message": "Ringing…"
+        })
+    elif call_status in ("completed", "failed", "busy", "no-answer", "canceled"):
         await _agent_queues[call_sid].put({
             "type": "status", "state": "ended", "message": f"Call {call_status}"
         })

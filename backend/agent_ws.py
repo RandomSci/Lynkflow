@@ -346,6 +346,7 @@ class AgentCallHandler:
 
         t0 = time.time()
         sent = 0
+        print(f"[TTS] voice={self.cfg.voice_id}")
         try:
             async with httpx.AsyncClient(timeout=30) as c:
                 async with c.stream(

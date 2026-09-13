@@ -580,7 +580,8 @@ function connectAgentEvents(callSid) {
       setAgentIndicator(data.state);
 
       if (data.state === 'connecting') startRingback();
-      if (data.state === 'active' || data.state === 'ended') stopRingback();
+      if (data.state === 'active') { stopRingback(); playAnswered(); }
+      if (data.state === 'ended')  { stopRingback(); playEnded(); }
 
       if (data.state === 'active' && !listenSocket && agentCallSid) {
         startListening(agentCallSid);
@@ -775,3 +776,23 @@ function stopRingback() {
   if (ringTimer) { clearInterval(ringTimer); ringTimer = null; }
   if (ringCtx) { ringCtx.close(); ringCtx = null; }
 }
+
+function playTone(freqs, dur, vol) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const g = ctx.createGain();
+    g.gain.value = vol;
+    g.connect(ctx.destination);
+    freqs.forEach(f => {
+      const o = ctx.createOscillator();
+      o.frequency.value = f;
+      o.connect(g);
+      o.start(ctx.currentTime);
+      o.stop(ctx.currentTime + dur);
+    });
+    setTimeout(() => ctx.close(), (dur + 0.2) * 1000);
+  } catch (e) {}
+}
+
+function playAnswered() { playTone([880, 1320], 0.14, 0.10); }   // bright ting
+function playEnded()    { playTone([392, 330],  0.30, 0.08); }   // low double
