@@ -530,11 +530,18 @@ async function handleAgentCallBtn() {
 }
 
 async function endAgentCall() {
-  if (!agentCallSid) return;
-  try { await fetch(`/api/agent/end/${agentCallSid}`, { method: 'POST' }); } catch (e) {}
+  const sid = agentCallSid;
+  agentCallSid = null;         
   disconnectAgentEvents();
-  agentCallSid = null;
   updateAgentCallBtn(false);
+  updateDialerStatus('Ending call…', 'ready');
+
+  if (sid) {
+    try {
+      await fetch(`/api/agent/end/${sid}`, { method: 'POST' });
+    } catch (e) { console.error('End failed', e); }
+  }
+
   updateDialerStatus('Call ended', 'ready');
   showDispositionPanel();
 }

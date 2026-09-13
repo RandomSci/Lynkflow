@@ -122,17 +122,20 @@ class AgentCallHandler:
     # ── Twilio events ────────────────────────────────────────────────────────
 
     async def _fanout(self, payload_b64: str, who: str):
-        """Push a base64 mulaw frame to every browser listener."""
+        """Push a frame to browser listeners — fire and forget, never blocks."""
         if not self.listeners:
             return
         msg = json.dumps({"t": who, "a": payload_b64})
-        dead = []
         for ws in list(self.listeners):
             try:
-                await ws.send_text(msg)
+                asyncio.create_task(self._safe_send(ws, msg))
             except Exception:
-                dead.append(ws)
-        for ws in dead:
+                self.listeners.discard(ws)
+
+    async def _safe_send(self, ws, msg: str):
+        try:
+            await ws.send_text(msg)
+        except Exception:
             self.listeners.discard(ws)
 
     async def _on_twilio_event(self, data: dict):
@@ -154,7 +157,8 @@ class AgentCallHandler:
             if not payload:
                 return
             raw = base64.b64decode(payload)
-            await self._fanout(payload, "prospect")
+            if self.listeners:
+                asyncio.create_task(self._fanout(payload, "prospect"))
 
             if self.is_speaking and self.cfg.allow_interruption:
                 try:
@@ -368,7 +372,8 @@ class AgentCallHandler:
                                 "streamSid": self.stream_sid,
                                 "media":     {"payload": frame_b64},
                             }))
-                            await self._fanout(frame_b64, "agent")
+                            if self.listeners:
+                                asyncio.create_task(self._fanout(frame_b64, "agent"))
                             sent += 1
                             await asyncio.sleep(0.019)
 
