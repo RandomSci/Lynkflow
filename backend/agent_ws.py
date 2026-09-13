@@ -432,12 +432,16 @@ class AgentCallHandler:
                             if self.listeners:
                                 self._fanout_nowait(frame_b64, "agent")
                             sent += 1
-                        # No sleep — Twilio buffers and plays at the correct rate.
-                        # Pacing here only introduces jitter.
+
+                            # Pace in 10-frame blocks (200ms of audio).
+                            # Keeps roughly realtime without per-frame jitter,
+                            # and stays ahead enough that playback never gaps.
+                            if sent % 10 == 0:
+                                await asyncio.sleep(0.16)
+
                         if self._fanout_buf:
                             batch, self._fanout_buf = self._fanout_buf, []
                             asyncio.create_task(self._flush_fanout(batch))
-                        await asyncio.sleep(0)
 
             print(f"[TTS] {sent} frames in {time.time()-t0:.2f}s :: {text[:50]}")
 
@@ -445,13 +449,9 @@ class AgentCallHandler:
             print(f"[TTS EXCEPTION] {e}")
         finally:
             if seq == self._speak_seq:
-                # Audio is buffered in Twilio — hold the speaking flag for its
-                # real duration so barge-in and turn-taking stay accurate.
-                await asyncio.sleep(sent * 0.020)
+                # Small tail so barge-in doesn't trigger on our own audio
+                await asyncio.sleep(0.25)
                 self.is_speaking = False
-                self._last_audio = time.time()
-                if not self._stop:
-                    await self._push_status("listening", "Listening…")
 
     async def _stop_speaking(self):
         self.is_speaking = False
