@@ -52,6 +52,7 @@ class AgentCallHandler:
         self._ivr_hits = 0
         self.listeners: set = set()      # browser WebSockets listening in
         self._last_partial = 0.0
+        self._fanout_buf: list = []
 
         self.stream_sid: Optional[str] = None
         self.call_sid:   Optional[str] = None
@@ -126,19 +127,23 @@ class AgentCallHandler:
     # ── Twilio events ────────────────────────────────────────────────────────
 
     def _fanout_nowait(self, payload_b64: str, who: str):
-        """Fire-and-forget frame push to browser listeners. Never awaits."""
+        """Buffer frames; flushed in batches to avoid task-per-frame overhead."""
         if not self.listeners:
             return
-        msg = json.dumps({"t": who, "a": payload_b64})
+        self._fanout_buf.append((who, payload_b64))
+        if len(self._fanout_buf) >= 25:          # ~500ms of audio
+            batch, self._fanout_buf = self._fanout_buf, []
+            asyncio.create_task(self._flush_fanout(batch))
+
+    async def _flush_fanout(self, batch):
+        if not self.listeners or not batch:
+            return
+        msg = json.dumps({"batch": [{"t": w, "a": a} for w, a in batch]})
         for ws in list(self.listeners):
-            asyncio.create_task(self._safe_send(ws, msg))
-
-    async def _safe_send(self, ws, msg: str):
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            self.listeners.discard(ws)
-
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                self.listeners.discard(ws)
     async def _on_twilio_event(self, data: dict):
         evt = data.get("event")
 
@@ -387,6 +392,9 @@ class AgentCallHandler:
                             sent += 1
                         # No sleep — Twilio buffers and plays at the correct rate.
                         # Pacing here only introduces jitter.
+                        if self._fanout_buf:
+                            batch, self._fanout_buf = self._fanout_buf, []
+                            asyncio.create_task(self._flush_fanout(batch))
                         await asyncio.sleep(0)
 
             print(f"[TTS] {sent} frames in {time.time()-t0:.2f}s :: {text[:50]}")

@@ -9,6 +9,7 @@ let agentCallTimeout = null;
 let listenSocket = null;
 let listenCtx = null;
 let listenTime = 0;
+let listenRetries = 0;
 
 const VOICES = [
   { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah',   desc: 'Warm, professional female' },
@@ -132,8 +133,8 @@ function buildAgentOptions() {
         </div>
         <div class="agent-custom-voice">
           <input type="text" id="optCustomVoice" class="agent-select"
-                 placeholder="e.g. 21m00Tcm4TlvDq8ikWAM"
-                 value="${escAttr(agentConfig.voice_id || '')}" />
+                 placeholder="Paste a voice ID, then press Apply"
+                 value="${VOICES.some(v => v.id === agentConfig.voice_id) ? '' : escAttr(agentConfig.voice_id || '')}" />
           <button class="agent-apply-btn" id="applyCustomVoice">Apply</button>
         </div>
         <div class="agent-current-voice">
@@ -296,8 +297,10 @@ function buildAgentOptions() {
     agentConfig.similarity_boost  = parseFloat(p.querySelector('#optSimilarity').value);
     agentConfig.style             = parseFloat(p.querySelector('#optStyle').value);
     agentConfig.speaking_rate     = parseFloat(p.querySelector('#optRate').value);
+    // Only override from the text field if it differs from the active voice.
+    // Prevents a stale field value from clobbering a card selection.
     const customId = p.querySelector('#optCustomVoice')?.value.trim();
-    if (customId) {
+    if (customId && customId !== agentConfig.voice_id) {
       agentConfig.voice_id = customId;
       const known = VOICES.find(v => v.id === customId);
       agentConfig.voice_name = known ? known.name : 'Custom';
@@ -368,30 +371,36 @@ function startListening(callSid) {
 
   listenSocket.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch { return; }
-    if (!m.a || !listenCtx) return;
+    if (!listenCtx) return;
 
-    const bin = atob(m.a);
-    const buf = listenCtx.createBuffer(1, bin.length, 8000);
-    const ch = buf.getChannelData(0);
-    for (let i = 0; i < bin.length; i++) ch[i] = MULAW[bin.charCodeAt(i)] / 32768;
+    const frames = m.batch || (m.a ? [m] : []);
+    for (const f of frames) {
+      if (!f.a) continue;
+      const bin = atob(f.a);
+      const buf = listenCtx.createBuffer(1, bin.length, 8000);
+      const ch = buf.getChannelData(0);
+      for (let i = 0; i < bin.length; i++) ch[i] = MULAW[bin.charCodeAt(i)] / 32768;
 
-    const src = listenCtx.createBufferSource();
-    src.buffer = buf;
-    const gain = listenCtx.createGain();
-    gain.gain.value = m.t === 'agent' ? 0.8 : 1.0;
-    src.connect(gain).connect(listenCtx.destination);
+      const src = listenCtx.createBufferSource();
+      src.buffer = buf;
+      const gain = listenCtx.createGain();
+      gain.gain.value = f.t === 'agent' ? 0.85 : 1.0;
+      src.connect(gain).connect(listenCtx.destination);
 
-    const now = listenCtx.currentTime;
-    if (listenTime < now) listenTime = now + 0.05;
-    src.start(listenTime);
-    listenTime += buf.duration;
+      const now = listenCtx.currentTime;
+      if (listenTime < now) listenTime = now + 0.08;
+      src.start(listenTime);
+      listenTime += buf.duration;
+    }
   };
 
   listenSocket.onclose = () => {
     listenSocket = null;
-    // Call may still be ringing — the handler doesn't exist until answered.
-    if (agentCallSid) {
-      setTimeout(() => { if (agentCallSid && !listenSocket) startListening(agentCallSid); }, 1500);
+    if (agentCallSid && listenRetries < 20) {
+      listenRetries++;
+      setTimeout(() => {
+        if (agentCallSid && !listenSocket) startListening(agentCallSid);
+      }, 2000);
     } else {
       setListenBtn(false);
     }
@@ -570,6 +579,9 @@ function connectAgentEvents(callSid) {
       updateDialerStatus(data.message, map[data.state] || 'active');
       setAgentIndicator(data.state);
 
+      if (data.state === 'connecting') startRingback();
+      if (data.state === 'active' || data.state === 'ended') stopRingback();
+
       if (data.state === 'active' && !listenSocket && agentCallSid) {
         startListening(agentCallSid);
       }
@@ -590,15 +602,6 @@ function connectAgentEvents(callSid) {
     }
     if (data.type === 'transcript_final') {
       finalizePartial(data.speaker, data.text, data.ts);
-    }
-    if (data.type === 'transcript_cancel') {
-      const wrap = document.getElementById('agentTranscript');
-      const rows = wrap?.querySelectorAll(`.agent-msg--partial[data-speaker="${data.speaker}"]`);
-      const row = rows?.[rows.length - 1];
-      if (row) {
-        row.classList.remove('agent-msg--partial');
-        row.removeAttribute('data-speaker');
-      }
     }
     if (data.type === 'transcript_cancel') {
       const wrap = document.getElementById('agentTranscript');
@@ -746,4 +749,29 @@ async function injectAgentUI() {
   dialerTop.after(buildTranscriptPanel());
   dialerTop.after(buildAgentOptions());
   applyAgentMode();
+}
+
+let ringOsc = null, ringCtx = null, ringTimer = null;
+
+function startRingback() {
+  if (ringCtx) return;
+  ringCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const beep = () => {
+    if (!ringCtx) return;
+    const o1 = ringCtx.createOscillator(), o2 = ringCtx.createOscillator();
+    const g = ringCtx.createGain();
+    o1.frequency.value = 440; o2.frequency.value = 480;
+    g.gain.value = 0.06;
+    o1.connect(g); o2.connect(g); g.connect(ringCtx.destination);
+    const t = ringCtx.currentTime;
+    o1.start(t); o2.start(t);
+    o1.stop(t + 2); o2.stop(t + 2);
+  };
+  beep();
+  ringTimer = setInterval(beep, 6000);   // US ringback: 2s on, 4s off
+}
+
+function stopRingback() {
+  if (ringTimer) { clearInterval(ringTimer); ringTimer = null; }
+  if (ringCtx) { ringCtx.close(); ringCtx = null; }
 }
