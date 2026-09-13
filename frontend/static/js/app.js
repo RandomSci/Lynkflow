@@ -456,6 +456,65 @@ function updateCallBtn(calling) {
   btn.className = calling ? 'call-btn call-btn--end' : 'call-btn call-btn--start';
 }
 
+
+function getTimezone(state) {
+  const map = {
+    'connecticut':'ET','delaware':'ET','florida':'ET','georgia':'ET','indiana':'ET',
+    'kentucky':'ET','maine':'ET','maryland':'ET','massachusetts':'ET','michigan':'ET',
+    'new hampshire':'ET','new jersey':'ET','new york':'ET','north carolina':'ET',
+    'ohio':'ET','pennsylvania':'ET','rhode island':'ET','south carolina':'ET',
+    'tennessee':'ET','vermont':'ET','virginia':'ET','west virginia':'ET',
+    'washington dc':'ET','district of columbia':'ET',
+    'alabama':'CT','arkansas':'CT','illinois':'CT','iowa':'CT','louisiana':'CT',
+    'minnesota':'CT','mississippi':'CT','missouri':'CT','nebraska':'CT',
+    'north dakota':'CT','oklahoma':'CT','south dakota':'CT','texas':'CT',
+    'wisconsin':'CT','kansas':'CT',
+    'arizona':'MT','colorado':'MT','idaho':'MT','montana':'MT','new mexico':'MT',
+    'utah':'MT','wyoming':'MT',
+    'california':'PT','nevada':'PT','oregon':'PT','washington':'PT',
+  };
+  const abbr = {
+    'CT':'ET','DE':'ET','FL':'ET','GA':'ET','IN':'ET','KY':'ET','ME':'ET',
+    'MD':'ET','MA':'ET','MI':'ET','NH':'ET','NJ':'ET','NY':'ET','NC':'ET',
+    'OH':'ET','PA':'ET','RI':'ET','SC':'ET','TN':'ET','VT':'ET','VA':'ET',
+    'WV':'ET','DC':'ET',
+    'AL':'CT','AR':'CT','IL':'CT','IA':'CT','LA':'CT','MN':'CT','MS':'CT',
+    'MO':'CT','NE':'CT','ND':'CT','OK':'CT','SD':'CT','TX':'CT','WI':'CT','KS':'CT',
+    'AZ':'MT','CO':'MT','ID':'MT','MT':'MT','NM':'MT','UT':'MT','WY':'MT',
+    'CA':'PT','NV':'PT','OR':'PT','WA':'PT',
+  };
+  const zones = {
+    'ET': { label:'ET', iana:'America/New_York', color:'#3b82f6' },
+    'CT': { label:'CT', iana:'America/Chicago', color:'#22c55e' },
+    'MT': { label:'MT', iana:'America/Denver', color:'#f59e0b' },
+    'PT': { label:'PT', iana:'America/Los_Angeles', color:'#a855f7' },
+  };
+  const s = (state || '').trim();
+  const key = abbr[s.toUpperCase()] || map[s.toLowerCase()];
+  return key ? zones[key] : null;
+}
+let tzClockInterval = null;
+function startTzClock() {
+  if (tzClockInterval) clearInterval(tzClockInterval);
+  function tick() {
+    const el = document.getElementById('tzClock');
+    if (!el) { clearInterval(tzClockInterval); return; }
+    const zones = [
+      { label: 'ET', iana: 'America/New_York', color: '#3b82f6' },
+      { label: 'CT', iana: 'America/Chicago', color: '#22c55e' },
+      { label: 'MT', iana: 'America/Denver', color: '#f59e0b' },
+      { label: 'PT', iana: 'America/Los_Angeles', color: '#a855f7' },
+    ];
+    const fullNames = { ET: 'Eastern', CT: 'Central', MT: 'Mountain', PT: 'Pacific' };
+    const items = zones.map(z => {
+      const t = new Date().toLocaleTimeString('en-US', { timeZone: z.iana, hour: 'numeric', minute: '2-digit', hour12: true });
+      return '<div class="tz-clock-item"><span class="tz-clock-label" style="color:' + z.color + '">' + fullNames[z.label] + '</span><span class="tz-clock-time" style="color:' + z.color + '">' + t + '</span></div>';
+    }).join('');
+    el.innerHTML = '<div class="tz-clock-header">US Timezones</div>' + items;
+  }
+  tick();
+  tzClockInterval = setInterval(tick, 1000);
+}
 async function loadDialer() {
   setActiveNav('dialer');
   const area = document.getElementById('contentArea');
@@ -467,6 +526,9 @@ async function loadDialer() {
     <div class="module-header">
       <div class="module-eyebrow">Live Calling</div>
       <div class="module-title">📞 Lead Dialer</div>
+    </div>
+    <div class="tz-clock-bar">
+      <div id="tzClock" class="tz-clock"></div>
     </div>
 
     <div class="dialer-top">
@@ -493,6 +555,9 @@ async function loadDialer() {
     </div>
   `;
   area.appendChild(wrap);
+  startTzClock();
+
+  if (typeof injectAgentUI === 'function') await injectAgentUI();
 
   if (!twilioDevice) await initTwilio();
   else updateDialerStatus('Ready to call', 'ready');
@@ -529,18 +594,22 @@ function renderLeads(list) {
     el.innerHTML = `<div class="lead-loading">No leads found.</div>`;
     return;
   }
-  el.innerHTML = list.map((l) => `
+  el.innerHTML = list.map((l) => {
+    const tz = getTimezone(l['State']);
+    const fullTzNames = { ET: 'Eastern', CT: 'Central', MT: 'Mountain', PT: 'Pacific' };
+    const tzBadge = tz ? `<span class="tz-badge" style="background:${tz.color}22;color:${tz.color};border-color:${tz.color}44">${fullTzNames[tz.label]}</span>` : '';
+    return `
     <div class="lead-row" onclick="selectLead(${leads.indexOf(l)})">
       <div class="lead-main">
         <div class="lead-name">${l['Name'] || 'Unknown'}</div>
         <div class="lead-meta">${[l['City'], l['State']].filter(Boolean).join(', ')} ${l['Category'] ? '· ' + l['Category'] : ''}</div>
       </div>
       <div class="lead-right">
-        <div class="lead-phone">${l['Phone'] || ''}</div>
+        <div class="lead-right-top">${tzBadge}<div class="lead-phone">${l['Phone'] || ''}</div></div>
         <div class="lead-status-pill ${(l['Status'] || '').toLowerCase()}">${l['Status'] || 'New'}</div>
       </div>
     </div>
-  `).join('');
+  `;}).join('');
 }
 
 function selectLead(idx) {
@@ -552,10 +621,24 @@ function selectLead(idx) {
 
   const info = document.getElementById('activeLeadInfo');
   info.style.display = 'block';
+  const tz = getTimezone(lead['State']);
+  const tzTime = tz ? new Date().toLocaleTimeString('en-US', { timeZone: tz.iana, hour: '2-digit', minute: '2-digit', hour12: true }) : null;
+  const ratingStars = lead['Rating'] ? '★'.repeat(Math.round(Number(lead['Rating']))) + '☆'.repeat(5 - Math.round(Number(lead['Rating']))) : '';
   info.innerHTML = `
-    <div class="active-lead-name">${lead['Name'] || 'Unknown'}</div>
-    <div class="active-lead-meta">${[lead['Address'], lead['City'], lead['State']].filter(Boolean).join(', ')}</div>
-    ${lead['Website'] ? `<div class="active-lead-meta"><a href="${lead['Website']}" target="_blank">${lead['Website']}</a></div>` : ''}
+    <div class="active-lead-header">
+      <div>
+        <div class="active-lead-name">${lead['Name'] || 'Unknown'}</div>
+        <div class="active-lead-meta">${[lead['Address'], lead['City'], lead['State']].filter(Boolean).join(', ')}</div>
+      </div>
+      ${tz ? `<div class="active-lead-tz" style="color:${tz.color};border-color:${tz.color}44;background:${tz.color}11"><span class="active-lead-tz-label">${tz.label}</span><span class="active-lead-tz-time">${tzTime}</span></div>` : ''}
+    </div>
+    <div class="active-lead-details">
+      ${lead['Website'] ? `<div class="active-lead-detail-row"><span class="active-lead-detail-label">Website</span><a href="${lead['Website']}" target="_blank" class="active-lead-detail-value">${lead['Website']}</a></div>` : ''}
+      ${lead['Category'] ? `<div class="active-lead-detail-row"><span class="active-lead-detail-label">Category</span><span class="active-lead-detail-value">${lead['Category']}</span></div>` : ''}
+      ${lead['Rating'] ? `<div class="active-lead-detail-row"><span class="active-lead-detail-label">Rating</span><span class="active-lead-detail-value"><span class="lead-stars">${ratingStars}</span> ${lead['Rating']} ${lead['Reviews'] ? `<span style="color:var(--text-3)">(${lead['Reviews']} reviews)</span>` : ''}</span></div>` : ''}
+      ${lead['Notes'] ? `<div class="active-lead-detail-row"><span class="active-lead-detail-label">Notes</span><span class="active-lead-detail-value" style="color:var(--amber)">${lead['Notes']}</span></div>` : ''}
+      ${lead['Assigned To'] ? `<div class="active-lead-detail-row"><span class="active-lead-detail-label">Assigned</span><span class="active-lead-detail-value">${lead['Assigned To']}</span></div>` : ''}
+    </div>
   `;
 
   document.querySelectorAll('.lead-row').forEach(r => r.classList.remove('selected'));
@@ -568,7 +651,7 @@ function handleCallBtn() {
     activeCall = null;
     updateCallBtn(false);
     updateDialerStatus('Call ended', 'ready');
-    markCurrentLeadCalled();
+    showDispositionPanel();
     return;
   }
   const number = document.getElementById('dialerInput')?.value.trim();
@@ -584,7 +667,7 @@ function handleCallBtn() {
       updateDialerStatus('Call ended', 'ready');
       activeCall = null;
       updateCallBtn(false);
-      markCurrentLeadCalled();
+      showDispositionPanel();
     });
     call.on('error', (err) => updateDialerStatus(`Call error: ${err.message}`, 'error'));
   }).catch(err => updateDialerStatus(`Failed to call: ${err.message}`, 'error'));
@@ -672,4 +755,89 @@ function renderSimContent(scenario) {
     wrap.appendChild(row);
     row.querySelectorAll('.play-btn').forEach(btn => btn.addEventListener('click', () => handlePlay(btn)));
   });
+}
+
+function showDispositionPanel() {
+  const existing = document.getElementById('dispositionPanel');
+  if (existing) existing.remove();
+
+  const phone = document.getElementById('dialerInput')?.value.trim();
+  if (!phone) return;
+
+  const statuses = [
+    { label: 'Voicemail', color: '#7c3aed' },
+    { label: 'VM No Message', color: '#7c3aed' },
+    { label: 'No Answer', color: '#f59e0b' },
+    { label: 'Called', color: '#3b82f6' },
+    { label: 'Interested', color: '#22c55e' },
+    { label: 'Not Interested', color: '#ef4444' },
+    { label: 'Callback', color: '#0ea5e9' },
+    { label: 'IVR', color: '#f59e0b' },
+    { label: 'DNC', color: '#ef4444' },
+    { label: 'Wrong Number', color: '#ef4444' },
+  ];
+
+  const leadName = document.querySelector('.active-lead-name')?.textContent?.trim() || '';
+  const panel = document.createElement('div');
+  panel.id = 'dispositionPanel';
+  panel.dataset.leadName = leadName;
+  panel.className = 'card';
+  panel.style.marginTop = '14px';
+  panel.style.border = '1px solid var(--accent-border)';
+  panel.innerHTML = `
+    <div class="card-label">What happened on this call?</div>
+    <div class="disposition-grid" id="dispGrid"></div>
+    <textarea id="dispNotes" class="dialer-input" placeholder="Notes — what happened? gatekeeper, callback time, what they said..." style="width:100%;margin-top:12px;height:70px;resize:none;font-size:13px;"></textarea>
+    <div id="dispFeedback" style="font-size:12px;color:var(--green);margin-top:10px;display:none">Sheet updated</div>
+  `;
+
+  const grid = panel.querySelector('#dispGrid');
+  statuses.forEach(s => {
+    const btn = document.createElement('button');
+    btn.className = 'disp-btn';
+    btn.textContent = s.label;
+    btn.style.borderColor = s.color;
+    btn.style.color = s.color;
+    btn.addEventListener('click', async () => {
+      grid.querySelectorAll('.disp-btn').forEach(b => b.classList.remove('disp-selected'));
+      btn.classList.add('disp-selected');
+      btn.style.background = s.color;
+      btn.style.color = '#fff';
+      try {
+        const notes    = document.getElementById('dispNotes')?.value || '';
+        const leadName = panel.dataset.leadName || '';
+        const leadPhone = (document.getElementById('dialerInput')?.value || '').trim();
+        // Pass the full lead object so the backend can update only specific cells
+        // without wiping Phone, Address, and other columns (the original bug)
+        const fullLead = leads.find(l => {
+          const lp = (l['Phone'] || '').replace(/\D/g, '');
+          const dp = leadPhone.replace(/\D/g, '');
+          return lp && dp && (lp === dp || dp.endsWith(lp) || lp.endsWith(dp));
+        }) || leads.find(l => l['Name'] === leadName) || {};
+        await fetch('/api/update-lead', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name:   leadName,
+            phone:  leadPhone,
+            status: s.label,
+            notes,
+            lead:   fullLead,
+          })
+        });
+        const ln = panel.dataset.leadName;
+        leads = leads.map(l => l['Name'] === ln ? { ...l, Status: s.label } : l);
+        renderLeads(leads);
+        panel.querySelector('#dispFeedback').style.display = 'block';
+        setTimeout(() => panel.remove(), 2000);
+      } catch(e) {
+        panel.querySelector('#dispFeedback').textContent = 'Failed to update';
+        panel.querySelector('#dispFeedback').style.display = 'block';
+      }
+    });
+    grid.appendChild(btn);
+  });
+
+  const dialerTop = document.querySelector('.dialer-top');
+  if (dialerTop) dialerTop.after(panel);
 }

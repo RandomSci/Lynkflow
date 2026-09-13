@@ -1,9 +1,13 @@
+import asyncio
+import json
 import os
 import hashlib
+import urllib.parse
+from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
@@ -11,6 +15,8 @@ from dotenv import load_dotenv
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse, Dial
+from agent_config import AgentConfig, load_agent_config, save_agent_config as _save_agent_config
+from agent_ws import AgentCallHandler
 
 load_dotenv()
 
@@ -31,6 +37,10 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=Path(__file__).parent.parent / "frontend" / "static"), name="static")
+
+# ── Agent call state (in-memory per server process) ──────────────────────────
+_agent_events: dict[str, list] = {}       # call_sid → buffered events
+_agent_queues: dict[str, asyncio.Queue] = {}  # call_sid → live queue for SSE
 
 
 class TTSRequest(BaseModel):
@@ -74,6 +84,99 @@ async def generate_tts(req: TTSRequest):
 
     audio_path.write_bytes(resp.content)
     return JSONResponse({"url": f"/static/audio/{cache_key}.mp3", "cached": False})
+
+
+@app.post("/api/update-lead")
+async def update_lead(request: Request):
+    """
+    Updates ONLY the Status, Notes, and Call Date columns for a lead.
+    Preserves all other columns (Phone, Name, Address, etc.) — fixes the
+    data-deletion bug caused by the old n8n full-row-replace approach.
+
+    Priority order:
+      1. GOOGLE_APPS_SCRIPT_URL  — Apps Script web app (recommended, no extra creds)
+      2. n8n webhook fallback    — sends all fields so n8n can do a proper update
+
+    To use Apps Script: paste and deploy the script below as a web app
+    (Execute as: Me, Access: Anyone) then set GOOGLE_APPS_SCRIPT_URL in .env.
+
+    --- Apps Script (Tools → Script editor in your sheet) ---
+    function doPost(e) {
+      var d = JSON.parse(e.postData.contents);
+      var sh = SpreadsheetApp.openById('YOUR_SHEET_ID').getActiveSheet();
+      var vals = sh.getDataRange().getValues();
+      var hdrs = vals[0].map(function(h){ return String(h).trim().toLowerCase(); });
+      var phoneCol   = hdrs.indexOf('phone');
+      var nameCol    = hdrs.indexOf('name');
+      var statusCol  = hdrs.indexOf('status');
+      var notesCol   = hdrs.indexOf('notes');
+      var dateCol    = hdrs.indexOf('call date');
+      if (dateCol < 0) dateCol = hdrs.indexOf('date');
+      var clean = function(p){ return String(p||'').replace(/\\D/g,''); };
+      var tp = clean(d.phone);
+      for (var i = 1; i < vals.length; i++) {
+        var rp = clean(vals[i][phoneCol] || '');
+        var rn = String(vals[i][nameCol] || '').trim().toLowerCase();
+        if ((tp && (rp === tp || tp.endsWith(rp))) || (d.name && rn === d.name.trim().toLowerCase())) {
+          var row = i + 1;
+          if (statusCol >= 0) sh.getRange(row, statusCol+1).setValue(d.status);
+          if (notesCol  >= 0 && d.notes) sh.getRange(row, notesCol+1).setValue(d.notes);
+          if (dateCol   >= 0) sh.getRange(row, dateCol+1).setValue(new Date().toLocaleString());
+          return ContentService.createTextOutput(JSON.stringify({ok:true})).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({ok:false,error:'row not found'})).setMimeType(ContentService.MimeType.JSON);
+    }
+    ---------------------------------------------------------
+    """
+    data   = await request.json()
+    name   = data.get("name", "")
+    phone  = data.get("phone", "")
+    status = data.get("status", "")
+    notes  = data.get("notes", "")
+    lead   = data.get("lead", {})   # full lead object from frontend
+
+    if not status:
+        raise HTTPException(status_code=400, detail="status required")
+
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # ── Option 1: Google Apps Script (targeted cell update) ──────────────────
+    apps_script_url = os.getenv("GOOGLE_APPS_SCRIPT_URL")
+    if apps_script_url:
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                resp = await client.post(
+                    apps_script_url,
+                    json={"name": name, "phone": phone, "status": status,
+                          "notes": notes, "date": date_str},
+                )
+            result = resp.json()
+            if result.get("ok"):
+                return JSONResponse({"success": True, "method": "apps_script"})
+        except Exception as e:
+            print(f"Apps Script update failed ({e}), falling back to n8n")
+
+    # ── Option 2: n8n webhook — send FULL lead so n8n has all columns ────────
+    # Note: this only helps if your n8n workflow uses all fields for the row write.
+    # Fix your n8n workflow to use a "Find Row" + "Update Specific Cells" pattern.
+    webhook_payload = {
+        "name":   name,
+        "phone":  phone,
+        "status": status,
+        "notes":  notes,
+        "date":   date_str,
+        **lead,  # all original fields from the sheet row
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://boil-refined-shingle.ngrok-free.dev/webhook/6ba4a9af-5e6c-43bd-84de-2cd6f3d59b8f",
+                json=webhook_payload,
+            )
+        return JSONResponse({"success": resp.status_code == 200, "method": "n8n_webhook"})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
 
 
 @app.get("/api/twilio/token")
@@ -129,15 +232,16 @@ async def get_modules():
             "id": "greeting",
             "title": "Opening & Greeting",
             "icon": "👋",
-            "explanation": "The first 5 seconds decide everything. A plumber gets sales calls all day — your opening has to sound human, confident, and different from every other call they've received. Do not rush. Do not sound like you're reading. The goal of the greeting is simply to earn 60 more seconds.",
+            "explanation": "The first 5 seconds decide everything. Most plumbers hang up the moment they sense a sales call. The transparent opener flips that -- you admit it is a cold call upfront, which disarms them and earns you 30 seconds. The goal of this call is NOT to close. It is to book a 10-minute Zoom or callback. That is a much easier yes.",
             "tips": [
-                "Smile before you dial — they can genuinely hear it in your voice",
-                "Say their business name in the first sentence — it snaps their attention",
-                "Never open with 'How are you today?' — it screams telemarketer immediately",
-                "If they sound distracted or annoyed, slow down — don't speed up",
-                "Keep your energy warm and steady, not excited or robotic",
+                "Smile before you dial -- they can genuinely hear it in your voice",
+                "Say their business name as a question first -- confirm you have the right person",
+                "Admit it is a cold call immediately -- it disarms them and builds trust",
+                "Give them the choice to hang up -- most will not take it",
+                "Your goal is a Zoom or callback, not a close. Keep that in mind the whole call",
+                "Tone matters more than words -- calm, confident, not robotic",
             ],
-            "script": "Hi, is this [Business Name]? Great — my name is Odelyn, I'm calling from Lynkflow. We help plumbing businesses make sure they never miss a customer call — even when they're in the middle of a job or it's the middle of the night. I just need about 60 seconds of your time. Is now an okay moment?",
+            "script": "Hi, am I reaching the owner of [Business Name]? Yeah, so I am going to be honest with you -- this is a cold call, so I do have something to pitch to your business. Would you like to hang up now or give me 30 seconds and then you can decide?",
             "sample_label": "Hear the opening",
         },
         {
@@ -181,7 +285,7 @@ async def get_modules():
                 "Pause after 'walking straight to your competitor' — let that sit for a second",
                 "Keep it under 50 seconds. If you're going longer, you're over-explaining",
             ],
-            "script": "Here's the thing — every time your phone rings and you can't get to it, that's a potential job walking straight to your competitor. Most people don't leave voicemails, and they don't call back. Lynkflow gives your business a 24/7 answering system that picks up every single call — even if three people call at the exact same time. It handles the conversation, finds out what the customer needs, books appointments straight into your calendar, and sends you a full summary by text or email right away. You never miss another lead. Not at 2am. Not on weekends. Not when you're knee-deep in a job. And it costs a fraction of what a receptionist would.",
+            "script": "I checked out your listing on Google and saw you are a plumbing business. We help plumbers make sure they never miss a customer call -- we build a 24/7 AI system that answers every call automatically, even when you are out on a job, and sends you a full summary by text right away. No contracts, month to month, cancel anytime. Does that sound like something worth a quick 10-minute Zoom so I can show you exactly how it works?",
             "sample_label": "Hear the full pitch",
         },
         {
@@ -291,6 +395,26 @@ async def get_modules():
                     "id": "faq_voicemail",
                     "question": "We already have voicemail — why do we need this?",
                     "answer": "Voicemail is what happens after you miss a call. The problem is most callers — over 80% — hang up when they hit voicemail and immediately call the next plumber on Google. That job is gone before you even hear the message. Lynkflow means you never miss the call in the first place. Every caller gets answered live, their details are captured, and you get notified instantly. No phone tag, no lost jobs.",
+                },
+                {
+                    "id": "faq_leave_message",
+                    "question": "The staff says 'I can take a message' or 'What do you want me to tell him?' — what do I say?",
+                    "answer": "Don't hand them a full pitch, it never gets relayed correctly. Give them something short they can actually repeat, then pivot straight to getting a callback time. Say: 'Sure — just let them know Odelyn from Lynkflow called about their business phone line, and that we help plumbers stop losing jobs to missed calls. It only takes about 10 minutes to show them. When's the best time I can catch them directly — morning or afternoon?' The message gives them enough to sound legitimate, and the question gets you a real time instead of a dead end. Always write down the day and time they give you and put it in your notes so you actually call back when you said you would.",
+                },
+                {
+                    "id": "faq_staff_wont_give_time",
+                    "question": "The staff won't give me a callback time and just says 'I'll pass it along'",
+                    "answer": "That's a soft no. Push once, politely: 'I appreciate that — the only thing is I'd hate to keep calling and bothering you. Is there a time of day they're usually around? Even a rough window helps.' If they still won't give you anything, don't fight it. Say: 'No worries at all, I'll try back another time. Thanks for your help.' Then disposition it as Callback with a note saying gatekeeper wouldn't give a time, and try again in a couple days at a different hour — early morning before 8am or late afternoon after 4pm local time often gets you the owner directly.",
+                },
+                {
+                    "id": "faq_ivr",
+                    "question": "We already have a system — callers press 1 for service, press 2 for billing, etc.",
+                    "answer": "That's an IVR menu — and they're useful for routing, but they don't actually help the customer. Most callers, especially in an emergency, just want to talk to someone fast. When they hit 'press 1, press 2,' a big chunk of them hang up before they even finish the menu — especially older customers or anyone frustrated. Lynkflow replaces that friction with a live conversation. The agent greets them, finds out what they need, and handles it — no menus, no waiting, no hang-ups. It's a better experience for your customer and more jobs captured for you.",
+                },
+                {
+                    "id": "faq_staff_answers",
+                    "question": "Someone on my staff answers — what do they tell me about the call?",
+                    "answer": "That's actually one of the biggest gaps we fix. When a staff member takes a call, the quality of what gets relayed to you depends entirely on that person — and details get lost all the time. With Lynkflow, every single call gets logged automatically. After every call, you get a full summary: who called, what they needed, whether they booked, and their contact info — all in one place, the moment the call ends. No playing telephone with your team. If a staff member takes the call and an owner callback is needed, Lynkflow captures the name, number, and the best time to reach them so you call back knowing exactly what the situation is.",
                 },
                 {
                     "id": "faq_receptionist",
@@ -486,15 +610,28 @@ async def get_modules():
             "id": "callback",
             "title": "Callback Confirmation",
             "icon": "📅",
-            "explanation": "When someone says 'call me back later,' most agents nod and hang up — then call at a random time and start from zero again. You need to lock in a specific time and set expectations so the callback feels like a scheduled meeting, not a cold call all over again.",
+            "explanation": "When someone says 'call me back later,' most agents nod and hang up — then call at a random time and start from zero again. You need to lock in a specific time and set expectations so the callback feels like a scheduled meeting, not a cold call all over again. But the most powerful callback is when YOU called them first and hit voicemail — that missed call becomes your best pitch.",
             "tips": [
                 "Always get a specific time — not 'sometime this week'",
                 "Repeat the time back to them to confirm",
                 "When you call back, reference the previous conversation immediately",
                 "If they don't pick up at the agreed time, leave a voicemail referencing the scheduled callback",
+                "If you hit their voicemail on a previous call — use it as proof of their problem when you call back",
+                "Never start a callback from zero — always reference why you are calling back",
             ],
             "script": "Completely understand — what's the best time to reach you? Is [morning / afternoon] better? ... [Confirm time] ... Perfect — so I'll call you back on [day] at [time]. And it's still [their number] that's best? ... Great. I'll have more details ready for you then. Talk soon. ... [On callback]: Hi [name], this is Odelyn from Lynkflow — we spoke [yesterday / earlier this week] and scheduled this call. Did I catch you at an okay time?",
             "sample_label": "Hear the callback script",
+            "aha_pitch": {
+                "title": "The Aha Callback — When You Hit Their Voicemail First",
+                "explanation": "This is your most powerful pitch. You literally experienced their problem firsthand — you called and they missed it. Use that. When you call back a No Answer or Voicemail lead, don't start from scratch. Open with proof.",
+                "script": "Hey, I actually called your shop yesterday but got your voicemail. I am calling back because I help plumbing businesses make sure that never happens to their customers. Because if I was a homeowner with a burst pipe, I would not have left a message — I would have hung up and called your competitor down the street. We build 24/7 AI receptionist lines so that every single call gets answered, even when you are under a sink. Does that sound like something worth two minutes of your time?",
+                "why_it_works": [
+                    "It proves the problem — you are not guessing they miss calls, you literally experienced it",
+                    "It makes the math real — a burst pipe call is worth $500 to $2,000, and it just went to a competitor",
+                    "It is not a pitch — it is a story about something that actually happened",
+                    "It creates instant credibility — you called, you noticed, you came back with a solution",
+                ]
+            },
         },
         {
             "id": "dispositions",
@@ -634,5 +771,311 @@ async def get_modules():
             ],
             "sample_label": None,
         },
+        {
+            "id": "cheatsheet",
+            "title": "Call Cheat Sheet",
+            "icon": "⚡",
+            "explanation": "Everything you need during a live call. Keep this open while dialing. Don't overthink — just follow the flow.",
+            "tips": [],
+            "cheatsheet": {
+                "flow": [
+                    {"step": "1", "label": "Open", "text": "Hi, am I reaching the owner of [Business Name]?"},
+                    {"step": "2", "label": "Disarm", "text": "Yeah, so I am going to be honest -- this is a cold call. Would you like to hang up now or give me 30 seconds and then you can decide?"},
+                    {"step": "3", "label": "Pitch", "text": "I checked your Google listing. We help plumbers never miss a customer call -- 24/7 AI that answers every call automatically and texts you a summary instantly. No contracts, cancel anytime. If that sounds interesting, my partner can show you exactly how it works on a quick 10-minute Zoom. No commitment, just a live demo. Would that be worth your time?"},
+                    {"step": "4", "label": "Book", "text": "What day and time works best for a quick 10-minute Zoom? I will send the link right after this call."},
+                    {"step": "5", "label": "Confirm", "text": "Just to confirm -- [day] at [time] [timezone]. What is the best email to send the Zoom link to?"},
+                    {"step": "6", "label": "Close", "text": "Perfect. You will get the Zoom link in a few minutes. Looking forward to showing you how it works. Have a great day!"},
+                ],
+                "objections": [
+                    {"trigger": "Not interested", "reply": "Totally fair. When you miss a call on a job, where does that lead go?"},
+                    {"trigger": "We have voicemail", "reply": "80% of callers hang up before leaving a voicemail. They call your competitor instead."},
+                    {"trigger": "Too busy", "reply": "No problem — what day and time works better for our team to reach you?"},
+                    {"trigger": "How much?", "reply": "$300-500 setup, $100-150/month. One saved job covers months of the service."},
+                    {"trigger": "Already have a receptionist", "reply": "Great — we handle overflow and after-hours calls they cannot get to. Worth a quick look?"},
+                    {"trigger": "Is this AI?", "reply": "Yes — and I am calling because we help plumbers never miss a job from a missed call. Worth a quick conversation?"},
+                    {"trigger": "Send me info", "reply": "Absolutely — what is the best email for you?"},
+                    {"trigger": "Think about it", "reply": "Of course — what part do you want to think through? I can answer it right now."},
+                ],
+                "statuses": [
+                    {"code": "Called", "when": "Answered, had a conversation"},
+                    {"code": "Voicemail", "when": "Left a voicemail"},
+                    {"code": "VM No Msg", "when": "Voicemail, no message left"},
+                    {"code": "No Answer", "when": "Rang, nobody picked up"},
+                    {"code": "IVR", "when": "Hit automated system, press 1/8 etc"},
+                    {"code": "Callback", "when": "They asked you to call back"},
+                    {"code": "Interested", "when": "Pitched, they want more info"},
+                    {"code": "NI", "when": "Clear no after pitch"},
+                    {"code": "DNC", "when": "Asked to be removed — never call again"},
+                    {"code": "Wrong #", "when": "Number does not match business"},
+                ],
+                "numbers": [
+                    {"label": "Your caller ID", "value": "+1 (978) 684-3590"},
+                    {"label": "Demo number (Rex)", "value": "+1 (401) 386-9119"},
+                ],
+                "attempts": [
+                    "1st call — no answer → leave voicemail with demo number",
+                    "2nd call — no answer → no voicemail, hang up",
+                    "3rd call — no answer → status RING, move on",
+                ]
+            },
+            "sample_label": None,
+        },
+        {
+            "id": "zoom_demo",
+            "title": "Zoom Demo Guide",
+            "icon": "🖥️",
+            "explanation": "This section is for Selwyn only. When Odelyn books a Zoom, you run it. Your job is to show Rex working live, answer technical questions, and close the deal. Keep it under 15 minutes. Be confident -- you built this.",
+            "tips": [
+                "Open with their name and business -- shows you know who they are",
+                "Keep it under 15 minutes -- respect their time",
+                "Show Rex answering a live call -- this is the money moment",
+                "Show the email notification landing in real time",
+                "Show the Google Sheets updating automatically",
+                "Answer questions confidently -- you built every part of this",
+                "Close at the end -- do not let them say they will think about it without a follow up time",
+            ],
+            "zoom_flow": [
+                {"step": "1", "label": "Open", "text": "Hey [Name], thanks for making time. I am Selwyn, the one who builds these systems. I will keep this to 10 minutes. Is it okay if I share my screen?"},
+                {"step": "2", "label": "Context", "text": "So Odelyn gave me a quick rundown -- you run [Business Name] and you are dealing with missed calls when you are out on jobs. That is exactly what we fix. Let me show you what your customers would experience."},
+                {"step": "3", "label": "Live Call", "text": "I am going to call our demo number right now. Watch what happens. [Call +1 401 386 9119 -- Rex answers] That is exactly what your customers would hear -- branded with your business name, 24/7, even if three people call at the same time."},
+                {"step": "4", "label": "Show Notification", "text": "Now watch your phone -- actually watch mine. [Show email landing] Every single call gets logged like this. You see exactly who called, what they need, and when. You call them back knowing everything already."},
+                {"step": "5", "label": "Handle Questions", "text": "What questions do you have? [Answer everything honestly. If you do not know, say you will confirm and follow up.]"},
+                {"step": "6", "label": "Pricing", "text": "Setup is between $300 and $500 depending on how we customize it for your business specifically. After that it is $100 to $150 a month. One saved job covers that instantly. Most of our clients see that in the first week."},
+                {"step": "7", "label": "Close", "text": "What questions do you still have? [Handle them.] Here is what setup looks like. I need your business details for the agent script, a Google account so I can connect your calendar and call logs, and access to set up call forwarding from your business number. Once I have those it takes about 5 days to build, test, and go live. Sound good? [Wait.] Does it make sense to move forward? [Wait for yes.] Perfect. I will send the PayPal invoice now and start building. What email should I use?"},
+            ],
+            "sample_label": None,
+        },
     ]
     return JSONResponse(modules)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/agent/config")
+async def get_agent_config():
+    return JSONResponse(load_agent_config().model_dump())
+
+
+@app.post("/api/agent/config")
+async def post_agent_config(request: Request):
+    data = await request.json()
+    cfg = AgentConfig(**data)
+    _save_agent_config(cfg)
+    return JSONResponse({"success": True})
+
+
+@app.post("/api/agent/initiate")
+async def agent_initiate(request: Request):
+    """
+    Kick off an outbound call via Twilio REST API.
+    Twilio calls the lead; when connected it fetches our TwiML which opens
+    the media stream WebSocket back to this server.
+    """
+    data     = await request.json()
+    phone    = data.get("phone", "").strip()
+    lead     = data.get("lead", {})
+    base_url = data.get("base_url", "").rstrip("/")
+
+    if not phone:
+        raise HTTPException(400, "phone required")
+    if not base_url:
+        raise HTTPException(400, "base_url required (your ngrok / production URL)")
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_CALLER_ID]):
+        raise HTTPException(500, "Twilio credentials not set in .env")
+
+    # Persist base_url into config so TwiML callback knows it too
+    cfg = load_agent_config()
+    if cfg.base_url != base_url:
+        cfg.base_url = base_url
+        _save_agent_config(cfg)
+
+    # Build TwiML callback URL
+    lead_phone = urllib.parse.quote(phone)
+    lead_name  = urllib.parse.quote(lead.get("Name", ""))
+    lead_city  = urllib.parse.quote(lead.get("City", ""))
+    lead_cat   = urllib.parse.quote(lead.get("Category", ""))
+    twiml_url  = (
+        f"{base_url}/api/agent/twiml"
+        f"?phone={lead_phone}&name={lead_name}&city={lead_city}&category={lead_cat}"
+    )
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json",
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            data={
+                "To":   phone,
+                "From": TWILIO_CALLER_ID,
+                "Url":  twiml_url,
+                "StatusCallback": f"{base_url}/api/agent/call-status",
+                "StatusCallbackMethod": "POST",
+            },
+        )
+
+    if r.status_code not in (200, 201):
+        raise HTTPException(502, f"Twilio error: {r.text}")
+
+    call_sid = r.json()["sid"]
+    _agent_queues[call_sid] = asyncio.Queue()
+    _agent_events[call_sid] = []
+
+    return JSONResponse({"success": True, "call_sid": call_sid})
+
+
+@app.get("/api/agent/twiml")
+@app.post("/api/agent/twiml")
+async def agent_twiml(request: Request):
+    """
+    TwiML returned to Twilio when the outbound call connects.
+    Opens a bidirectional Media Stream WebSocket to this server.
+    """
+    params = dict(request.query_params)
+    phone    = urllib.parse.quote(params.get("phone", ""))
+    name     = urllib.parse.quote(params.get("name", ""))
+    city     = urllib.parse.quote(params.get("city", ""))
+    category = urllib.parse.quote(params.get("category", ""))
+
+    cfg = load_agent_config()
+    base_url = cfg.base_url.rstrip("/")
+
+    # Convert http(s) to ws(s)
+    ws_base = base_url.replace("https://", "wss://").replace("http://", "ws://")
+    stream_url = (
+        f"{ws_base}/ws/agent/stream"
+        f"?phone={phone}&name={name}&city={city}&category={category}"
+    )
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{stream_url}" />
+    </Connect>
+</Response>"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/api/agent/call-status")
+async def agent_call_status(request: Request):
+    """Twilio StatusCallback — update internal state on call completion."""
+    form = await request.form()
+    call_sid     = form.get("CallSid", "")
+    call_status  = form.get("CallStatus", "")
+
+    if call_status in ("completed", "failed", "busy", "no-answer", "canceled"):
+        q = _agent_queues.get(call_sid)
+        if q:
+            await q.put({"type": "status", "state": "ended", "message": f"Call {call_status}"})
+
+    return Response(content="", media_type="text/plain")
+
+
+@app.post("/api/agent/end/{call_sid}")
+async def agent_end_call(call_sid: str):
+    """Frontend-triggered hangup."""
+    if not TWILIO_ACCOUNT_SID:
+        raise HTTPException(500, "Twilio credentials not set")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{call_sid}.json",
+                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                data={"Status": "completed"},
+            )
+    except Exception as e:
+        print(f"End call error: {e}")
+    return JSONResponse({"success": True})
+
+
+@app.websocket("/ws/agent/stream")
+async def agent_stream(websocket: WebSocket):
+    """
+    Twilio connects here when the media stream starts.
+    This is NOT the browser — it's Twilio's servers streaming call audio.
+    """
+    await websocket.accept()
+
+    params = dict(websocket.query_params)
+    lead_info = {
+        "Name":     urllib.parse.unquote(params.get("name", "")),
+        "Phone":    urllib.parse.unquote(params.get("phone", "")),
+        "City":     urllib.parse.unquote(params.get("city", "")),
+        "Category": urllib.parse.unquote(params.get("category", "")),
+    }
+
+    cfg           = load_agent_config()
+    status_queue  = asyncio.Queue()
+
+    handler = AgentCallHandler(
+        twilio_ws    = websocket,
+        voice_id     = cfg.voice_id,
+        model        = cfg.model,
+        tone         = cfg.tone,
+        lead_info    = lead_info,
+        status_queue = status_queue,
+    )
+
+    async def _relay_status():
+        """Forward status/transcript events to the per-call SSE queue."""
+        while True:
+            try:
+                event = await asyncio.wait_for(status_queue.get(), timeout=60)
+                sid   = handler.call_sid or "unknown"
+
+                # Buffer events
+                if sid not in _agent_events:
+                    _agent_events[sid] = []
+                _agent_events[sid].append(event)
+
+                # Push to SSE queue if registered
+                q = _agent_queues.get(sid)
+                if q:
+                    await q.put(event)
+
+                if handler._stop:
+                    break
+            except asyncio.TimeoutError:
+                if handler._stop:
+                    break
+            except Exception as e:
+                print(f"Relay error: {e}")
+                break
+
+    await asyncio.gather(handler.run(), _relay_status())
+
+
+@app.get("/api/agent/events/{call_sid}")
+async def agent_events(call_sid: str):
+    """
+    SSE stream — browser connects here to receive live status + transcript.
+    Replays buffered events first, then streams new ones.
+    """
+    async def stream():
+        # Replay buffered events
+        for evt in _agent_events.get(call_sid, []):
+            yield f"data: {json.dumps(evt)}\n\n"
+
+        # Stream new events
+        q = _agent_queues.get(call_sid)
+        if not q:
+            yield f"data: {json.dumps({'type':'error','message':'Call not found'})}\n\n"
+            return
+
+        while True:
+            try:
+                evt = await asyncio.wait_for(q.get(), timeout=30)
+                yield f"data: {json.dumps(evt)}\n\n"
+                if evt.get("type") == "status" and evt.get("state") == "ended":
+                    _agent_queues.pop(call_sid, None)
+                    _agent_events.pop(call_sid, None)
+                    break
+            except asyncio.TimeoutError:
+                yield "data: {\"type\":\"ping\"}\n\n"
+            except Exception:
+                break
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
