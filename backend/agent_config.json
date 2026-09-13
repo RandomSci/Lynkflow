@@ -1,9 +1,0 @@
-{
-  "enabled": true,
-  "voice_id": "EXAVITQu4vr4xnSDxMaL",
-  "voice_name": "Sarah",
-  "model": "gpt-4o-mini",
-  "tone": "professional",
-  "speaking_rate": 1.0,
-  "base_url": "https://records-base-slope-sentence.trycloudflare.com"
-}

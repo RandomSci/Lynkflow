@@ -910,6 +910,8 @@ async def agent_initiate(request: Request):
                 "Url":  twiml_url,
                 "StatusCallback": f"{base_url}/api/agent/call-status",
                 "StatusCallbackMethod": "POST",
+                "StatusCallbackEvent": ["initiated", "ringing", "answered", "completed"],
+                "Timeout": "30",
             },
         )
 
@@ -966,15 +968,17 @@ async def agent_twiml(request: Request):
 
 @app.post("/api/agent/call-status")
 async def agent_call_status(request: Request):
-    """Twilio StatusCallback — update internal state on call completion."""
-    form = await request.form()
-    call_sid     = form.get("CallSid", "")
-    call_status  = form.get("CallStatus", "")
+    form        = await request.form()
+    call_sid    = form.get("CallSid", "")
+    call_status = form.get("CallStatus", "")
+    print(f"[CALL STATUS] {call_sid} → {call_status}")
 
     if call_status in ("completed", "failed", "busy", "no-answer", "canceled"):
-        q = _agent_queues.get(call_sid)
-        if q:
-            await q.put({"type": "status", "state": "ended", "message": f"Call {call_status}"})
+        if call_sid not in _agent_queues:
+            _agent_queues[call_sid] = asyncio.Queue()
+        await _agent_queues[call_sid].put({
+            "type": "status", "state": "ended", "message": f"Call {call_status}"
+        })
 
     return Response(content="", media_type="text/plain")
 
@@ -1012,14 +1016,12 @@ async def agent_stream(websocket: WebSocket):
         "Category": urllib.parse.unquote(params.get("category", "")),
     }
 
-    cfg           = load_agent_config()
-    status_queue  = asyncio.Queue()
+    cfg          = load_agent_config()
+    status_queue = asyncio.Queue()
 
     handler = AgentCallHandler(
         twilio_ws    = websocket,
-        voice_id     = cfg.voice_id,
-        model        = cfg.model,
-        tone         = cfg.tone,
+        cfg          = cfg,
         lead_info    = lead_info,
         status_queue = status_queue,
     )
@@ -1067,12 +1069,13 @@ async def agent_events(call_sid: str):
         # Stream new events
         q = _agent_queues.get(call_sid)
         if not q:
-            yield f"data: {json.dumps({'type':'error','message':'Call not found'})}\n\n"
+            yield f"data: {json.dumps({'type':'status','state':'ended','message':'Call ended'})}\n\n"
             return
 
         while True:
             try:
                 evt = await asyncio.wait_for(q.get(), timeout=30)
+                print(f"[SSE OUT] {evt}")
                 yield f"data: {json.dumps(evt)}\n\n"
                 if evt.get("type") == "status" and evt.get("state") == "ended":
                     _agent_queues.pop(call_sid, None)
@@ -1086,5 +1089,18 @@ async def agent_events(call_sid: str):
     return StreamingResponse(
         stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
+
+
+@app.post("/api/agent/config/reset")
+async def reset_agent_config():
+    from agent_config import AgentConfig
+    cfg = load_agent_config()
+    fresh = AgentConfig(enabled=cfg.enabled, base_url=cfg.base_url)
+    _save_agent_config(fresh)
+    return JSONResponse({"success": True})

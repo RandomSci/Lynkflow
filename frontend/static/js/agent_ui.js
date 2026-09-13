@@ -2,18 +2,10 @@
 // AGENT UI — AI outbound agent controls, options, live transcript
 // ═══════════════════════════════════════════════════════════════════════════
 
-let agentConfig = {
-  enabled: false,
-  voice_id: 'EXAVITQu4vr4xnSDxMaL',
-  voice_name: 'Sarah',
-  model: 'gpt-4o-mini',
-  tone: 'professional',
-  speaking_rate: 1.0,
-  base_url: '',
-};
-
+let agentConfig = {};
 let agentCallSid = null;
 let agentEventSource = null;
+let agentCallTimeout = null;
 
 const VOICES = [
   { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah',   desc: 'Warm, professional female' },
@@ -25,20 +17,18 @@ const VOICES = [
 ];
 
 const TONES = [
-  { id: 'professional', label: 'Professional', desc: 'Confident and businesslike' },
-  { id: 'friendly',     label: 'Friendly',     desc: 'Warm and conversational' },
-  { id: 'direct',       label: 'Direct',       desc: 'Brief and straight to the point' },
+  { id: 'professional', label: 'Professional', desc: 'Confident, businesslike' },
+  { id: 'friendly',     label: 'Friendly',     desc: 'Warm, conversational' },
+  { id: 'direct',       label: 'Direct',       desc: 'Brief, straight to the point' },
 ];
 
-// ── Config load / save ─────────────────────────────────────────────────────
+// ── Config ──────────────────────────────────────────────────────────────────
 
 async function loadAgentConfig() {
   try {
     const res = await fetch('/api/agent/config');
     agentConfig = await res.json();
-  } catch (e) {
-    console.error('Failed to load agent config', e);
-  }
+  } catch (e) { console.error('Config load failed', e); }
   return agentConfig;
 }
 
@@ -49,12 +39,10 @@ async function saveAgentConfig() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(agentConfig),
     });
-  } catch (e) {
-    console.error('Failed to save agent config', e);
-  }
+  } catch (e) { console.error('Config save failed', e); }
 }
 
-// ── Agent toggle bar (injected into dialer page) ───────────────────────────
+// ── Toggle bar ──────────────────────────────────────────────────────────────
 
 function buildAgentBar() {
   const bar = document.createElement('div');
@@ -73,17 +61,13 @@ function buildAgentBar() {
         </div>
       </div>
     </div>
-    <button class="agent-options-btn" id="agentOptionsBtn">
-      <span>⚙</span> Options
-    </button>
+    <button class="agent-options-btn" id="agentOptionsBtn"><span>&#9881;</span> Options</button>
   `;
-
   bar.querySelector('#agentToggle').addEventListener('change', async (e) => {
     agentConfig.enabled = e.target.checked;
     await saveAgentConfig();
     applyAgentMode();
   });
-
   bar.querySelector('#agentOptionsBtn').addEventListener('click', toggleAgentOptions);
   return bar;
 }
@@ -91,54 +75,141 @@ function buildAgentBar() {
 // ── Options panel ───────────────────────────────────────────────────────────
 
 function buildAgentOptions() {
-  const panel = document.createElement('div');
-  panel.className = 'card agent-options-panel';
-  panel.id = 'agentOptionsPanel';
-  panel.style.display = 'none';
+  const p = document.createElement('div');
+  p.className = 'card agent-options-panel';
+  p.id = 'agentOptionsPanel';
+  p.style.display = 'none';
 
-  panel.innerHTML = `
-    <div class="card-label">Agent Configuration</div>
-
-    <div class="agent-opt-group">
-      <div class="agent-opt-label">Voice</div>
-      <div class="agent-voice-grid" id="voiceGrid"></div>
+  p.innerHTML = `
+    <div class="agent-opt-tabs">
+      <button class="agent-opt-tab active" data-tab="messages">Messages</button>
+      <button class="agent-opt-tab" data-tab="voice">Voice</button>
+      <button class="agent-opt-tab" data-tab="model">Model</button>
+      <button class="agent-opt-tab" data-tab="behavior">Behavior</button>
     </div>
 
-    <div class="agent-opt-group">
-      <div class="agent-opt-label">Tone</div>
-      <div class="agent-tone-row" id="toneRow"></div>
+    <!-- MESSAGES -->
+    <div class="agent-opt-pane active" data-pane="messages">
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">
+          First Message
+          <span class="agent-opt-hint">Spoken the moment the lead picks up. Use {business}, {city}, {category}</span>
+        </div>
+        <textarea id="optFirstMessage" class="agent-textarea" rows="4">${escAttr(agentConfig.first_message || '')}</textarea>
+      </div>
+
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">
+          System Prompt
+          <span class="agent-opt-hint">The agent's brain — rules, pitch, objection handling</span>
+        </div>
+        <textarea id="optSystemPrompt" class="agent-textarea agent-textarea--tall" rows="16">${escAttr(agentConfig.system_prompt || '')}</textarea>
+      </div>
+
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">
+          End Call Phrases
+          <span class="agent-opt-hint">Comma separated — agent hangs up after saying any of these</span>
+        </div>
+        <input type="text" id="optEndPhrases" class="agent-select" value="${escAttr(agentConfig.end_call_phrases || '')}" />
+      </div>
     </div>
 
-    <div class="agent-opt-group">
-      <div class="agent-opt-label">Model</div>
-      <select id="agentModel" class="agent-select">
-        <option value="gpt-4o-mini" ${agentConfig.model === 'gpt-4o-mini' ? 'selected' : ''}>
-          GPT-4o Mini — faster, cheaper
-        </option>
-        <option value="gpt-4o" ${agentConfig.model === 'gpt-4o' ? 'selected' : ''}>
-          GPT-4o — smarter, slower
-        </option>
-      </select>
+    <!-- VOICE -->
+    <div class="agent-opt-pane" data-pane="voice">
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">Voice</div>
+        <div class="agent-voice-grid" id="voiceGrid"></div>
+      </div>
+
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">Tone</div>
+        <div class="agent-tone-row" id="toneRow"></div>
+      </div>
+
+      <div class="agent-opt-group">
+        ${slider('optStability', 'Stability', agentConfig.stability, 0, 1, 0.05,
+                 'Lower = more expressive, higher = more consistent')}
+        ${slider('optSimilarity', 'Similarity Boost', agentConfig.similarity_boost, 0, 1, 0.05,
+                 'How closely it matches the original voice')}
+        ${slider('optStyle', 'Style Exaggeration', agentConfig.style, 0, 1, 0.05,
+                 'Adds emotion — higher values increase latency')}
+        ${slider('optRate', 'Speaking Rate', agentConfig.speaking_rate, 0.7, 1.2, 0.05,
+                 'Playback speed')}
+      </div>
     </div>
 
-    <div class="agent-opt-group">
-      <div class="agent-opt-label">Public URL <span class="agent-opt-hint">(ngrok or production — Twilio needs to reach your server)</span></div>
-      <input type="text" id="agentBaseUrl" class="agent-select" placeholder="https://your-tunnel.ngrok-free.app"
-             value="${agentConfig.base_url || ''}" />
+    <!-- MODEL -->
+    <div class="agent-opt-pane" data-pane="model">
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">Model</div>
+        <select id="optModel" class="agent-select">
+          <option value="gpt-4o-mini" ${agentConfig.model === 'gpt-4o-mini' ? 'selected' : ''}>GPT-4o Mini — faster, cheaper</option>
+          <option value="gpt-4o" ${agentConfig.model === 'gpt-4o' ? 'selected' : ''}>GPT-4o — smarter, slower</option>
+        </select>
+      </div>
+      <div class="agent-opt-group">
+        ${slider('optTemperature', 'Temperature', agentConfig.temperature, 0, 1.2, 0.05,
+                 'Lower = predictable and on-script, higher = more varied')}
+        ${slider('optMaxTokens', 'Max Response Length', agentConfig.max_tokens, 60, 400, 10,
+                 'Cap on how long each reply can be', true)}
+      </div>
+    </div>
+
+    <!-- BEHAVIOR -->
+    <div class="agent-opt-pane" data-pane="behavior">
+      <div class="agent-opt-group">
+        ${slider('optEndpointing', 'Response Delay (ms)', agentConfig.endpointing_ms, 100, 1500, 50,
+                 'Silence before the agent starts replying. Lower = snappier but may cut people off', true)}
+        ${slider('optUtteranceEnd', 'Turn End Detection (ms)', agentConfig.utterance_end_ms, 500, 3000, 100,
+                 'Silence that marks the prospect finished their turn', true)}
+        ${slider('optSilenceTimeout', 'Silence Timeout (sec)', agentConfig.silence_timeout_s, 5, 60, 5,
+                 'Hang up after this much dead air', true)}
+        ${slider('optMaxDuration', 'Max Call Duration (sec)', agentConfig.max_duration_s, 60, 900, 30,
+                 'Hard cap — call ends automatically at this point', true)}
+      </div>
+      <div class="agent-opt-group">
+        <label class="agent-checkbox-row">
+          <input type="checkbox" id="optInterruption" ${agentConfig.allow_interruption ? 'checked' : ''} />
+          <span>
+            <span class="agent-checkbox-label">Allow interruption (barge-in)</span>
+            <span class="agent-opt-hint">Agent stops talking the moment the prospect speaks</span>
+          </span>
+        </label>
+      </div>
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">
+          Public URL
+          <span class="agent-opt-hint">Your ngrok or cloudflare tunnel — Twilio must reach this</span>
+        </div>
+        <input type="text" id="optBaseUrl" class="agent-select"
+               placeholder="https://your-tunnel.trycloudflare.com"
+               value="${escAttr(agentConfig.base_url || '')}" />
+      </div>
     </div>
 
     <div class="agent-opt-footer">
+      <button class="agent-reset-btn" id="agentResetBtn">Reset to defaults</button>
       <span id="agentSaveFeedback" class="agent-save-feedback"></span>
       <button class="agent-save-btn" id="agentSaveBtn">Save settings</button>
     </div>
   `;
 
+  // Tabs
+  p.querySelectorAll('.agent-opt-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      p.querySelectorAll('.agent-opt-tab').forEach(t => t.classList.remove('active'));
+      p.querySelectorAll('.agent-opt-pane').forEach(pane => pane.classList.remove('active'));
+      tab.classList.add('active');
+      p.querySelector(`[data-pane="${tab.dataset.tab}"]`).classList.add('active');
+    });
+  });
+
   // Voice cards
-  const vGrid = panel.querySelector('#voiceGrid');
+  const vGrid = p.querySelector('#voiceGrid');
   VOICES.forEach(v => {
     const el = document.createElement('div');
     el.className = 'agent-voice-card' + (agentConfig.voice_id === v.id ? ' selected' : '');
-    el.dataset.voiceId = v.id;
     el.innerHTML = `<div class="agent-voice-name">${v.name}</div><div class="agent-voice-desc">${v.desc}</div>`;
     el.addEventListener('click', () => {
       vGrid.querySelectorAll('.agent-voice-card').forEach(c => c.classList.remove('selected'));
@@ -150,7 +221,7 @@ function buildAgentOptions() {
   });
 
   // Tone buttons
-  const tRow = panel.querySelector('#toneRow');
+  const tRow = p.querySelector('#toneRow');
   TONES.forEach(t => {
     const el = document.createElement('button');
     el.className = 'agent-tone-btn' + (agentConfig.tone === t.id ? ' selected' : '');
@@ -163,26 +234,79 @@ function buildAgentOptions() {
     tRow.appendChild(el);
   });
 
-  panel.querySelector('#agentSaveBtn').addEventListener('click', async () => {
-    agentConfig.model    = panel.querySelector('#agentModel').value;
-    agentConfig.base_url = panel.querySelector('#agentBaseUrl').value.trim();
+  // Live slider value display
+  p.querySelectorAll('.agent-slider').forEach(s => {
+    s.addEventListener('input', () => {
+      const out = p.querySelector(`#${s.id}_val`);
+      if (out) out.textContent = s.value;
+    });
+  });
+
+  // Save
+  p.querySelector('#agentSaveBtn').addEventListener('click', async () => {
+    agentConfig.first_message     = p.querySelector('#optFirstMessage').value;
+    agentConfig.system_prompt     = p.querySelector('#optSystemPrompt').value;
+    agentConfig.end_call_phrases  = p.querySelector('#optEndPhrases').value;
+    agentConfig.model             = p.querySelector('#optModel').value;
+    agentConfig.temperature       = parseFloat(p.querySelector('#optTemperature').value);
+    agentConfig.max_tokens        = parseInt(p.querySelector('#optMaxTokens').value);
+    agentConfig.stability         = parseFloat(p.querySelector('#optStability').value);
+    agentConfig.similarity_boost  = parseFloat(p.querySelector('#optSimilarity').value);
+    agentConfig.style             = parseFloat(p.querySelector('#optStyle').value);
+    agentConfig.speaking_rate     = parseFloat(p.querySelector('#optRate').value);
+    agentConfig.endpointing_ms    = parseInt(p.querySelector('#optEndpointing').value);
+    agentConfig.utterance_end_ms  = parseInt(p.querySelector('#optUtteranceEnd').value);
+    agentConfig.silence_timeout_s = parseInt(p.querySelector('#optSilenceTimeout').value);
+    agentConfig.max_duration_s    = parseInt(p.querySelector('#optMaxDuration').value);
+    agentConfig.allow_interruption = p.querySelector('#optInterruption').checked;
+    agentConfig.base_url          = p.querySelector('#optBaseUrl').value.trim();
+
     await saveAgentConfig();
-    const fb = panel.querySelector('#agentSaveFeedback');
+    const fb = p.querySelector('#agentSaveFeedback');
     fb.textContent = 'Saved';
     fb.classList.add('visible');
     setTimeout(() => fb.classList.remove('visible'), 2000);
   });
 
-  return panel;
+  // Reset
+  p.querySelector('#agentResetBtn').addEventListener('click', async () => {
+    if (!confirm('Reset all agent settings to defaults?')) return;
+    await fetch('/api/agent/config/reset', { method: 'POST' });
+    await loadAgentConfig();
+    const old = document.getElementById('agentOptionsPanel');
+    const fresh = buildAgentOptions();
+    fresh.style.display = 'block';
+    old.replaceWith(fresh);
+  });
+
+  return p;
+}
+
+function slider(id, label, value, min, max, step, hint, isInt) {
+  const v = value ?? min;
+  return `
+    <div class="agent-slider-row">
+      <div class="agent-slider-head">
+        <span class="agent-slider-label">${label}</span>
+        <span class="agent-slider-value" id="${id}_val">${v}</span>
+      </div>
+      <input type="range" class="agent-slider" id="${id}"
+             min="${min}" max="${max}" step="${step}" value="${v}" />
+      ${hint ? `<div class="agent-opt-hint">${hint}</div>` : ''}
+    </div>
+  `;
+}
+
+function escAttr(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function toggleAgentOptions() {
   const p = document.getElementById('agentOptionsPanel');
-  if (!p) return;
-  p.style.display = p.style.display === 'none' ? 'block' : 'none';
+  if (p) p.style.display = p.style.display === 'none' ? 'block' : 'none';
 }
 
-// ── Apply agent mode — swaps manual dialer UI for agent UI ──────────────────
+// ── Mode switching ──────────────────────────────────────────────────────────
 
 function applyAgentMode() {
   const sub      = document.getElementById('agentBarSub');
@@ -190,50 +314,43 @@ function applyAgentMode() {
   const dialCard = document.querySelector('.dialer-card');
   const bar      = document.getElementById('agentBar');
 
-  if (sub) {
-    sub.textContent = agentConfig.enabled
-      ? 'Agent will handle calls automatically'
-      : 'You handle calls manually';
-  }
+  if (sub) sub.textContent = agentConfig.enabled
+    ? 'Agent will handle calls automatically'
+    : 'You handle calls manually';
 
   if (bar) bar.classList.toggle('agent-bar--active', agentConfig.enabled);
   if (dialCard) dialCard.classList.toggle('dialer-card--agent', agentConfig.enabled);
 
   if (callBtn) {
     if (agentConfig.enabled) {
-      callBtn.textContent = '🤖 Start Agent Call';
+      callBtn.textContent = '\u{1F916} Start Agent Call';
       callBtn.className = 'call-btn call-btn--agent';
       callBtn.onclick = handleAgentCallBtn;
     } else {
-      callBtn.textContent = '📞 Call';
+      callBtn.textContent = '\u{1F4DE} Call';
       callBtn.className = 'call-btn call-btn--start';
       callBtn.onclick = handleCallBtn;
     }
   }
 
-  // Show/hide transcript panel
   const tp = document.getElementById('agentTranscriptPanel');
   if (tp) tp.style.display = agentConfig.enabled ? 'block' : 'none';
 }
 
-// ── Agent call control ──────────────────────────────────────────────────────
+// ── Call control ────────────────────────────────────────────────────────────
 
 async function handleAgentCallBtn() {
-  if (agentCallSid) {
-    await endAgentCall();
-    return;
-  }
+  if (agentCallSid) { await endAgentCall(); return; }
 
   const number = document.getElementById('dialerInput')?.value.trim();
   if (!number) return updateDialerStatus('Enter a phone number first', 'error');
 
   if (!agentConfig.base_url) {
-    updateDialerStatus('Set your public URL in Agent Options first', 'error');
+    updateDialerStatus('Set your public URL in Options → Behavior', 'error');
     toggleAgentOptions();
     return;
   }
 
-  // Find lead for context
   const dp = number.replace(/\D/g, '');
   const lead = leads.find(l => {
     const lp = (l['Phone'] || '').replace(/\D/g, '');
@@ -251,10 +368,21 @@ async function handleAgentCallBtn() {
       body: JSON.stringify({ phone: number, lead, base_url: agentConfig.base_url }),
     });
     const data = await res.json();
-    if (!res.ok || !data.success) throw new Error(data.detail || 'Failed to start call');
+    if (!res.ok || !data.success) throw new Error(data.detail || 'Failed to start');
 
     agentCallSid = data.call_sid;
     connectAgentEvents(agentCallSid);
+
+    agentCallTimeout = setTimeout(() => {
+      if (agentCallSid) {
+        updateDialerStatus('No answer — timed out', 'ready');
+        disconnectAgentEvents();
+        agentCallSid = null;
+        updateAgentCallBtn(false);
+        showDispositionPanel();
+      }
+    }, 90000);
+
   } catch (e) {
     updateDialerStatus(`Agent call failed: ${e.message}`, 'error');
     updateAgentCallBtn(false);
@@ -264,9 +392,7 @@ async function handleAgentCallBtn() {
 
 async function endAgentCall() {
   if (!agentCallSid) return;
-  try {
-    await fetch(`/api/agent/end/${agentCallSid}`, { method: 'POST' });
-  } catch (e) { /* ignore */ }
+  try { await fetch(`/api/agent/end/${agentCallSid}`, { method: 'POST' }); } catch (e) {}
   disconnectAgentEvents();
   agentCallSid = null;
   updateAgentCallBtn(false);
@@ -277,11 +403,11 @@ async function endAgentCall() {
 function updateAgentCallBtn(calling) {
   const btn = document.getElementById('callBtn');
   if (!btn) return;
-  btn.textContent = calling ? '⏹ End Agent Call' : '🤖 Start Agent Call';
+  btn.textContent = calling ? '\u23F9 End Agent Call' : '\u{1F916} Start Agent Call';
   btn.className = calling ? 'call-btn call-btn--end' : 'call-btn call-btn--agent';
 }
 
-// ── SSE event stream ────────────────────────────────────────────────────────
+// ── SSE ─────────────────────────────────────────────────────────────────────
 
 function connectAgentEvents(callSid) {
   disconnectAgentEvents();
@@ -290,19 +416,12 @@ function connectAgentEvents(callSid) {
   agentEventSource.onmessage = (e) => {
     let data;
     try { data = JSON.parse(e.data); } catch { return; }
-
     if (data.type === 'ping') return;
 
     if (data.type === 'status') {
-      const stateMap = {
-        connecting: 'calling',
-        connected:  'calling',
-        active:     'active',
-        speaking:   'active',
-        listening:  'active',
-        ended:      'ready',
-      };
-      updateDialerStatus(data.message, stateMap[data.state] || 'active');
+      const map = { connecting:'calling', connected:'calling', active:'active',
+                    speaking:'active', listening:'active', ended:'ready' };
+      updateDialerStatus(data.message, map[data.state] || 'active');
       setAgentIndicator(data.state);
 
       if (data.state === 'ended') {
@@ -317,20 +436,14 @@ function connectAgentEvents(callSid) {
       appendTranscript(data.speaker, data.text, data.ts);
     }
   };
-
-  agentEventSource.onerror = () => {
-    // browser auto-reconnects; nothing to do
-  };
 }
 
 function disconnectAgentEvents() {
-  if (agentEventSource) {
-    agentEventSource.close();
-    agentEventSource = null;
-  }
+  if (agentCallTimeout) { clearTimeout(agentCallTimeout); agentCallTimeout = null; }
+  if (agentEventSource) { agentEventSource.close(); agentEventSource = null; }
 }
 
-// ── Transcript panel ────────────────────────────────────────────────────────
+// ── Transcript ──────────────────────────────────────────────────────────────
 
 function buildTranscriptPanel() {
   const panel = document.createElement('div');
@@ -346,7 +459,7 @@ function buildTranscriptPanel() {
       </span>
     </div>
     <div class="agent-transcript" id="agentTranscript">
-      <div class="agent-transcript-empty">Transcript will appear here when the agent call starts.</div>
+      <div class="agent-transcript-empty">Transcript appears here once the call starts.</div>
     </div>
   `;
   return panel;
@@ -356,12 +469,11 @@ function appendTranscript(speaker, text, ts) {
   const wrap = document.getElementById('agentTranscript');
   if (!wrap) return;
   wrap.querySelector('.agent-transcript-empty')?.remove();
-
   const row = document.createElement('div');
   row.className = `agent-msg agent-msg--${speaker}`;
   row.innerHTML = `
     <div class="agent-msg-head">
-      <span class="agent-msg-who">${speaker === 'agent' ? '🤖 Agent' : '👤 Prospect'}</span>
+      <span class="agent-msg-who">${speaker === 'agent' ? '\u{1F916} Agent' : '\u{1F464} Prospect'}</span>
       <span class="agent-msg-ts">${ts || ''}</span>
     </div>
     <div class="agent-msg-text">${escapeHtml(text)}</div>
@@ -378,14 +490,8 @@ function clearTranscript() {
 function setAgentIndicator(state) {
   const ind = document.getElementById('agentIndicator');
   if (!ind) return;
-  const labels = {
-    connecting: 'Connecting',
-    connected:  'Connected',
-    active:     'Active',
-    speaking:   'Agent speaking',
-    listening:  'Listening',
-    ended:      'Ended',
-  };
+  const labels = { connecting:'Connecting', connected:'Connected', active:'Active',
+                   speaking:'Agent speaking', listening:'Listening', ended:'Ended' };
   ind.className = `agent-indicator agent-indicator--${state}`;
   ind.querySelector('.agent-indicator-text').textContent = labels[state] || state;
 }
@@ -396,19 +502,14 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
-// ── Injection hook — called by app.js after the dialer renders ─────────────
+// ── Injection ───────────────────────────────────────────────────────────────
 
 async function injectAgentUI() {
   await loadAgentConfig();
-
   const dialerTop = document.querySelector('.dialer-top');
   if (!dialerTop) return;
-
-  // Agent bar goes above the dialer card
   dialerTop.parentNode.insertBefore(buildAgentBar(), dialerTop);
-  // Options panel + transcript go right after
   dialerTop.after(buildTranscriptPanel());
   dialerTop.after(buildAgentOptions());
-
   applyAgentMode();
 }
