@@ -211,3 +211,55 @@
   font-family: ui-monospace, monospace; font-size: 10.5px;
   color: var(--text-3); margin-left: 8px; opacity: 0.7;
 }
+
+.agent-msg--partial { opacity: 0.6; border-style: dashed; }
+.agent-msg--partial .agent-msg-text::after {
+  content: '▋'; animation: blink 1s step-end infinite; margin-left: 2px; opacity: 0.5;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+/* ═══ TRANSCRIPT AS RIGHT RAIL (wide screens) ═══ */
+
+@media (min-width: 1400px) {
+  /* Shrink main content so the rail has room */
+  .main .content-area {
+    max-width: calc(100% - 420px);
+    margin-right: 0;
+  }
+
+  /* Pin the transcript to the right */
+  .agent-transcript-panel {
+    position: fixed;
+    top: 88px;
+    right: 24px;
+    width: 380px;
+    max-height: calc(100vh - 120px);
+    display: flex !important;
+    flex-direction: column;
+    z-index: 50;
+    margin: 0;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.24);
+  }
+
+  .agent-transcript-panel .card-label {
+    flex-shrink: 0;
+    margin-bottom: 12px;
+  }
+
+  .agent-transcript-panel .agent-transcript {
+    flex: 1;
+    max-height: none;
+    overflow-y: auto;
+  }
+
+  /* Hide the rail when agent mode is off */
+  body:not(.agent-mode-on) .agent-transcript-panel {
+    display: none !important;
+  }
+}
+
+/* Wider screens — bigger rail */
+@media (min-width: 1700px) {
+  .main .content-area { max-width: calc(100% - 480px); }
+  .agent-transcript-panel { width: 440px; }
+}

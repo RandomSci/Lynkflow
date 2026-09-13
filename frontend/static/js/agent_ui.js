@@ -404,8 +404,9 @@ function applyAgentMode() {
     }
   }
 
+  document.body.classList.toggle('agent-mode-on', !!agentConfig.enabled);
   const tp = document.getElementById('agentTranscriptPanel');
-  if (tp) tp.style.display = agentConfig.enabled ? 'block' : 'none';
+  if (tp) tp.style.display = agentConfig.enabled ? '' : 'none';
 }
 
 // ── Call control ────────────────────────────────────────────────────────────
@@ -503,6 +504,12 @@ function connectAgentEvents(callSid) {
     if (data.type === 'transcript') {
       appendTranscript(data.speaker, data.text, data.ts);
     }
+    if (data.type === 'transcript_partial') {
+      upsertPartial(data.speaker, data.text, data.ts);
+    }
+    if (data.type === 'transcript_final') {
+      finalizePartial(data.speaker, data.text, data.ts);
+    }
   };
 }
 
@@ -547,6 +554,43 @@ function appendTranscript(speaker, text, ts) {
     <div class="agent-msg-text">${escapeHtml(text)}</div>
   `;
   wrap.appendChild(row);
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function upsertPartial(speaker, text, ts) {
+  const wrap = document.getElementById('agentTranscript');
+  if (!wrap) return;
+  wrap.querySelector('.agent-transcript-empty')?.remove();
+
+  let row = wrap.querySelector(`.agent-msg--partial[data-speaker="${speaker}"]`);
+  if (!row) {
+    row = document.createElement('div');
+    row.className = `agent-msg agent-msg--${speaker} agent-msg--partial`;
+    row.dataset.speaker = speaker;
+    row.innerHTML = `
+      <div class="agent-msg-head">
+        <span class="agent-msg-who">${speaker === 'agent' ? '\u{1F916} Agent' : '\u{1F464} Prospect'}</span>
+        <span class="agent-msg-ts">${ts || ''}</span>
+      </div>
+      <div class="agent-msg-text"></div>
+    `;
+    wrap.appendChild(row);
+  }
+  row.querySelector('.agent-msg-text').textContent = text;
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function finalizePartial(speaker, text, ts) {
+  const wrap = document.getElementById('agentTranscript');
+  if (!wrap) return;
+  const row = wrap.querySelector(`.agent-msg--partial[data-speaker="${speaker}"]`);
+  if (row) {
+    row.classList.remove('agent-msg--partial');
+    row.removeAttribute('data-speaker');
+    row.querySelector('.agent-msg-text').textContent = text;
+  } else {
+    appendTranscript(speaker, text, ts);
+  }
   wrap.scrollTop = wrap.scrollHeight;
 }
 

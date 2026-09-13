@@ -12,7 +12,7 @@ import os
 import time
 from datetime import datetime
 from typing import Optional
-
+import audioop
 import httpx
 import websockets
 from dotenv import load_dotenv
@@ -49,6 +49,7 @@ class AgentCallHandler:
         self.cfg          = cfg
         self.lead_info    = lead_info
         self.status_queue = status_queue
+        self._ivr_hits = 0
 
         self.stream_sid: Optional[str] = None
         self.call_sid:   Optional[str] = None
@@ -59,7 +60,9 @@ class AgentCallHandler:
         self._stop        = False
         self._last_audio  = time.time()
         self._call_start  = time.time()
-        self._speak_seq   = 0
+        self._speak_seq     = 0
+        self._loud_frames   = 0      # consecutive frames above threshold
+        self._vad_threshold = 1800    # RMS level that counts as speech
 
         self.end_phrases = [
             p.strip().lower()
@@ -68,6 +71,20 @@ class AgentCallHandler:
         ]
 
     # ── Entry ────────────────────────────────────────────────────────────────
+
+    IVR_MARKERS = [
+        "press one", "press two", "press three", "press zero",
+        "press 1", "press 2", "press 3", "press 0",
+        "dial by name", "extension number", "main menu",
+        "for quality assurance", "may be monitored", "may be recorded",
+        "please listen", "options have changed", "please hold",
+        "leave a message", "after the tone", "business hours are",
+        "answering service", "please stay on the line",
+    ]
+
+    def _looks_like_ivr(self, text: str) -> bool:
+        low = text.lower()
+        return any(m in low for m in self.IVR_MARKERS)
 
     async def run(self):
         await self._push_status("connecting", "Connecting…")
@@ -117,13 +134,32 @@ class AgentCallHandler:
 
         elif evt == "media":
             self._last_audio = time.time()
+            payload = data.get("media", {}).get("payload", "")
+            if not payload:
+                return
+            raw = base64.b64decode(payload)
+
+            if self.is_speaking and self.cfg.allow_interruption:
+                try:
+                    pcm = audioop.ulaw2lin(raw, 2)
+                    rms = audioop.rms(pcm, 2)
+                except Exception:
+                    rms = 0
+                if rms > self._vad_threshold:
+                    self._loud_frames += 1
+                    if self._loud_frames >= 6:      # ~120ms      # ~60ms of speech
+                        print(f"[VAD] barge-in (rms={rms})")
+                        self._speak_seq += 1
+                        await self._stop_speaking()
+                        self._loud_frames = 0
+                else:
+                    self._loud_frames = max(0, self._loud_frames - 1)
+
             if self.dg_ws:
-                payload = data.get("media", {}).get("payload", "")
-                if payload:
-                    try:
-                        await self.dg_ws.send(base64.b64decode(payload))
-                    except Exception as e:
-                        print(f"[DG SEND] {e}")
+                try:
+                    await self.dg_ws.send(raw)
+                except Exception as e:
+                    print(f"[DG SEND] {e}")
 
         elif evt == "stop":
             print("[STREAM STOP] media stream closed")
@@ -157,17 +193,28 @@ class AgentCallHandler:
         if not text.strip() or self._stop:
             return
 
-        await self._push_transcript("prospect", text)
+        if self._looks_like_ivr(text):
+            self._ivr_hits += 1
+            print(f"[IVR] detected ({self._ivr_hits}): {text[:60]}")
+            if self._ivr_hits >= 2:
+                print("[IVR] phone tree confirmed — hanging up")
+                await self._push_status("ended", "IVR / phone tree")
+                await self._hangup()
+            return
+
         self.conversation.append({"role": "user", "content": text})
 
+        my_seq = self._speak_seq
         response = await self._respond()
+        if my_seq != self._speak_seq and self._speak_seq > my_seq + 1:
+            print("[SKIP] superseded by newer turn")
+            return
         if not response:
             return
 
         clean = response.replace("[HANGUP]", "").strip()
         if clean:
             self.conversation.append({"role": "assistant", "content": clean})
-            await self._push_transcript("agent", clean)
 
         low = clean.lower()
         if "[HANGUP]" in response or any(p in low for p in self.end_phrases):
@@ -220,6 +267,11 @@ class AgentCallHandler:
 
                         full += tok
                         buf  += tok
+                        # Stream partial agent text to the UI as it generates
+                        await self.status_queue.put({
+                            "type": "transcript_partial", "speaker": "agent",
+                            "text": full, "ts": datetime.now().strftime("%H:%M:%S"),
+                        })
 
                         # Flush on sentence boundary (or early on first chunk)
                         limit = 25 if first_chunk else 90
@@ -236,7 +288,14 @@ class AgentCallHandler:
         if buf.strip() and not self._stop and seq == self._speak_seq:
             await self._speak_chunk(buf.strip(), seq)
 
-        return full.strip() or None
+        final = full.strip()
+        if final:
+            await self.status_queue.put({
+                "type": "transcript_final", "speaker": "agent",
+                "text": final.replace("[HANGUP]", "").strip(),
+                "ts": datetime.now().strftime("%H:%M:%S"),
+            })
+        return final or None
 
     async def _speak_chunk(self, text: str, seq: int):
         """Stream one sentence to ElevenLabs and pipe audio straight to Twilio."""
@@ -309,8 +368,9 @@ class AgentCallHandler:
                 await self.twilio_ws.send_text(json.dumps({
                     "event": "clear", "streamSid": self.stream_sid,
                 }))
-            except Exception:
-                pass
+                print("[TTS] buffer cleared")
+            except Exception as e:
+                print(f"[CLEAR ERROR] {e}")
 
     # ── Deepgram ─────────────────────────────────────────────────────────────
 
@@ -370,7 +430,16 @@ class AgentCallHandler:
 
                 if data.get("is_final"):
                     print(f"[DG] final: {text}")
+                    await self.status_queue.put({
+                        "type": "transcript_final", "speaker": "prospect",
+                        "text": text, "ts": datetime.now().strftime("%H:%M:%S"),
+                    })
                     asyncio.create_task(self._handle_transcript(text))
+                else:
+                    await self.status_queue.put({
+                        "type": "transcript_partial", "speaker": "prospect",
+                        "text": text, "ts": datetime.now().strftime("%H:%M:%S"),
+                    })
 
         except Exception as e:
             print(f"[DG] listener error: {e}")
