@@ -8,14 +8,15 @@ let agentEventSource = null;
 let agentCallTimeout = null;
 let listenSocket = null;
 let listenCtx = null;
-let listenTime = 0;
+let listenNode = null;
+let listenQueue = [];
+let listenQueuedSamples = 0;
 let listenRetries = 0;
 let listenPingTimer = null;
-let listenSources = [];
 let agentCallActive = false;
 
-const LISTEN_TARGET_BUFFER_S = 0.08;
-const LISTEN_MAX_BUFFER_S = 0.45;
+const LISTEN_TARGET_BUFFER_S = 0.12;
+const LISTEN_MAX_BUFFER_S = 0.6;
 
 const VOICES = [
   { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah',   desc: 'Warm, professional female' },
@@ -401,10 +402,8 @@ const MULAW = (() => {
 
 function startListening(callSid) {
   if (listenSocket) stopListening();
-  listenCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
-  listenTime = listenCtx.currentTime + LISTEN_TARGET_BUFFER_S;
+  initListenAudio();
   listenRetries = 0;
-  listenSources = [];
   setListenBtn(true);
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -422,29 +421,15 @@ function startListening(callSid) {
     if (!listenCtx) return;
 
     const frames = m.batch || (m.a ? [m] : []);
+    const chunks = [];
     for (const f of frames) {
       if (!f.a) continue;
       const bin = atob(f.a);
-      const buf = listenCtx.createBuffer(1, bin.length, 8000);
-      const ch = buf.getChannelData(0);
-      for (let i = 0; i < bin.length; i++) ch[i] = MULAW[bin.charCodeAt(i)] / 32768;
-
-      const src = listenCtx.createBufferSource();
-      src.buffer = buf;
-      const gain = listenCtx.createGain();
-      gain.gain.value = f.t === 'agent' ? 0.85 : 1.0;
-      src.connect(gain).connect(listenCtx.destination);
-      src.onended = () => {
-        listenSources = listenSources.filter(s => s !== src);
-      };
-
-      const now = listenCtx.currentTime;
-      if (listenTime - now > LISTEN_MAX_BUFFER_S) resetListenPlayback();
-      if (listenTime < now) listenTime = now + LISTEN_TARGET_BUFFER_S;
-      src.start(listenTime);
-      listenSources.push(src);
-      listenTime += buf.duration;
+      const last = chunks[chunks.length - 1];
+      if (last && last.t === f.t) last.bin += bin;
+      else chunks.push({ t: f.t, bin });
     }
+    chunks.forEach(playListenChunk);
   };
 
   listenSocket.onclose = () => {
@@ -465,16 +450,85 @@ function stopListening() {
   if (listenSocket) { listenSocket.close(); listenSocket = null; }
   if (listenPingTimer) { clearInterval(listenPingTimer); listenPingTimer = null; }
   resetListenPlayback();
+  if (listenNode) {
+    try { listenNode.disconnect(); } catch (e) {}
+    listenNode = null;
+  }
   if (listenCtx) { listenCtx.close(); listenCtx = null; }
   setListenBtn(false);
 }
 
 function resetListenPlayback() {
-  listenSources.forEach(src => {
-    try { src.stop(); } catch (e) {}
-  });
-  listenSources = [];
-  if (listenCtx) listenTime = listenCtx.currentTime + LISTEN_TARGET_BUFFER_S;
+  listenQueue = [];
+  listenQueuedSamples = 0;
+}
+
+function playListenChunk(chunk) {
+  if (!listenCtx || !chunk?.bin) return;
+
+  const decoded = decodeMulawToFloat(chunk.bin, chunk.t === 'agent' ? 0.85 : 1.0);
+  const samples = resampleListenChunk(decoded, 8000, listenCtx.sampleRate);
+  listenQueue.push({ samples, offset: 0 });
+  listenQueuedSamples += samples.length;
+
+  const maxSamples = Math.round(listenCtx.sampleRate * LISTEN_MAX_BUFFER_S);
+  const targetSamples = Math.round(listenCtx.sampleRate * LISTEN_TARGET_BUFFER_S);
+  if (listenQueuedSamples > maxSamples) trimListenQueue(targetSamples);
+}
+
+function initListenAudio() {
+  listenCtx = new (window.AudioContext || window.webkitAudioContext)();
+  listenNode = listenCtx.createScriptProcessor(1024, 0, 1);
+  listenNode.onaudioprocess = (e) => {
+    const out = e.outputBuffer.getChannelData(0);
+    let i = 0;
+    while (i < out.length) {
+      const item = listenQueue[0];
+      if (!item) {
+        out.fill(0, i);
+        break;
+      }
+      const available = item.samples.length - item.offset;
+      const take = Math.min(available, out.length - i);
+      out.set(item.samples.subarray(item.offset, item.offset + take), i);
+      item.offset += take;
+      listenQueuedSamples -= take;
+      i += take;
+      if (item.offset >= item.samples.length) listenQueue.shift();
+    }
+  };
+  listenNode.connect(listenCtx.destination);
+}
+
+function decodeMulawToFloat(bin, gain) {
+  const out = new Float32Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = MULAW[bin.charCodeAt(i)] / 32768 * gain;
+  return out;
+}
+
+function resampleListenChunk(input, fromRate, toRate) {
+  if (fromRate === toRate) return input;
+  const ratio = toRate / fromRate;
+  const out = new Float32Array(Math.max(1, Math.round(input.length * ratio)));
+  for (let i = 0; i < out.length; i++) {
+    const pos = i / ratio;
+    const left = Math.floor(pos);
+    const right = Math.min(left + 1, input.length - 1);
+    const frac = pos - left;
+    out[i] = input[left] + (input[right] - input[left]) * frac;
+  }
+  return out;
+}
+
+function trimListenQueue(targetSamples) {
+  while (listenQueuedSamples > targetSamples && listenQueue.length) {
+    const item = listenQueue[0];
+    const available = item.samples.length - item.offset;
+    const drop = Math.min(available, listenQueuedSamples - targetSamples);
+    item.offset += drop;
+    listenQueuedSamples -= drop;
+    if (item.offset >= item.samples.length) listenQueue.shift();
+  }
 }
 
 function setListenBtn(on) {
@@ -1302,7 +1356,7 @@ function renderAnalytics(d) {
 
   <div class="an-section">
     <div class="an-section-title">Recent calls</div>
-    <div class="an-table-wrap">
+    <div class="an-table-wrap an-table-wrap--recent">
       <table class="an-table">
         <thead><tr>
           <th>When</th><th>Business</th><th>Outcome</th>

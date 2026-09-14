@@ -100,12 +100,15 @@ class AgentCallHandler:
         self.outcome = "no_answer"        
         self._machine_kind = ""
         self._vm_left = False
+        self._voicemail_task = None
         self._last_dg_text = 0.0        
         self._vad_threshold = 3200        
         self._rec_agent = bytearray()
         self._rec_prospect = bytearray()        
         self.recording_file = None
-        self._script_step = "pitch"
+        self._script_step = "owner_check"
+        self._gatekeeper_mode = False
+        self._gatekeeper_contact_asked = False
 
         self.end_phrases = [
             p.strip().lower()
@@ -135,17 +138,34 @@ class AgentCallHandler:
         "can't take your call", "cannot take your call",
         "mailbox is full", "brief description",
         "call you back as soon as", "we'll get back to you",
-        "thank you for calling",
+    ]
+
+    HUMAN_GREETING_MARKERS = [
+        "how may i help", "how can i help", "how may we help", "how can we help",
+        "how may i assist", "how can i assist", "how may we assist", "how can we assist",
+        "you're speaking with", "you are speaking with", "speaking",
+        "can i help", "may i help", "how can i direct", "how may i direct",
     ]
 
     def _classify_machine(self, text: str) -> str:
         """Returns 'voicemail', 'menu', or '' for a human."""
         low = text.lower()
-        if any(m in low for m in self.VOICEMAIL_MARKERS):
-            return "voicemail"
+        if self._looks_like_human_greeting(low):
+            return ""
         if any(m in low for m in self.MENU_MARKERS):
             return "menu"
+        if any(m in low for m in self.VOICEMAIL_MARKERS):
+            return "voicemail"
         return ""
+
+    def _looks_like_human_greeting(self, text: str) -> bool:
+        low = text.lower()
+        if any(m in low for m in self.VOICEMAIL_MARKERS):
+            return False
+        if any(m in low for m in self.HUMAN_GREETING_MARKERS):
+            return True
+        # Receptionists often say: "Thank you for calling X, this is Frankie..."
+        return bool(re.search(r"\b(thank you|thanks) for calling\b.+\b(how (may|can)|this is)\b", low))
 
     async def run(self):
         await self._push_status("connecting", "Connecting…")
@@ -212,6 +232,8 @@ class AgentCallHandler:
             self._fanout_buf.clear()
             return
         self._fanout_buf.append((who, payload_b64))
+        if len(self._fanout_buf) > 30:
+            self._fanout_buf = self._fanout_buf[-10:]
         if len(self._fanout_buf) >= 8:
             self._flush_fanout_nowait()
         elif not self._fanout_flush_task or self._fanout_flush_task.done():
@@ -328,7 +350,7 @@ class AgentCallHandler:
             {"role": "system",    "content": system},
             {"role": "assistant", "content": opening},
         ]
-        self._script_step = "pitch"
+        self._script_step = "owner_check"
         await asyncio.sleep(0.6)
         await self._push_transcript("agent", opening)
         self._speak_seq += 1
@@ -345,6 +367,13 @@ class AgentCallHandler:
         if self.outcome == "no_answer":
             self.outcome = "conversation"        
 
+        if self._voicemail_task and not self._voicemail_task.done() and self._looks_like_human_greeting(text):
+            print(f"[MACHINE] cancelled voicemail; human greeting detected: {text[:80]}")
+            self._voicemail_task.cancel()
+            self._voicemail_task = None
+            self._machine_kind = ""
+            self.outcome = "conversation"
+
         kind = self._classify_machine(text)
 
         if kind == "menu":
@@ -355,12 +384,12 @@ class AgentCallHandler:
             return
 
         if kind == "voicemail":
-            if self._vm_left:
+            if self._vm_left or (self._voicemail_task and not self._voicemail_task.done()):
                 return
             self._machine_kind = "voicemail"
             print(f"[MACHINE] voicemail: {text[:60]}")
             if self.cfg.voicemail_enabled:
-                asyncio.create_task(self._leave_voicemail())
+                self._voicemail_task = asyncio.create_task(self._leave_voicemail())
             else:
                 self.outcome = "voicemail"
                 await self._push_status("ended", "Voicemail — skipped")
@@ -368,6 +397,9 @@ class AgentCallHandler:
             return
 
         self.conversation.append({"role": "user", "content": text})
+
+        if self._gatekeeper_mode and await self._handle_gatekeeper_transcript(text):
+            return
 
         if await self._maybe_scripted_opening_response(text):
             return
@@ -421,18 +453,100 @@ class AgentCallHandler:
             "where", "number", "email", "info", "information",
         ))
 
+    def _looks_like_gatekeeper(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "how may i help", "how can i help", "how may we help", "how can we help",
+            "how may i assist", "how can i assist", "can i help", "may i help",
+            "how can i direct", "how may i direct",
+        ))
+
+    def _confirms_owner(self, text: str) -> bool:
+        low = text.lower().strip(" .,?!")
+        return (
+            low in {
+                "yes", "yeah", "yep", "speaking", "this is he", "this is she",
+                "this is him", "this is her", "this is me", "that's me", "that is me",
+            }
+            or any(k in low for k in (
+                "i'm the owner", "i am the owner", "owner speaking", "this is the owner",
+                "i handle that", "i make those decisions", "i'm the manager", "i am the manager",
+            ))
+        )
+
+    def _denies_owner(self, text: str) -> bool:
+        low = text.lower().strip(" .,?!")
+        if low in {"no", "nope", "nah"}:
+            return True
+        return any(k in low for k in (
+            "not the owner", "not the decision maker", "not a decision maker",
+            "i'm just", "i am just", "receptionist", "front desk", "office",
+            "employee", "staff", "assistant", "i can take a message",
+            "take a message", "pass along", "pass a message",
+        ))
+
+    def _owner_unavailable(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "isn't here", "is not here", "not here", "isn't available", "isnt available",
+            "is not available", "not available", "unavailable", "owner isn't available",
+            "owner is not available", "owner's not available", "out right now",
+            "away right now", "he's out", "she's out", "he is out", "she is out",
+            "owner is out", "owner's out",
+        ))
+
     async def _maybe_scripted_opening_response(self, text: str) -> bool:
         """Keep the first two turns on track before handing off to GPT."""
-        if self._script_step not in ("pitch", "hook"):
-            return False
-        if self._needs_flexible_response(text):
-            self._script_step = "done"
+        if self._script_step not in ("owner_check", "pitch", "hook"):
             return False
 
         if self._is_hard_no(text):
             self._script_step = "done"
             await self._send_agent_line("No problem at all, have a great day! [HANGUP]")
             return True
+
+        if self._script_step == "owner_check":
+            if self._confirms_owner(text):
+                self._script_step = "hook"
+                self._gatekeeper_mode = False
+                await self._send_agent_line(
+                    "We help plumbing businesses stop losing jobs to missed calls. "
+                    "We build an AI system that answers your calls automatically and books jobs while you're on site."
+                )
+                return True
+
+            if self._owner_unavailable(text):
+                self._script_step = "done"
+                self._gatekeeper_mode = True
+                self._gatekeeper_contact_asked = True
+                await self._send_agent_line(
+                    "No worries at all. What's the best way to reach the owner directly - phone, email, or a good callback time?"
+                )
+                return True
+
+            if self._looks_like_gatekeeper(text) or self._denies_owner(text):
+                self._script_step = "done"
+                self._gatekeeper_mode = True
+                await self._send_agent_line("Hi, I'm calling about their phone system. Is the owner available?")
+                return True
+
+            if self._needs_flexible_response(text):
+                self._script_step = "done"
+                return False
+
+            await self._send_agent_line(
+                "Before I go further, are you the owner or the person who handles decisions for the business?"
+            )
+            return True
+
+        if self._script_step == "pitch" and self._looks_like_gatekeeper(text):
+            self._script_step = "done"
+            self._gatekeeper_mode = True
+            await self._send_agent_line("Hi, I'm calling about their phone system. Is the owner available?")
+            return True
+        if self._needs_flexible_response(text):
+            self._script_step = "done"
+            return False
 
         if self._script_step == "pitch":
             self._script_step = "hook"
@@ -445,6 +559,82 @@ class AgentCallHandler:
         self._script_step = "done"
         await self._send_agent_line(
             "Would a quick 10 minute call with our team be worth it to see if it fits your business?"
+        )
+        return True
+
+    def _asks_reason(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "what's this about", "what is this about", "what is it about", "what's it about",
+            "tell me more", "more info", "bit more", "a bit more", "what for", "why are you calling",
+            "regarding", "in regards to", "what do you need",
+        ))
+
+    def _offers_transfer_or_message(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "take a message", "pass your info", "pass your information", "pass it along",
+            "get you to the right person", "right person", "send a message", "relay a message",
+        ))
+
+    def _asks_agent_identity(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "your name", "who are you", "who's calling", "who is calling",
+            "company name", "where are you calling from", "number for callback",
+        ))
+
+    async def _handle_gatekeeper_transcript(self, text: str) -> bool:
+        if self._confirms_owner(text):
+            self._gatekeeper_mode = False
+            await self._send_agent_line(
+                "Perfect, thanks. We help plumbing businesses stop losing jobs to missed calls. "
+                "We build an AI system that answers your calls automatically and books jobs while you're on site."
+            )
+            return True
+
+        if self._is_hard_no(text):
+            await self._send_agent_line("No problem, I'll try another time. Thanks for your help, have a good day! [HANGUP]")
+            return True
+
+        if self._asks_agent_identity(text):
+            cb = self._callback_number() or "the number I called from"
+            await self._send_agent_line(
+                f"My name is Anna with Lynkflow, and the best callback is {cb}. What's the best way to reach the owner directly?"
+            )
+            self._gatekeeper_contact_asked = True
+            return True
+
+        if self._asks_reason(text):
+            await self._send_agent_line(
+                "We're reaching out because missed calls can cost trade businesses real jobs. "
+                "I just need the best way to reach the owner about their business phone line."
+            )
+            self._gatekeeper_contact_asked = True
+            return True
+
+        if self._owner_unavailable(text) or self._offers_transfer_or_message(text) or self._denies_owner(text):
+            if self._gatekeeper_contact_asked:
+                await self._send_agent_line(
+                    "Sure, please tell them Anna from Lynkflow called about their business phone line. "
+                    "What's the best callback number or email for the owner?"
+                )
+            else:
+                await self._send_agent_line(
+                    "No worries. What's the best way to reach the owner directly - phone, email, or a good callback time?"
+                )
+                self._gatekeeper_contact_asked = True
+            return True
+
+        if not self._gatekeeper_contact_asked:
+            await self._send_agent_line(
+                "What's the best way to reach the owner directly - phone, email, or a good callback time?"
+            )
+            self._gatekeeper_contact_asked = True
+            return True
+
+        await self._send_agent_line(
+            "Got it. Please let them know Anna from Lynkflow called about their business phone line. Thanks for your help, have a good day! [HANGUP]"
         )
         return True
 
@@ -482,13 +672,10 @@ class AgentCallHandler:
 
     async def _leave_voicemail(self):
         """Wait for the beep, deliver the message, then hang up."""
-        self._vm_left = True
-        self.outcome = "voicemail_left"
         await self._push_status("speaking", "Waiting for beep…")
 
         # Let the greeting finish — watch for a gap in incoming speech
-        quiet_start = time.time()
-        self._last_dg_text = quiet_start
+        self._last_dg_text = time.time()
         deadline = time.time() + 25
         while time.time() < deadline and not self._stop:
             await asyncio.sleep(0.4)
@@ -499,6 +686,12 @@ class AgentCallHandler:
             return
 
         await asyncio.sleep(0.8)   # pause after the beep
+
+        if self._machine_kind != "voicemail":
+            return
+
+        self._vm_left = True
+        self.outcome = "voicemail_left"
 
         cb = self._callback_number()
         msg = (self.cfg.voicemail_message
