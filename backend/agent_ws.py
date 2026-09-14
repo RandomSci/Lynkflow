@@ -77,6 +77,7 @@ class AgentCallHandler:
         self._last_partial = 0.0
         self._fanout_buf: list = []
         self._fanout_inflight = 0
+        self._fanout_flush_task = None
         self._speak_started = 0.0
         self._nudges = 0
         self._last_turn = time.time()
@@ -211,11 +212,21 @@ class AgentCallHandler:
             self._fanout_buf.clear()
             return
         self._fanout_buf.append((who, payload_b64))
-        if len(self._fanout_buf) >= 25:
-            batch, self._fanout_buf = self._fanout_buf, []
-            if self._fanout_inflight < 3:      # never queue more than 3 batches
-                self._fanout_inflight += 1
-                asyncio.create_task(self._flush_fanout(batch))
+        if len(self._fanout_buf) >= 8:
+            self._flush_fanout_nowait()
+        elif not self._fanout_flush_task or self._fanout_flush_task.done():
+            self._fanout_flush_task = asyncio.create_task(self._flush_fanout_soon())
+
+    def _flush_fanout_nowait(self):
+        if not self._fanout_buf or self._fanout_inflight:
+            return
+        batch, self._fanout_buf = self._fanout_buf, []
+        self._fanout_inflight += 1
+        asyncio.create_task(self._flush_fanout(batch))
+
+    async def _flush_fanout_soon(self):
+        await asyncio.sleep(0.12)
+        self._flush_fanout_nowait()
 
     async def _flush_fanout(self, batch):
         try:
@@ -229,6 +240,11 @@ class AgentCallHandler:
                     self.listeners.discard(ws)
         finally:
             self._fanout_inflight = max(0, self._fanout_inflight - 1)
+            if self._fanout_buf and self.listeners:
+                if len(self._fanout_buf) >= 8:
+                    self._flush_fanout_nowait()
+                elif not self._fanout_flush_task or self._fanout_flush_task.done():
+                    self._fanout_flush_task = asyncio.create_task(self._flush_fanout_soon())
 
     async def _on_twilio_event(self, data: dict):
         evt = data.get("event")
@@ -728,8 +744,7 @@ class AgentCallHandler:
                 sent += 1
 
             if self._fanout_buf:
-                batch, self._fanout_buf = self._fanout_buf, []
-                asyncio.create_task(self._flush_fanout(batch))
+                self._flush_fanout_nowait()
 
             print(f"[TTS] {sent} frames ({sent*0.02:.1f}s audio) in {time.time()-t_start:.2f}s")
 

@@ -10,7 +10,12 @@ let listenSocket = null;
 let listenCtx = null;
 let listenTime = 0;
 let listenRetries = 0;
+let listenPingTimer = null;
+let listenSources = [];
 let agentCallActive = false;
+
+const LISTEN_TARGET_BUFFER_S = 0.08;
+const LISTEN_MAX_BUFFER_S = 0.45;
 
 const VOICES = [
   { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah',   desc: 'Warm, professional female' },
@@ -397,10 +402,20 @@ const MULAW = (() => {
 function startListening(callSid) {
   if (listenSocket) stopListening();
   listenCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
-  listenTime = listenCtx.currentTime;
+  listenTime = listenCtx.currentTime + LISTEN_TARGET_BUFFER_S;
+  listenRetries = 0;
+  listenSources = [];
+  setListenBtn(true);
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   listenSocket = new WebSocket(`${proto}://${location.host}/ws/agent/listen/${callSid}`);
+
+  listenSocket.onopen = () => {
+    if (listenPingTimer) clearInterval(listenPingTimer);
+    listenPingTimer = setInterval(() => {
+      if (listenSocket?.readyState === WebSocket.OPEN) listenSocket.send('ping');
+    }, 5000);
+  };
 
   listenSocket.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch { return; }
@@ -419,16 +434,22 @@ function startListening(callSid) {
       const gain = listenCtx.createGain();
       gain.gain.value = f.t === 'agent' ? 0.85 : 1.0;
       src.connect(gain).connect(listenCtx.destination);
+      src.onended = () => {
+        listenSources = listenSources.filter(s => s !== src);
+      };
 
       const now = listenCtx.currentTime;
-      if (listenTime < now) listenTime = now + 0.08;
+      if (listenTime - now > LISTEN_MAX_BUFFER_S) resetListenPlayback();
+      if (listenTime < now) listenTime = now + LISTEN_TARGET_BUFFER_S;
       src.start(listenTime);
+      listenSources.push(src);
       listenTime += buf.duration;
     }
   };
 
   listenSocket.onclose = () => {
     listenSocket = null;
+    if (listenPingTimer) { clearInterval(listenPingTimer); listenPingTimer = null; }
     if (agentCallActive && agentCallSid && listenRetries < 8) {
       listenRetries++;
       setTimeout(() => {
@@ -442,8 +463,18 @@ function startListening(callSid) {
 
 function stopListening() {
   if (listenSocket) { listenSocket.close(); listenSocket = null; }
+  if (listenPingTimer) { clearInterval(listenPingTimer); listenPingTimer = null; }
+  resetListenPlayback();
   if (listenCtx) { listenCtx.close(); listenCtx = null; }
   setListenBtn(false);
+}
+
+function resetListenPlayback() {
+  listenSources.forEach(src => {
+    try { src.stop(); } catch (e) {}
+  });
+  listenSources = [];
+  if (listenCtx) listenTime = listenCtx.currentTime + LISTEN_TARGET_BUFFER_S;
 }
 
 function setListenBtn(on) {
