@@ -769,10 +769,8 @@ async function injectAgentUI() {
   if (!dialerTop) return;
   dialerTop.parentNode.insertBefore(buildAgentBar(), dialerTop);
   dialerTop.after(buildTranscriptPanel());
-  dialerTop.after(buildMetricsPanel());
   dialerTop.after(buildAgentOptions());
   applyAgentMode();
-  renderMetrics();
 }
 
 let ringOsc = null, ringCtx = null, ringTimer = null;
@@ -990,4 +988,275 @@ async function fetchRealTwilioPrice(callSid, attempt = 0) {
   } catch (e) { /* retry below */ }
   // Twilio hasn't priced it yet — back off and try again
   setTimeout(() => fetchRealTwilioPrice(callSid, attempt + 1), 3000);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ANALYTICS PAGE — cost, latency, outcomes, call history
+// Append to agent_ui.js
+// ═══════════════════════════════════════════════════════════════════════════
+
+let analyticsRange = 30;
+
+async function loadAnalytics() {
+  const area = document.getElementById('contentArea');
+  if (!area) return;
+
+  area.innerHTML = `
+    <div class="an-header">
+      <div>
+        <div class="an-eyebrow">Performance</div>
+        <h1 class="an-title">Analytics</h1>
+      </div>
+      <div class="an-range" id="anRange">
+        ${[1, 7, 30, 90].map(d =>
+          `<button class="an-range-btn ${d === analyticsRange ? 'active' : ''}" data-days="${d}">
+            ${d === 1 ? 'Today' : d + 'd'}
+          </button>`).join('')}
+      </div>
+    </div>
+    <div id="anBody"><div class="an-loading">Loading…</div></div>
+  `;
+
+  area.querySelectorAll('.an-range-btn').forEach(b => {
+    b.addEventListener('click', () => {
+      analyticsRange = parseInt(b.dataset.days);
+      loadAnalytics();
+    });
+  });
+
+  let data, info;
+  try {
+    [data, info] = await Promise.all([
+      fetch(`/api/analytics?days=${analyticsRange}`).then(r => r.json()),
+      fetch('/api/agent/metrics/info').then(r => r.json()),
+    ]);
+  } catch (e) {
+    document.getElementById('anBody').innerHTML =
+      `<div class="an-loading">Failed to load analytics.</div>`;
+    return;
+  }
+
+  document.getElementById('anBody').innerHTML =
+    renderConfigSection(info) + (data.empty ? renderEmpty() : renderAnalytics(data));
+
+  wirePresetButtons();
+}
+
+function renderEmpty() {
+  return `
+    <div class="an-section">
+      <div class="an-section-title">No calls yet</div>
+      <div class="an-empty">
+        Make some calls from the Lead Dialer and the numbers will show up here —
+        cost per conversation, latency breakdown, connect rates, and outcome mix.
+      </div>
+    </div>`;
+}
+
+// ── Current configuration + estimates ───────────────────────────────────────
+
+function renderConfigSection(info) {
+  const { transcriber, model, voice, estimated, presets, rates } = info;
+
+  const costParts = [
+    { label: 'Twilio',      v: rates.twilio_voice_us + rates.twilio_media_stream, c: 'seg-twilio' },
+    { label: 'Transcriber', v: transcriber.cost_per_min, c: 'seg-stt' },
+    { label: 'Model',       v: model.cost_per_min,       c: 'seg-llm' },
+    { label: 'Voice',       v: voice.cost_per_min,       c: 'seg-tts' },
+  ];
+  const latParts = [
+    { label: 'Endpointing', v: estimated.endpointing_ms,       c: 'seg-twilio' },
+    { label: 'Transcriber', v: transcriber.typical_latency_ms, c: 'seg-stt' },
+    { label: 'Model',       v: model.typical_latency_ms,       c: 'seg-llm' },
+    { label: 'Voice',       v: voice.typical_latency_ms,       c: 'seg-tts' },
+  ];
+  const csum = costParts.reduce((a, b) => a + b.v, 0) || 1;
+  const lsum = latParts.reduce((a, b) => a + b.v, 0) || 1;
+
+  const bar = (parts, sum) => parts.map(x =>
+    `<span class="an-seg ${x.c}" style="width:${(x.v / sum * 100).toFixed(1)}%" title="${x.label}"></span>`).join('');
+  const legend = (parts, fmt) => parts.map(x =>
+    `<span class="an-legend-item"><i class="${x.c}"></i>${x.label} <b>${fmt(x.v)}</b></span>`).join('');
+
+  return `
+  <div class="an-section">
+    <div class="an-section-title">Current configuration</div>
+
+    <div class="an-estimates">
+      <div>
+        <div class="an-est-label">Estimated cost</div>
+        <div class="an-est-big">~$${estimated.cost_per_min.toFixed(3)}<span>/min</span></div>
+        <div class="an-bar">${bar(costParts, csum)}</div>
+        <div class="an-legend">${legend(costParts, v => '$' + v.toFixed(3))}</div>
+      </div>
+      <div>
+        <div class="an-est-label">Estimated latency</div>
+        <div class="an-est-big">~${estimated.latency_ms}<span>ms</span></div>
+        <div class="an-bar">${bar(latParts, lsum)}</div>
+        <div class="an-legend">${legend(latParts, v => v + 'ms')}</div>
+      </div>
+    </div>
+
+    <div class="an-presets">
+      <span class="an-presets-label">Presets</span>
+      ${Object.entries(presets).map(([k, l]) =>
+        `<button class="an-preset-btn" data-preset="${k}">${l}</button>`).join('')}
+    </div>
+
+    <div class="an-stack">
+      ${componentCard('Transcriber', 'dot-stt', transcriber)}
+      ${componentCard('Model',       'dot-llm', model)}
+      ${componentCard('Voice',       'dot-tts', voice)}
+    </div>
+  </div>`;
+}
+
+function componentCard(tag, dot, c) {
+  return `
+    <div class="an-comp">
+      <div class="an-comp-tag"><i class="${dot}"></i>${tag}</div>
+      <div class="an-comp-name">${c.name}</div>
+      <div class="an-comp-sub">${c.provider}</div>
+      <div class="an-comp-stats">
+        <div><span>Latency</span><b>${c.typical_latency_ms}ms</b></div>
+        <div><span>Cost</span><b>$${c.cost_per_min.toFixed(3)}/min</b></div>
+        <div><span>${c.metric_label}</span><b>${c.metric_value}</b></div>
+      </div>
+    </div>`;
+}
+
+// ── Measured results ────────────────────────────────────────────────────────
+
+function renderAnalytics(d) {
+  const t = d.totals, r = d.rates, c = d.cost, l = d.latency;
+
+  const kpi = (label, value, sub) => `
+    <div class="an-kpi">
+      <div class="an-kpi-label">${label}</div>
+      <div class="an-kpi-value">${value}</div>
+      ${sub ? `<div class="an-kpi-sub">${sub}</div>` : ''}
+    </div>`;
+
+  const outcomeRows = Object.entries(d.outcomes)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => {
+      const pct = (v / t.calls * 100).toFixed(1);
+      return `
+        <div class="an-outcome">
+          <div class="an-outcome-head">
+            <span class="an-outcome-name">${k.replace(/_/g, ' ')}</span>
+            <span class="an-outcome-count">${v} <em>${pct}%</em></span>
+          </div>
+          <div class="an-outcome-bar"><span style="width:${pct}%"></span></div>
+        </div>`;
+    }).join('');
+
+  const maxDaily = Math.max(...d.daily.map(x => x.calls), 1);
+  const dailyBars = d.daily.map(x => `
+    <div class="an-day" title="${x.date} — ${x.calls} calls, $${x.cost.toFixed(3)}">
+      <div class="an-day-bar">
+        <span class="an-day-conv" style="height:${x.conversations / maxDaily * 100}%"></span>
+        <span class="an-day-conn" style="height:${x.connected / maxDaily * 100}%"></span>
+        <span class="an-day-all"  style="height:${x.calls / maxDaily * 100}%"></span>
+      </div>
+      <div class="an-day-label">${x.date.slice(5)}</div>
+    </div>`).join('');
+
+  const recentRows = d.recent.map(x => `
+    <tr>
+      <td class="an-td-time">${new Date(x.ts * 1000).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'})}</td>
+      <td class="an-td-name">${escapeHtml(x.business || '—')}</td>
+      <td><span class="an-tag an-tag--${x.outcome || 'unknown'}">${(x.outcome || 'unknown').replace(/_/g,' ')}</span></td>
+      <td class="an-td-num">${x.duration_s || 0}s</td>
+      <td class="an-td-num">${x.turns || 0}</td>
+      <td class="an-td-num">${x.latency?.total_ms || 0}ms</td>
+      <td class="an-td-num">$${(
+        (x.cost?.twilio||0)+(x.cost?.stt||0)+(x.cost?.llm||0)+(x.cost?.tts||0)
+      ).toFixed(4)}</td>
+    </tr>`).join('');
+
+  return `
+  <div class="an-section">
+    <div class="an-section-title">Summary — last ${d.days} days</div>
+    <div class="an-kpis">
+      ${kpi('Calls placed',    t.calls)}
+      ${kpi('Answered',        t.connected, `${r.connect}% connect rate`)}
+      ${kpi('Conversations',   t.conversations, `${r.conversation}% of calls`)}
+      ${kpi('Interested',      t.interested, `${r.interest}% of calls`)}
+      ${kpi('Talk time',       t.minutes + 'm')}
+      ${kpi('Total spend',     '$' + c.total.toFixed(2))}
+    </div>
+  </div>
+
+  <div class="an-section">
+    <div class="an-section-title">Cost</div>
+    <div class="an-kpis an-kpis--4">
+      ${kpi('Per call',         '$' + c.per_call.toFixed(4))}
+      ${kpi('Per minute',       '$' + c.per_min.toFixed(4))}
+      ${kpi('Per conversation', '$' + c.per_conversation.toFixed(4))}
+      ${kpi('Per interested lead', c.per_interested ? '$' + c.per_interested.toFixed(3) : '—')}
+    </div>
+    <div class="an-costsplit">
+      ${[['Twilio','seg-twilio',c.twilio],['Transcriber','seg-stt',c.stt],
+         ['Model','seg-llm',c.llm],['Voice','seg-tts',c.tts]].map(([n,cl,v]) => `
+        <div class="an-costrow">
+          <span class="an-costrow-name"><i class="${cl}"></i>${n}</span>
+          <span class="an-costrow-bar"><span class="${cl}" style="width:${c.total ? v/c.total*100 : 0}%"></span></span>
+          <span class="an-costrow-val">$${v.toFixed(3)}</span>
+          <span class="an-costrow-pct">${c.total ? (v/c.total*100).toFixed(0) : 0}%</span>
+        </div>`).join('')}
+    </div>
+  </div>
+
+  <div class="an-section">
+    <div class="an-section-title">Measured latency</div>
+    <div class="an-kpis an-kpis--5">
+      ${kpi('Median total', l.total + 'ms')}
+      ${kpi('p95 total',    l.p95 + 'ms')}
+      ${kpi('Transcriber',  l.stt + 'ms')}
+      ${kpi('Model',        l.llm + 'ms')}
+      ${kpi('Voice',        l.tts + 'ms')}
+    </div>
+  </div>
+
+  <div class="an-section">
+    <div class="an-section-title">Outcomes</div>
+    <div class="an-outcomes">${outcomeRows}</div>
+  </div>
+
+  ${d.daily.length > 1 ? `
+  <div class="an-section">
+    <div class="an-section-title">Daily volume</div>
+    <div class="an-chart-legend">
+      <span><i class="an-day-all"></i>Placed</span>
+      <span><i class="an-day-conn"></i>Answered</span>
+      <span><i class="an-day-conv"></i>Conversations</span>
+    </div>
+    <div class="an-chart">${dailyBars}</div>
+  </div>` : ''}
+
+  <div class="an-section">
+    <div class="an-section-title">Recent calls</div>
+    <div class="an-table-wrap">
+      <table class="an-table">
+        <thead><tr>
+          <th>When</th><th>Business</th><th>Outcome</th>
+          <th class="an-th-num">Duration</th><th class="an-th-num">Turns</th>
+          <th class="an-th-num">Latency</th><th class="an-th-num">Cost</th>
+        </tr></thead>
+        <tbody>${recentRows}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+function wirePresetButtons() {
+  document.querySelectorAll('.an-preset-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      await fetch(`/api/agent/preset/${btn.dataset.preset}`, { method: 'POST' });
+      await loadAgentConfig();
+      loadAnalytics();
+    });
+  });
 }

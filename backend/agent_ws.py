@@ -74,6 +74,7 @@ class AgentCallHandler:
         self._speak_seq     = 0
         self._loud_frames   = 0      # consecutive frames above threshold
         self._vad_threshold = 2500    # RMS level that counts as speech
+        self.outcome = "no_answer"        
 
         self.end_phrases = [
             p.strip().lower()
@@ -278,12 +279,15 @@ class AgentCallHandler:
         self._last_turn = time.time()
         self._nudges = 0
         self._prospect_spoke = True        
+        if self.outcome == "no_answer":
+            self.outcome = "conversation"        
 
         if self._looks_like_ivr(text):
             self._ivr_hits += 1
             print(f"[IVR] detected ({self._ivr_hits}): {text[:60]}")
             if self._ivr_hits >= 1:
                 print("[IVR] phone tree confirmed — hanging up")
+                self.outcome = "ivr"
                 await self._push_status("ended", "IVR / phone tree")
                 await self._hangup()
             return
@@ -311,6 +315,15 @@ class AgentCallHandler:
             self.conversation.append({"role": "assistant", "content": clean})
 
         low = clean.lower()
+        # Classify interest from what the agent asked for
+        if any(k in low for k in ("what day works", "callback", "spell that",
+                                  "best number to reach", "our team will reach out")):
+            self.outcome = "interested"
+        elif any(k in low for k in ("no problem at all", "have a great day",
+                                    "i'll let you go")):
+            if self.outcome != "interested":
+                self.outcome = "not_interested"
+
         if "[HANGUP]" in response or any(p in low for p in self.end_phrases):
             await asyncio.sleep(1)
             await self._hangup()
@@ -609,6 +622,8 @@ class AgentCallHandler:
         })
 
     async def _cleanup(self):
+        if getattr(self, "_cleaned", False):
+            return
         self._stop = True
         self.metrics.ended = time.time()
         snap = self.metrics.snapshot()

@@ -77,6 +77,17 @@ function renderNav() {
   dialerItem.innerHTML = `<span class="nav-icon">📞</span><span>Lead Dialer</span>`;
   dialerItem.addEventListener('click', () => { loadDialer(); closeSidebar(); });
   nav.appendChild(dialerItem);
+
+  const analyticsItem = document.createElement('div');
+  analyticsItem.className = 'nav-item';
+  analyticsItem.dataset.id = 'analytics';
+  analyticsItem.innerHTML = `<span class="nav-icon">📊</span><span>Analytics</span>`;
+  analyticsItem.addEventListener('click', () => {
+    setActiveNav('analytics');
+    loadAnalytics();
+    closeSidebar();
+  });
+  nav.appendChild(analyticsItem);
 }
 
 function setActiveNav(id) {

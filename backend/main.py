@@ -1080,6 +1080,25 @@ async def agent_stream(websocket: WebSocket):
     finally:
         if handler.call_sid:
             _agent_handlers.pop(handler.call_sid, None)
+        try:
+            from call_history import record_call
+            snap = handler.metrics.snapshot()
+            record_call({
+                "call_sid":   handler.call_sid,
+                "business":   handler.lead_info.get("Name", ""),
+                "phone":      handler.lead_info.get("Phone", ""),
+                "city":       handler.lead_info.get("City", ""),
+                "category":   handler.lead_info.get("Category", ""),
+                "answered":   handler.metrics.turns > 0,
+                "outcome":    handler.outcome,
+                "turns":      snap["turns"],
+                "interrupts": snap["interrupts"],
+                "duration_s": snap["cost"]["duration_s"],
+                "latency":    snap["latency"],
+                "cost":       snap["cost"],
+            })
+        except Exception as e:
+            print(f"[HISTORY] failed: {e}")
 
 
 @app.get("/api/agent/events/{call_sid}")
@@ -1219,3 +1238,8 @@ async def agent_call_price(call_sid: str):
         })
     except Exception as e:
         return JSONResponse({"price": None, "error": str(e)})
+
+@app.get("/api/analytics")
+async def get_analytics(days: int = 30):
+    from call_history import summarise
+    return JSONResponse(summarise(days))
