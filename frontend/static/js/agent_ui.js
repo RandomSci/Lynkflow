@@ -773,7 +773,7 @@ function startRingback() {
   if (ringCtx) return;
   ringCtx = new (window.AudioContext || window.webkitAudioContext)();
   const beep = () => {
-    if (!ringCtx) return;
+    if (!ringCtx || ringCtx.state === 'closed') return;
     const o1 = ringCtx.createOscillator(), o2 = ringCtx.createOscillator();
     const g = ringCtx.createGain();
     o1.frequency.value = 440; o2.frequency.value = 480;
@@ -781,7 +781,7 @@ function startRingback() {
     o1.connect(g); o2.connect(g); g.connect(ringCtx.destination);
     const t = ringCtx.currentTime;
     o1.start(t); o2.start(t);
-    o1.stop(t + 2); o2.stop(t + 2);
+    o1.stop(t + 1.6); o2.stop(t + 1.6);
   };
   beep();
   ringTimer = setInterval(beep, 6000);   // US ringback: 2s on, 4s off
@@ -789,7 +789,10 @@ function startRingback() {
 
 function stopRingback() {
   if (ringTimer) { clearInterval(ringTimer); ringTimer = null; }
-  if (ringCtx) { ringCtx.close(); ringCtx = null; }
+  if (ringCtx) {
+    try { ringCtx.close(); } catch (e) {}
+    ringCtx = null;
+  }
 }
 
 function playTone(freqs, dur, vol) {

@@ -57,10 +57,9 @@ class AgentCallHandler:
         self._speak_started = 0.0
         self._nudges = 0
         self._last_turn = time.time()
-
+        self._prospect_spoke = False        
         self.stream_sid: Optional[str] = None
         self.call_sid:   Optional[str] = None
-
         self.conversation: list = []
         self.is_speaking  = False
         self.dg_ws        = None
@@ -130,7 +129,7 @@ class AgentCallHandler:
             # Nudge on dead air — only when the agent isn't speaking and the
             # conversation has actually started
             quiet = now - self._last_turn
-            if (not self.is_speaking and self.conversation and quiet > 6
+            if (not self.is_speaking and self._prospect_spoke and quiet > 9
                     and self._nudges < len(NUDGES)):
                 line = NUDGES[self._nudges]
                 self._nudges += 1
@@ -272,6 +271,7 @@ class AgentCallHandler:
 
         self._last_turn = time.time()
         self._nudges = 0
+        self._prospect_spoke = True        
 
         if self._looks_like_ivr(text):
             self._ivr_hits += 1
@@ -449,9 +449,9 @@ class AgentCallHandler:
             print(f"[TTS EXCEPTION] {e}")
         finally:
             if seq == self._speak_seq:
-                # Small tail so barge-in doesn't trigger on our own audio
                 await asyncio.sleep(0.25)
                 self.is_speaking = False
+                self._last_turn = time.time()
 
     async def _stop_speaking(self):
         self.is_speaking = False
