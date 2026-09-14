@@ -93,7 +93,18 @@ class AgentCallHandler:
         self.dg_ws        = None
         self._stop        = False
         self._last_audio  = time.time()
+        self._last_voice_audio = time.time()
         self._call_start  = time.time()
+        self._awaiting_response_since = None
+        self._max_duration_extended = False
+        self._startup_audio_seen = False
+        self._opening_started = False
+        self._initial_turn_task = None
+        self._turn_lock = asyncio.Lock()
+        self._last_handled_text = ""
+        self._last_handled_at = 0.0
+        self._awaiting_callback_time = False
+        self.followup_note = ""
         self._speak_seq     = 0
         self._loud_frames   = 0      # consecutive frames above threshold
         self._vad_threshold = 2500    # RMS level that counts as speech
@@ -109,6 +120,7 @@ class AgentCallHandler:
         self._script_step = "owner_check"
         self._gatekeeper_mode = False
         self._gatekeeper_contact_asked = False
+        self._decision_maker_confirmed = False
 
         self.end_phrases = [
             p.strip().lower()
@@ -145,6 +157,17 @@ class AgentCallHandler:
         "call you back as soon as", "we'll get back to you",
     ]
 
+    ANNOUNCEMENT_MARKERS = [
+        "this call may be recorded", "this call is being recorded",
+        "call may be recorded", "call is being recorded",
+        "may be recorded", "being recorded", "recorded for quality",
+        "quality assurance", "quality of service", "quality of customer care",
+        "ensure quality", "training purposes", "monitoring purposes",
+        "please wait while", "while we connect", "while i connect",
+        "your call will be connected", "connecting your call",
+        "ringing", "ring ring", "phone ringing", "dial tone",
+    ]
+
     HUMAN_GREETING_MARKERS = [
         "how may i help", "how can i help", "how may we help", "how can we help",
         "how may i assist", "how can i assist", "how may we assist", "how can we assist",
@@ -161,6 +184,8 @@ class AgentCallHandler:
             return "menu"
         if any(m in low for m in self.VOICEMAIL_MARKERS):
             return "voicemail"
+        if any(m in low for m in self.ANNOUNCEMENT_MARKERS):
+            return "announcement"
         return ""
 
     def _looks_like_human_greeting(self, text: str) -> bool:
@@ -195,6 +220,20 @@ class AgentCallHandler:
         finally:
             await self._cleanup()
 
+    def _mark_listening_for_response(self):
+        self._awaiting_response_since = time.time()
+
+    def _recent_prospect_activity(self, now: float, grace_s: float = 4.0) -> bool:
+        last = self._last_dg_text or 0.0
+        return last > 0 and (now - last) <= grace_s
+
+    def _is_engaged_human_conversation(self) -> bool:
+        return (
+            self._prospect_spoke
+            and not self._machine_kind
+            and self.outcome in {"conversation", "interested", "not_interested"}
+        )
+
     async def _watchdog(self):
         """Silence nudges, silence timeout, and max call duration."""
         NUDGES = [
@@ -204,15 +243,33 @@ class AgentCallHandler:
         while not self._stop:
             await asyncio.sleep(1)
             now = time.time()
+            quiet = now - self._last_turn
 
             if self.cfg.max_duration_s and (now - self._call_start) > self.cfg.max_duration_s:
-                print("[WATCHDOG] max duration reached")
+                if self._is_engaged_human_conversation():
+                    if not self._max_duration_extended:
+                        self._max_duration_extended = True
+                        print("[WATCHDOG] max duration reached during engaged conversation; continuing")
+                    if not self.is_speaking and quiet > max(45, self.cfg.silence_timeout_s * 2):
+                        print("[WATCHDOG] engaged call went quiet after max duration")
+                        await self._hangup()
+                        break
+                else:
+                    print("[WATCHDOG] max duration reached")
+                    await self._hangup()
+                    break
+
+            if (self.cfg.silence_timeout_s and not self.is_speaking
+                    and not self._prospect_spoke and self._awaiting_response_since
+                    and (now - self._awaiting_response_since) > self.cfg.silence_timeout_s
+                    and not self._recent_prospect_activity(now)):
+                print("[WATCHDOG] no response after agent line")
+                await self._push_status("ended", "No response")
                 await self._hangup()
                 break
 
             # Nudge on dead air — only when the agent isn't speaking and the
             # conversation has actually started
-            quiet = now - self._last_turn
             if (not self.is_speaking and self._prospect_spoke and quiet > 9
                     and self._nudges < len(NUDGES)):
                 line = NUDGES[self._nudges]
@@ -231,8 +288,8 @@ class AgentCallHandler:
                 await self._hangup()
                 break
 
-            if (self.cfg.silence_timeout_s and not self.is_speaking
-                    and (now - self._last_audio) > self.cfg.silence_timeout_s):
+            if (self.cfg.silence_timeout_s and not self.is_speaking and self._prospect_spoke
+                    and (now - max(self._last_turn, self._last_voice_audio, self._last_dg_text or 0.0)) > self.cfg.silence_timeout_s):
                 print("[WATCHDOG] silence timeout")
                 await self._hangup()
                 break
@@ -302,7 +359,8 @@ class AgentCallHandler:
                 }
             print(f"[STREAM START] {self.call_sid} lead={self.lead_info}")
             await self._push_status("active", "Call active")
-            await self._begin_conversation()
+            if not self._initial_turn_task or self._initial_turn_task.done():
+                self._initial_turn_task = asyncio.create_task(self._begin_when_ready())
 
         elif evt == "media":
             self._last_audio = time.time()
@@ -314,15 +372,21 @@ class AgentCallHandler:
             if self.listeners:
                 self._fanout_nowait(payload, "prospect")
 
+            try:
+                pcm = audioop.ulaw2lin(raw, 2)
+                rms = audioop.rms(pcm, 2)
+            except Exception:
+                pcm = None
+                rms = 0
+            if rms > self._vad_threshold:
+                self._last_voice_audio = self._last_audio
+                if not self._opening_started:
+                    self._startup_audio_seen = True
+
             # Grace period — never let barge-in kill the agent's first words.
             # Echo and trailing speech from the prospect cause false triggers.
             grace_ok = (time.time() - self._speak_started) > 0.9
             if self.is_speaking and self.cfg.allow_interruption and grace_ok:
-                try:
-                    pcm = audioop.ulaw2lin(raw, 2)
-                    rms = audioop.rms(pcm, 2)
-                except Exception:
-                    rms = 0
                 if rms > self._vad_threshold:
                     self._loud_frames += 1
                     if self._loud_frames >= 10:     # ~200ms      # ~60ms of speech
@@ -345,25 +409,44 @@ class AgentCallHandler:
 
     # ── Conversation ─────────────────────────────────────────────────────────
 
-    async def _begin_conversation(self):
+    def _system_message(self) -> str:
         tone_note = TONE_NOTES.get(self.cfg.tone, "Be natural and confident.")
         business  = self.lead_info.get("Name") or "your business"
         city      = self.lead_info.get("City") or ""
         category  = self.lead_info.get("Category") or "plumbing business"
 
         context = f"\n\nLEAD CONTEXT: {business}, a {category}" + (f" in {city}." if city else ".")
-        system  = render_template(self.cfg.system_prompt, self.lead_info) \
-                  + context + f"\n\nTONE: {tone_note}"
+        return render_template(self.cfg.system_prompt, self.lead_info) + context + f"\n\nTONE: {tone_note}"
+
+    def _ensure_conversation_context(self):
+        if not self.conversation:
+            self.conversation = [{"role": "system", "content": self._system_message()}]
+
+    async def _begin_when_ready(self):
+        self._ensure_conversation_context()
+        await self._push_status("listening", "Listening for answer...")
+        deadline = time.time() + max(4, self.cfg.silence_timeout_s)
+
+        while not self._stop and not self._opening_started and not self._prospect_spoke:
+            if time.time() > deadline:
+                print("[STARTUP] no answer transcript detected")
+                await self._push_status("ended", "No human detected")
+                await self._hangup()
+                return
+            await asyncio.sleep(0.2)
+
+    async def _begin_conversation(self):
+        if self._opening_started:
+            return
 
         opening = render_template(self.cfg.first_message, self.lead_info)
         print(f"[LEAD] {self.lead_info}")
         print(f"[OPENING] {opening}")
 
-        self.conversation = [
-            {"role": "system",    "content": system},
-            {"role": "assistant", "content": opening},
-        ]
+        self._ensure_conversation_context()
+        self.conversation.append({"role": "assistant", "content": opening})
         self._script_step = "owner_check"
+        self._opening_started = True
         await asyncio.sleep(0.6)
         await self._push_transcript("agent", opening)
         self._speak_seq += 1
@@ -374,11 +457,26 @@ class AgentCallHandler:
         if not text.strip() or self._stop:
             return
 
-        self._last_turn = time.time()
-        self._nudges = 0
-        self._prospect_spoke = True        
-        if self.outcome == "no_answer":
-            self.outcome = "conversation"        
+        low = text.lower().strip(" .,?!")
+        if self._turn_lock.locked() and (
+                self.is_speaking or self._is_ambiguous_greeting(text)
+                or "can you hear me" in low or low in {"hello", "hi", "hey"}):
+            print(f"[TURN] dropping overlapping transcript: {text[:80]}")
+            return
+
+        async with self._turn_lock:
+            now = time.time()
+            norm = re.sub(r"\s+", " ", low)
+            if norm and norm == self._last_handled_text and (now - self._last_handled_at) < 4:
+                print(f"[TURN] dropping duplicate transcript: {text[:80]}")
+                return
+            self._last_handled_text = norm
+            self._last_handled_at = now
+            await self._handle_transcript_locked(text)
+
+    async def _handle_transcript_locked(self, text: str):
+        if not text.strip() or self._stop:
+            return
 
         if self._voicemail_task and not self._voicemail_task.done() and self._looks_like_human_greeting(text):
             print(f"[MACHINE] cancelled voicemail; human greeting detected: {text[:80]}")
@@ -388,6 +486,14 @@ class AgentCallHandler:
             self.outcome = "conversation"
 
         kind = self._classify_machine(text)
+
+        if kind == "announcement":
+            print(f"[MACHINE] announcement: {text[:80]}")
+            self._startup_audio_seen = True
+            if self.is_speaking:
+                self._speak_seq += 1
+                await self._stop_speaking()
+            return
 
         if kind == "menu":
             print(f"[MACHINE] phone tree: {text[:60]}")
@@ -411,7 +517,16 @@ class AgentCallHandler:
 
         if self._looks_like_business_greeting_only(text):
             print(f"[GREETING] waiting for more context: {text[:80]}")
+            self._startup_audio_seen = True
             return
+
+        self._ensure_conversation_context()
+        self._awaiting_response_since = None
+        self._last_turn = time.time()
+        self._nudges = 0
+        self._prospect_spoke = True
+        if self.outcome == "no_answer":
+            self.outcome = "conversation"
 
         self.conversation.append({"role": "user", "content": text})
 
@@ -421,6 +536,11 @@ class AgentCallHandler:
         if await self._maybe_scripted_opening_response(text):
             return
 
+        if not self._decision_maker_confirmed:
+            if await self._handle_unconfirmed_transcript(text):
+                return
+
+        self._opening_started = True
         response = await self._respond()
 
         # Record latency for this turn
@@ -472,11 +592,14 @@ class AgentCallHandler:
 
     def _looks_like_gatekeeper(self, text: str) -> bool:
         low = text.lower()
-        return any(k in low for k in (
+        if any(k in low for k in (
             "how may i help", "how can i help", "how may we help", "how can we help",
             "how may i assist", "how can i assist", "can i help", "may i help",
-            "how can i direct", "how may i direct",
-        ))
+            "how can i direct", "how may i direct", "what can i get you",
+            "what can i help", "how can i get you", "this is", "speaking with",
+        )):
+            return True
+        return bool(re.search(r"\b(great|good) day at\b", low))
 
     def _confirms_owner(self, text: str) -> bool:
         low = text.lower().strip(" .,?!")
@@ -512,6 +635,130 @@ class AgentCallHandler:
             "owner is out", "owner's out",
         ))
 
+    def _lead_timezone(self) -> str:
+        for key in ("Timezone", "Time Zone", "timezone", "time_zone", "TZ", "tz"):
+            val = str(self.lead_info.get(key, "")).strip()
+            if val:
+                return val
+        return ""
+
+    def _requests_better_time(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "better time", "call back", "callback", "try later", "another time",
+            "not right now", "busy right now", "too busy", "later",
+        ))
+
+    def _has_callback_time_detail(self, text: str) -> bool:
+        low = text.lower().strip(" .,?!")
+        vague = {
+            "a better time", "a better time to call", "better time", "better time to call",
+            "call back", "call back later", "later", "another time", "try later",
+        }
+        if low in vague:
+            return False
+        if re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?\b", low):
+            return True
+        return any(k in low for k in (
+            "morning", "afternoon", "evening", "noon", "lunch", "tomorrow", "today",
+            "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+            "next week", "this week", "after", "before",
+        ))
+
+    async def _save_callback_time_and_end(self, text: str):
+        tz = self._lead_timezone()
+        when = text.strip()
+        self.outcome = "callback"
+        self.followup_note = f"Callback requested: {when}"
+        if tz:
+            self.followup_note += f" ({tz})"
+        line = f"Got it, I'll note that {when}"
+        if tz:
+            line += f" {tz}"
+        line += ". Thanks for your help, have a good day. [HANGUP]"
+        await self._send_agent_line(line)
+
+    def _is_ambiguous_greeting(self, text: str) -> bool:
+        low = text.lower().strip(" .,?!")
+        return low in {
+            "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+            "yes", "yeah", "yep", "uh huh", "okay", "ok",
+        }
+
+    async def _handle_unconfirmed_transcript(self, text: str) -> bool:
+        """Keep pre-confirmation turns safe: route first, never pitch."""
+        if self._confirms_owner(text):
+            self._decision_maker_confirmed = True
+            self._gatekeeper_mode = False
+            self._script_step = "done"
+            self.conversation.append({
+                "role": "system",
+                "content": (
+                    "The last reply confirmed this is the owner or decision maker. "
+                    "Continue naturally using the pitch reference. Keep it brief and ask one clear next-step question."
+                ),
+            })
+            return False
+
+        self._script_step = "done"
+
+        if self._is_hard_no(text):
+            await self._send_agent_line("No problem, thanks for your time. Have a good day. [HANGUP]")
+            return True
+
+        if self._awaiting_callback_time:
+            if self._has_callback_time_detail(text):
+                await self._save_callback_time_and_end(text)
+            else:
+                await self._send_agent_line("Sure, what day and time is usually best?")
+            return True
+
+        if self._requests_better_time(text):
+            self._awaiting_callback_time = True
+            await self._send_agent_line("Sure, what day and time is usually best?")
+            return True
+
+        if self._owner_unavailable(text):
+            self._gatekeeper_mode = True
+            self._gatekeeper_contact_asked = True
+            await self._send_agent_line(
+                "No worries. What's the best way to reach the owner or office manager directly?"
+            )
+            return True
+
+        if self._looks_like_gatekeeper(text) or self._denies_owner(text):
+            self._gatekeeper_mode = True
+            line = "No problem. Is the owner or office manager available?"
+            if not self._opening_started:
+                line = "Hi, this is Anna with Lynkflow. Is the owner or office manager available?"
+            await self._send_agent_line(
+                line
+            )
+            return True
+
+        if self._asks_agent_identity(text):
+            await self._send_agent_line(
+                "This is Anna with Lynkflow. I was trying to reach whoever handles customer calls for the business. Is that you?"
+            )
+            return True
+
+        if self._asks_reason(text):
+            await self._send_agent_line(
+                "It's about customer calls for the business, but I only want to speak with whoever handles that. Is that you or someone else?"
+            )
+            return True
+
+        if self._is_ambiguous_greeting(text):
+            await self._send_agent_line(
+                "Hi, this is Anna with Lynkflow. Are you the owner or office manager?"
+            )
+            return True
+
+        await self._send_agent_line(
+            "Hi, this is Anna with Lynkflow. Are you the owner or the person who handles customer calls?"
+        )
+        return True
+
     async def _maybe_scripted_opening_response(self, text: str) -> bool:
         """Keep the first two turns on track before handing off to GPT."""
         if self._script_step not in ("owner_check", "pitch", "hook"):
@@ -524,13 +771,17 @@ class AgentCallHandler:
 
         if self._script_step == "owner_check":
             if self._confirms_owner(text):
-                self._script_step = "hook"
+                self._script_step = "done"
                 self._gatekeeper_mode = False
-                await self._send_agent_line(
-                    "We help plumbing businesses stop losing jobs to missed calls. "
-                    "We build an AI system that answers your calls automatically and books jobs while you're on site."
-                )
-                return True
+                self._decision_maker_confirmed = True
+                self.conversation.append({
+                    "role": "system",
+                    "content": (
+                        "The last reply confirmed this is the owner or decision maker. "
+                        "Continue naturally using the pitch reference. Keep it brief and ask one clear next-step question."
+                    ),
+                })
+                return False
 
             if self._owner_unavailable(text):
                 self._script_step = "done"
@@ -542,26 +793,21 @@ class AgentCallHandler:
                 return True
 
             if self._looks_like_gatekeeper(text) or self._denies_owner(text):
-                self._script_step = "done"
-                self._gatekeeper_mode = True
-                await self._send_agent_line("Hi, I'm calling about their phone system. Is the owner available?")
-                return True
+                return await self._handle_unconfirmed_transcript(text)
 
             if self._needs_flexible_response(text):
-                self._script_step = "done"
-                return False
+                return await self._handle_unconfirmed_transcript(text)
 
-            await self._send_agent_line(
-                "Before I go further, are you the owner or office manager?"
-            )
-            return True
+            return await self._handle_unconfirmed_transcript(text)
 
         if self._script_step == "pitch" and self._looks_like_gatekeeper(text):
             self._script_step = "done"
             self._gatekeeper_mode = True
-            await self._send_agent_line("Hi, I'm calling about their phone system. Is the owner available?")
+            await self._send_agent_line("No problem. Is the owner or office manager available?")
             return True
         if self._needs_flexible_response(text):
+            if not self._decision_maker_confirmed:
+                return await self._handle_unconfirmed_transcript(text)
             self._script_step = "done"
             return False
 
@@ -604,28 +850,45 @@ class AgentCallHandler:
     async def _handle_gatekeeper_transcript(self, text: str) -> bool:
         if self._confirms_owner(text):
             self._gatekeeper_mode = False
-            await self._send_agent_line(
-                "Perfect, thanks. We help plumbing businesses stop losing jobs to missed calls. "
-                "We build an AI system that answers your calls automatically and books jobs while you're on site."
-            )
-            return True
+            self._decision_maker_confirmed = True
+            self._script_step = "done"
+            self.conversation.append({
+                "role": "system",
+                "content": (
+                    "The last reply confirmed this is the owner or decision maker. "
+                    "Continue naturally using the pitch reference. Keep it brief and ask one clear next-step question."
+                ),
+            })
+            return False
 
         if self._is_hard_no(text):
             await self._send_agent_line("No problem, I'll try another time. Thanks for your help, have a good day! [HANGUP]")
             return True
 
+        if self._awaiting_callback_time:
+            if self._has_callback_time_detail(text):
+                await self._save_callback_time_and_end(text)
+            else:
+                await self._send_agent_line("Sure, what day and time is usually best?")
+            return True
+
+        if self._requests_better_time(text):
+            self._awaiting_callback_time = True
+            await self._send_agent_line("Sure, what day and time is usually best?")
+            return True
+
         if self._asks_agent_identity(text):
             cb = self._callback_number() or "the number I called from"
             await self._send_agent_line(
-                f"My name is Anna with Lynkflow, and the best callback is {cb}. What's the best way to reach the owner directly?"
+                f"My name is Anna with Lynkflow, and the best callback is {cb}. What's the best way to reach the owner or office manager directly?"
             )
             self._gatekeeper_contact_asked = True
             return True
 
         if self._asks_reason(text):
             await self._send_agent_line(
-                "It's regarding their business phone line. "
-                "What's the best way to reach the owner or office manager?"
+                "It's about customer calls for the business. "
+                "What's the best way to reach the owner or office manager directly?"
             )
             self._gatekeeper_contact_asked = True
             return True
@@ -633,7 +896,7 @@ class AgentCallHandler:
         if self._owner_unavailable(text) or self._offers_transfer_or_message(text) or self._denies_owner(text):
             if self._gatekeeper_contact_asked:
                 await self._send_agent_line(
-                    "Sure, please let them know Anna from Lynkflow called about their business phone line. "
+                    "Sure, please let them know Anna from Lynkflow called about customer calls for the business. "
                     "What's the best callback number or email for them?"
                 )
             else:
@@ -651,13 +914,15 @@ class AgentCallHandler:
             return True
 
         await self._send_agent_line(
-            "Got it. Please let them know Anna from Lynkflow called regarding their business phone line. Thanks for your help, have a good day! [HANGUP]"
+            "Got it. Please let them know Anna from Lynkflow called about customer calls for the business. Thanks for your help, have a good day! [HANGUP]"
         )
         return True
 
     async def _send_agent_line(self, line: str):
         clean = line.replace("[HANGUP]", "").strip()
         if clean:
+            self._ensure_conversation_context()
+            self._opening_started = True
             self.conversation.append({"role": "assistant", "content": clean})
             await self._push_transcript("agent", clean)
             self.metrics.turns += 1
@@ -861,6 +1126,7 @@ class AgentCallHandler:
                 self.is_speaking = False
                 self._last_audio = time.time()
                 self._last_turn = time.time()
+                self._mark_listening_for_response()
                 if not self._stop:
                     await self._push_status("listening", "Listening…")
 
@@ -1064,6 +1330,7 @@ class AgentCallHandler:
                 self.is_speaking = False
                 self._last_audio = time.time()
                 self._last_turn = time.time()
+                self._mark_listening_for_response()
                 if not self._stop:
                     await self._push_status("listening", "Listening…")                
 

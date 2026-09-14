@@ -81,6 +81,14 @@ def _format_us_phone(phone: str) -> str:
     return str(phone or "").strip()
 
 
+def _lead_timezone(lead: dict) -> str:
+    for key in ("Timezone", "Time Zone", "timezone", "time_zone", "TZ", "tz"):
+        val = str((lead or {}).get(key, "")).strip()
+        if val:
+            return val
+    return ""
+
+
 def _is_autodial_eligible(lead: dict) -> bool:
     if not _phone_key(lead.get("Phone", "")):
         return False
@@ -290,9 +298,11 @@ async def _start_agent_call(phone: str, lead: dict, base_url: str) -> str:
     lead_name  = urllib.parse.quote(lead.get("Name", ""))
     lead_city  = urllib.parse.quote(lead.get("City", ""))
     lead_cat   = urllib.parse.quote(lead.get("Category", ""))
+    lead_tz    = urllib.parse.quote(_lead_timezone(lead))
     twiml_url  = (
         f"{base_url}/api/agent/twiml"
         f"?phone={lead_phone}&name={lead_name}&city={lead_city}&category={lead_cat}"
+        f"&timezone={lead_tz}"
     )
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -1060,6 +1070,8 @@ def _status_from_outcome(outcome: str, call_status: str = "") -> str:
     call_status = (call_status or "").lower()
     if outcome == "interested":
         return "Interested"
+    if outcome == "callback":
+        return "Callback"
     if outcome in ("voicemail", "voicemail_left"):
         return "Voicemail"
     if outcome == "ivr":
@@ -1154,7 +1166,7 @@ async def _autodial_loop():
             _autodial_state["task"] = None
 
 
-async def _autodial_finish_call(call_sid: str, outcome: str = "", call_status: str = "", recording: str = ""):
+async def _autodial_finish_call(call_sid: str, outcome: str = "", call_status: str = "", recording: str = "", notes_extra: str = ""):
     async with _autodial_lock:
         item = _autodial_state["active"].pop(call_sid, None)
         if not item:
@@ -1165,6 +1177,8 @@ async def _autodial_finish_call(call_sid: str, outcome: str = "", call_status: s
     phone = item.get("phone", lead.get("Phone", ""))
     status = _status_from_outcome(outcome, call_status)
     notes = f"Auto dial outcome: {outcome or call_status or 'completed'}"
+    if notes_extra:
+        notes += f"; {notes_extra}"
     if recording:
         notes += f"; recording: {recording}"
     result = await _update_lead_record(lead.get("Name", ""), phone, status, notes, lead)
@@ -1298,6 +1312,7 @@ async def agent_twiml(request: Request):
         f'<Parameter name="name" value="{xml_esc(params.get("name",""))}" />'
         f'<Parameter name="city" value="{xml_esc(params.get("city",""))}" />'
         f'<Parameter name="category" value="{xml_esc(params.get("category",""))}" />'
+        f'<Parameter name="timezone" value="{xml_esc(params.get("timezone",""))}" />'
         '</Stream>'
         '</Connect>'
         '</Response>'
@@ -1359,6 +1374,7 @@ async def agent_stream(websocket: WebSocket):
         "Phone":    urllib.parse.unquote(params.get("phone", "")),
         "City":     urllib.parse.unquote(params.get("city", "")),
         "Category": urllib.parse.unquote(params.get("category", "")),
+        "Timezone": urllib.parse.unquote(params.get("timezone", "")),
     }
 
     cfg          = load_agent_config()
@@ -1427,12 +1443,14 @@ async def agent_stream(websocket: WebSocket):
                 "duration_s": snap["cost"]["duration_s"],
                 "latency":    snap["latency"],
                 "cost":       snap["cost"],
-                "recording": getattr(handler, "recording_file", None),                
+                "recording": getattr(handler, "recording_file", None),
+                "followup_note": getattr(handler, "followup_note", ""),
             })
             await _autodial_finish_call(
                 handler.call_sid,
                 outcome=handler.outcome,
                 recording=getattr(handler, "recording_file", None) or "",
+                notes_extra=getattr(handler, "followup_note", ""),
             )
         except Exception as e:
             print(f"[HISTORY] failed: {e}")

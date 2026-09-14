@@ -1,0 +1,112 @@
+# Lynkflow: AI-Driven Voice Agent System
+
+**Lynkflow** is a full-stack AI autodial/contact center system for businesses who want to automate outbound calling, warm lead engagement, and real-time voice/sales handling—with a focus on service businesses (like plumbers, home services, etc). Below, I’ll summarize what it is, what it does, major features, tech details, strengths, and known issues.
+
+---
+
+## 1. What is Lynkflow?
+
+- Lynkflow is a modern AI-powered web system that automates outbound phone calls using large language models and advanced speech-to-text/-from-text technology.
+- It acts as a virtual agent/caller—initiates calls, interacts with humans (prospects, customers, gatekeepers), handles objections, leaves tailored voicemails, and logs all conversations.
+- Configurable agent “intelligence” logic, with custom scripts and rules, but also uses OpenAI models like GPT-4.1 for conversation generation.
+- Built for high-speed dialing, high-compliance, and easy scripting/testing.
+- Used by businesses to scale sales calls, warm up leads, book appointments, or just ensure no answer goes unlogged.
+
+---
+
+## 2. Key Features & Capabilities
+
+- **Automated Outbound Calling:**  
+  Initiates hundreds/thousands of calls to leads using cloud telephony via Twilio.
+- **AI Conversation:**  
+  Uses OpenAI (GPT-4.1 by default) to generate natural language dialogue, with customizable tightness—never pitching to non-decision makers.
+- **Text-to-Speech (TTS):**  
+  Outbound voice is natural and high-quality, using ElevenLabs’ TTS for nearly human-sounding responses.
+- **Speech Recognition:**  
+  Real-time transcription runs via Deepgram.
+- **Lead Management:**  
+  Pulls leads from Google Sheets, logs all call histories, and can push results back to a CRM.
+- **Engagement State Machine:**  
+  Robust code gates agent behavior:
+  - Does not pitch products to receptionists/staff or IVRs.
+  - Only pitches when decision-maker is confirmed (owner/manager/etc).
+  - Custom, dynamic responses before owner confirmation (routes, asks for best callback, etc).
+- **Voicemail Handling:**  
+  Leaves a humanized, de-pitched voicemail if a machine answers, following a compliant script.
+- **Ringback/Announcement Handling:**  
+  Recognizes recording warnings (“This call may be recorded…”) and waits/does not respond until a human is detected.
+- **Fail-Safes:**  
+  Hangs up on long silences, phone menus, announcements, and dead air.
+- **UI/Web App:**  
+  Lightweight HTML/JS frontend for control, config, and monitoring—no heavy build pipeline.
+- **Auto-dialer Controls:**  
+  Advanced auto dial system with concurrency limits and live monitoring.
+
+---
+
+## 3. Tech Stack/Architecture
+
+- **Python** backend with FastAPI for all routes, SSE, and websocket comms.
+- **Frontend:** Classic HTML/JavaScript/CSS, minimal client-side JS, direct AJAX and EventSource for monitoring and control.
+- **Voice/Telephony:**  
+  - Twilio API for outbound/inbound phone calls.
+  - ElevenLabs for TTS (AI voice rendering).
+  - Deepgram for speech-to-text.
+- **Config/Data/Storage:**  
+  - `.env`, `agent_config.json` for all key settings.
+  - Text log and JSONL for history.
+  - CRM sync via webhook/Google Sheets.
+- **Model:** Uses OpenAI’s GPT-4.1 by default, can be swapped for other models (e.g. GPT-4o) with config changes.
+
+---
+
+## 4. Behavioral Flow (Typical Call):
+
+1. Agent dials out to a lead.
+2. Startup logic: Waits for remote audio. If announcement, holds for human.
+3. Opening: Only asks to speak to owner/manager. Never pitches to a staff/IVR.
+4. Routing: If owner is confirmed, dynamic AI pitch is delivered based on custom script prompt.
+5. Objections/Questions: Responds naturally according to custom prompt logic; never repeats the same question, keeps to short sentences, collects only needed details.
+6. If voicemail: Leaves a gentle, non-salesy humanized voicemail.
+7. End-case handling: Hangs up gracefully on menu, dead air, or if no conversation emerges.
+8. Logs and reports: All transcripts, durations, audio, and “outcomes” are recorded.
+
+---
+
+## 5. Strengths & Configurability
+
+- Fully configurable script logic. No black-box behaviors.
+- Highly resistant to robocall patterns: Advanced wait/classify state means it shouldn’t talk to menu, voicemail, or announcement unless real human is detected.
+- Low cost per call at scale.
+- Compliance-first: Will not pitch without explicit role confirmation.
+- Easily integrates with custom dashboards, CRMs, and reporting workflows.
+
+---
+
+## 6. Known Limitations & Current State
+
+- **Conversion:** As of now, in this install/user context, no conversions/revenue have occurred yet.
+- **Historical bugs:** Earlier versions would start talking during ringback/announcements, fail to detect when a human answered, and pitch to anyone. (These issues have been targeted and fixed in recent versions.)
+- **Market fit:** Still being evaluated—is it a fit for outbound sales in SMBs, or are humans still better for your vertical?
+- **Requires technical oversight:** Custom system; you (or a dev) must monitor, tune, and maintain it.
+
+---
+
+## 7. Who Should Use It?
+
+- Businesses that want to experiment with high-volume outbound calling or auto-reply voicemails, with full transparency.
+- Sales orgs that can't justify $5k+/mo enterprise SaaS but want LLM-grade intelligence.
+- Anyone who needs strict pitch gating—no generic robocalls.
+
+---
+
+## 8. How Stable/Production-Ready?
+
+- Most reliability bugs addressed as of latest patch, but as always with AI + phone: real-world QA/testing is crucial.
+- For non-technical users, a SaaS solution may be easier.
+- For technical teams: this is a deeply hackable, open-source style starter kit to automate voice workflows at a fraction of commercial cost.
+
+---
+
+**Summary:**  
+Lynkflow is a Python-based AI voice agent system that automates outbound calling and lead engagement with GPT-powered script logic, advanced telephony integration, and extensive compliance/routing controls. Customizable, hackable, but should be tested for conversion and reliability before full business deployment.
