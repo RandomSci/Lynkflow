@@ -75,6 +75,10 @@ class AgentCallHandler:
         self._loud_frames   = 0      # consecutive frames above threshold
         self._vad_threshold = 2500    # RMS level that counts as speech
         self.outcome = "no_answer"        
+        self._machine_kind = ""
+        self._vm_left = False
+        self._last_dg_text = 0.0        
+        self._vad_threshold = 3200        
 
         self.end_phrases = [
             p.strip().lower()
@@ -84,23 +88,37 @@ class AgentCallHandler:
 
     # ── Entry ────────────────────────────────────────────────────────────────
 
-    IVR_MARKERS = [
+    # Phone trees — cannot leave a message, hang up
+    MENU_MARKERS = [
         "press one", "press two", "press three", "press zero",
         "press 1", "press 2", "press 3", "press 0",
         "dial by name", "extension number", "main menu",
-        "for quality assurance", "may be monitored", "may be recorded",
-        "please listen", "options have changed", "please hold",
-        "leave a message", "after the tone", "business hours are",
-        "answering service", "please stay on the line",
-        "unable to take your call", "leave your name",
-        "brief description", "call you back as soon as",
-        "thank you for calling", "we are currently closed",
-        "at the tone", "record your message",
+        "for emergency service", "for sales", "for billing",
+        "please listen as our options", "options have changed",
+        "please hold", "your call is important",
+        "currently assisting other customers",
     ]
 
-    def _looks_like_ivr(self, text: str) -> bool:
+    # Voicemail — CAN leave a message
+    VOICEMAIL_MARKERS = [
+        "at the tone", "after the tone", "after the beep",
+        "record your message", "leave your name", "leave a message",
+        "leave your message", "forwarded to voice mail", "forwarded to voicemail",
+        "is not available", "unable to take your call",
+        "can't take your call", "cannot take your call",
+        "mailbox is full", "brief description",
+        "call you back as soon as", "we'll get back to you",
+        "thank you for calling",
+    ]
+
+    def _classify_machine(self, text: str) -> str:
+        """Returns 'voicemail', 'menu', or '' for a human."""
         low = text.lower()
-        return any(m in low for m in self.IVR_MARKERS)
+        if any(m in low for m in self.VOICEMAIL_MARKERS):
+            return "voicemail"
+        if any(m in low for m in self.MENU_MARKERS):
+            return "menu"
+        return ""
 
     async def run(self):
         await self._push_status("connecting", "Connecting…")
@@ -229,7 +247,7 @@ class AgentCallHandler:
                     rms = 0
                 if rms > self._vad_threshold:
                     self._loud_frames += 1
-                    if self._loud_frames >= 6:      # ~120ms      # ~60ms of speech
+                    if self._loud_frames >= 10:     # ~200ms      # ~60ms of speech
                         print(f"[VAD] barge-in (rms={rms})")
                         self._speak_seq += 1
                         await self._stop_speaking()
@@ -282,13 +300,25 @@ class AgentCallHandler:
         if self.outcome == "no_answer":
             self.outcome = "conversation"        
 
-        if self._looks_like_ivr(text):
-            self._ivr_hits += 1
-            print(f"[IVR] detected ({self._ivr_hits}): {text[:60]}")
-            if self._ivr_hits >= 1:
-                print("[IVR] phone tree confirmed — hanging up")
-                self.outcome = "ivr"
-                await self._push_status("ended", "IVR / phone tree")
+        kind = self._classify_machine(text)
+
+        if kind == "menu":
+            print(f"[MACHINE] phone tree: {text[:60]}")
+            self.outcome = "ivr"
+            await self._push_status("ended", "Phone tree — cannot leave message")
+            await self._hangup()
+            return
+
+        if kind == "voicemail":
+            if self._vm_left:
+                return
+            self._machine_kind = "voicemail"
+            print(f"[MACHINE] voicemail: {text[:60]}")
+            if self.cfg.voicemail_enabled:
+                asyncio.create_task(self._leave_voicemail())
+            else:
+                self.outcome = "voicemail"
+                await self._push_status("ended", "Voicemail — skipped")
                 await self._hangup()
             return
 
@@ -328,21 +358,108 @@ class AgentCallHandler:
             await asyncio.sleep(1)
             await self._hangup()
 
+    # ── Voicemail ────────────────────────────────────────────────────────────
+
+    def _callback_number(self) -> str:
+        return (self.cfg.callback_number or os.getenv("TWILIO_CALLER_ID", "")).strip()
+
+    @staticmethod
+    def _space_digits(num: str) -> str:
+        """+19786843590 -> 9 7 8. 6 8 4. 3 5 9 0 — makes TTS read it clearly."""
+        d = "".join(ch for ch in num if ch.isdigit())
+        if len(d) == 11 and d.startswith("1"):
+            d = d[1:]
+        if len(d) != 10:
+            return " ".join(d)
+        return f"{' '.join(d[:3])}. {' '.join(d[3:6])}. {' '.join(d[6:])}"
+
+    async def _leave_voicemail(self):
+        """Wait for the beep, deliver the message, then hang up."""
+        self._vm_left = True
+        self.outcome = "voicemail_left"
+        await self._push_status("speaking", "Waiting for beep…")
+
+        # Let the greeting finish — watch for a gap in incoming speech
+        quiet_start = time.time()
+        self._last_dg_text = quiet_start
+        deadline = time.time() + 25
+        while time.time() < deadline and not self._stop:
+            await asyncio.sleep(0.4)
+            if time.time() - self._last_dg_text > 2.0:
+                break
+
+        if self._stop:
+            return
+
+        await asyncio.sleep(0.8)   # pause after the beep
+
+        cb = self._callback_number()
+        msg = (self.cfg.voicemail_message
+               .replace("{business}", self.lead_info.get("Name") or "your business")
+               .replace("{callback_spaced}", self._space_digits(cb))
+               .replace("{callback}", cb))
+
+        print(f"[VOICEMAIL] leaving message ({len(msg)} chars)")
+        await self._push_transcript("agent", f"[voicemail] {msg}")
+
+        self._speak_seq += 1
+        await self._speak_chunk(msg, self._speak_seq)
+        await asyncio.sleep(1.5)
+
+        await self._hangup()            
+
     # ── GPT + TTS streaming pipeline ─────────────────────────────────────────
+
+    # ── Streaming pipeline: GPT tokens -> ElevenLabs WS -> Twilio ────────────
 
     async def _respond(self) -> Optional[str]:
         """
-        Streams GPT tokens, and as soon as a full sentence is ready it is sent
-        to TTS. This overlaps generation with speech so the caller hears the
-        first words while the rest is still being written.
+        Opens one ElevenLabs WebSocket, streams GPT tokens into it as they
+        arrive, and forwards audio to Twilio continuously. Single generation
+        means no seams between sentences.
         """
-        full = ""
-        buf  = ""
         self._speak_seq += 1
         seq = self._speak_seq
-        first_chunk = True
+        full = ""
+
+        ws_url = (
+            f"wss://api.elevenlabs.io/v1/text-to-speech/{self.cfg.voice_id}/stream-input"
+            f"?model_id=eleven_flash_v2_5"
+            f"&output_format=ulaw_8000"
+            f"&auto_mode=true"
+            f"&inactivity_timeout=20"
+        )
+
+        tts_ws = None
+        audio_task = None
+        t_start = time.time()
 
         try:
+            headers = {"xi-api-key": ELEVENLABS_API_KEY}
+            try:
+                tts_ws = await websockets.connect(ws_url, additional_headers=headers)
+            except TypeError:
+                tts_ws = await websockets.connect(ws_url, extra_headers=headers)
+
+            # Initialise the stream
+            await tts_ws.send(json.dumps({
+                "text": " ",
+                "voice_settings": {
+                    "stability":        self.cfg.stability,
+                    "similarity_boost": self.cfg.similarity_boost,
+                    "style":            self.cfg.style,
+                    "speed":            self.cfg.speaking_rate,
+                },
+            }))
+
+            self.is_speaking = True
+            self._speak_started = time.time()
+            await self._push_status("speaking", "Agent speaking…")
+
+            # Pump audio out in the background while text streams in
+            audio_task = asyncio.create_task(self._pump_tts_audio(tts_ws, seq, t_start))
+
+            # Stream GPT tokens straight into the TTS socket
             async with httpx.AsyncClient(timeout=30) as c:
                 async with c.stream(
                     "POST",
@@ -358,15 +475,14 @@ class AgentCallHandler:
                 ) as resp:
                     async for line in resp.aiter_lines():
                         if self._stop or seq != self._speak_seq:
-                            return None
+                            break
                         if not line.startswith("data: "):
                             continue
                         payload = line[6:]
                         if payload == "[DONE]":
                             break
                         try:
-                            delta = json.loads(payload)["choices"][0]["delta"]
-                            tok = delta.get("content", "")
+                            tok = json.loads(payload)["choices"][0]["delta"].get("content", "")
                         except Exception:
                             continue
                         if not tok:
@@ -375,126 +491,224 @@ class AgentCallHandler:
                         if not full:
                             self._t_llm_first = time.time()
                         full += tok
-                        buf  += tok
-                        # Throttle partial updates to ~7/sec instead of per-token
+
+                        # Never speak the control token
+                        speakable = tok.replace("[HANGUP]", "")
+                        if speakable:
+                            try:
+                                await tts_ws.send(json.dumps({"text": speakable}))
+                            except Exception:
+                                break
+
+                        # Throttled UI update
                         now = time.time()
                         if now - self._last_partial > 0.15:
                             self._last_partial = now
                             await self.status_queue.put({
                                 "type": "transcript_partial", "speaker": "agent",
-                                "text": full, "ts": datetime.now().strftime("%H:%M:%S"),
+                                "text": full.replace("[HANGUP]", "").strip(),
+                                "ts": datetime.now().strftime("%H:%M:%S"),
                             })
 
-                        # Flush on sentence boundary (or early on first chunk)
-                        limit = 25 if first_chunk else 90
-                        if (any(buf.rstrip().endswith(p) for p in ".!?") and len(buf.strip()) > 12) \
-                           or len(buf) > limit:
-                            chunk = buf.strip()
-                            buf = ""
-                            first_chunk = False
-                            await self._speak_chunk(chunk, seq)
+            # Signal end of input
+            if seq == self._speak_seq and not self._stop:
+                try:
+                    await tts_ws.send(json.dumps({"text": ""}))
+                except Exception:
+                    pass
+
+            # Let the audio finish draining
+            if audio_task:
+                try:
+                    await asyncio.wait_for(audio_task, timeout=45)
+                except asyncio.TimeoutError:
+                    audio_task.cancel()
 
         except Exception as e:
-            print(f"[GPT ERROR] {e}")
+            print(f"[PIPELINE ERROR] {e}")
+        finally:
+            if audio_task and not audio_task.done():
+                audio_task.cancel()
+            if tts_ws:
+                try:
+                    await tts_ws.close()
+                except Exception:
+                    pass
+            if seq == self._speak_seq:
+                self.is_speaking = False
+                self._last_audio = time.time()
+                self._last_turn = time.time()
+                if not self._stop:
+                    await self._push_status("listening", "Listening…")
 
-        if buf.strip() and not self._stop and seq == self._speak_seq:
-            await self._speak_chunk(buf.strip(), seq)
+        final = full.strip().replace("[HANGUP]", "").strip()
+        if final:
+            await self.status_queue.put({
+                "type": "transcript_final", "speaker": "agent",
+                "text": final, "ts": datetime.now().strftime("%H:%M:%S"),
+            })
 
-        # Rough token accounting — 4 chars per token is the usual approximation
+        # Rough token accounting
         convo_chars = sum(len(m.get("content", "")) for m in self.conversation)
         self.metrics.tokens_in  += convo_chars // 4
         self.metrics.tokens_out += len(full) // 4
+        self.metrics.tts_chars  += len(final)
 
-        final = full.strip().replace("[HANGUP]", "").strip()
-        if final and len(final) > 1:
-            await self.status_queue.put({
-                "type": "transcript_final", "speaker": "agent",
-                "text": final.replace("[HANGUP]", "").strip(),
-                "ts": datetime.now().strftime("%H:%M:%S"),
-            })
-        return final or None
+        return full.strip() or None
+
+    async def _pump_tts_audio(self, tts_ws, seq: int, t_start: float):
+        """Read audio frames off the TTS socket and pace them into Twilio."""
+        sent = 0
+        first = True
+        buf = b""
+
+        try:
+            async for raw in tts_ws:
+                if self._stop or seq != self._speak_seq or not self.is_speaking:
+                    return
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+
+                audio_b64 = msg.get("audio")
+                if audio_b64:
+                    if first:
+                        first = False
+                        self._t_tts_first = time.time()
+                        print(f"[TTS] first audio {(time.time()-t_start)*1000:.0f}ms")
+
+                    buf += base64.b64decode(audio_b64)
+
+                    # Emit whole 20ms frames (160 bytes of mulaw at 8kHz)
+                    n = (len(buf) // 160) * 160
+                    for i in range(0, n, 160):
+                        if self._stop or seq != self._speak_seq or not self.is_speaking:
+                            return
+                        frame = base64.b64encode(buf[i:i+160]).decode()
+                        await self.twilio_ws.send_text(json.dumps({
+                            "event":     "media",
+                            "streamSid": self.stream_sid,
+                            "media":     {"payload": frame},
+                        }))
+                        if self.listeners:
+                            self._fanout_nowait(frame, "agent")
+                        sent += 1
+
+                        # Pace roughly to realtime, slightly ahead so the
+                        # jitter buffer never runs dry
+                        if sent % 12 == 0:
+                            await asyncio.sleep(0.20)
+                    buf = buf[n:]
+
+                if msg.get("isFinal"):
+                    break
+
+            # Flush any tail
+            if buf and not self._stop and seq == self._speak_seq:
+                frame = base64.b64encode(buf.ljust(160, b"\xff")[:160]).decode()
+                await self.twilio_ws.send_text(json.dumps({
+                    "event": "media", "streamSid": self.stream_sid,
+                    "media": {"payload": frame},
+                }))
+                sent += 1
+
+            if self._fanout_buf:
+                batch, self._fanout_buf = self._fanout_buf, []
+                asyncio.create_task(self._flush_fanout(batch))
+
+            print(f"[TTS] {sent} frames ({sent*0.02:.1f}s audio) in {time.time()-t_start:.2f}s")
+
+            # Hold the speaking flag for any audio still buffered in Twilio
+            await asyncio.sleep(0.3)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[TTS PUMP] {e}")
 
     async def _speak_chunk(self, text: str, seq: int):
-        """Stream one sentence to ElevenLabs and pipe audio straight to Twilio."""
+        """One-shot TTS for fixed text (opening line, voicemail)."""
         if self._stop or seq != self._speak_seq:
             return
 
         self.is_speaking = True
         self._speak_started = time.time()
+        self.metrics.tts_chars += len(text)
         await self._push_status("speaking", "Agent speaking…")
 
         t0 = time.time()
         sent = 0
-        first_byte = 0.0
-        self.metrics.tts_chars += len(text)
-        print(f"[TTS] voice={self.cfg.voice_id}")
+        ws_url = (
+            f"wss://api.elevenlabs.io/v1/text-to-speech/{self.cfg.voice_id}/stream-input"
+            f"?model_id=eleven_flash_v2_5&output_format=ulaw_8000&auto_mode=true"
+        )
+        tts_ws = None
         try:
-            async with httpx.AsyncClient(timeout=30) as c:
-                async with c.stream(
-                    "POST",
-                    f"https://api.elevenlabs.io/v1/text-to-speech/{self.cfg.voice_id}/stream"
-                    f"?output_format=ulaw_8000&optimize_streaming_latency=4",
-                    headers={"xi-api-key": ELEVENLABS_API_KEY,
-                             "Content-Type": "application/json"},
-                    json={
-                        "text":     text,
-                        "model_id": "eleven_flash_v2_5",
-                        "voice_settings": {
-                            "stability":        self.cfg.stability,
-                            "similarity_boost": self.cfg.similarity_boost,
-                            "style":            self.cfg.style,
-                            "speed":            self.cfg.speaking_rate,
-                        },
-                    },
-                ) as r:
-                    if r.status_code != 200:
-                        body = await r.aread()
-                        print(f"[TTS ERROR] {r.status_code}: {body[:200]}")
-                        return
+            headers = {"xi-api-key": ELEVENLABS_API_KEY}
+            try:
+                tts_ws = await websockets.connect(ws_url, additional_headers=headers)
+            except TypeError:
+                tts_ws = await websockets.connect(ws_url, extra_headers=headers)
 
-                    leftover = b""
-                    async for raw in r.aiter_bytes(1600):
-                        if not first_byte:
-                            first_byte = time.time()
-                            self._t_tts_first = first_byte
+            await tts_ws.send(json.dumps({
+                "text": " ",
+                "voice_settings": {
+                    "stability":        self.cfg.stability,
+                    "similarity_boost": self.cfg.similarity_boost,
+                    "style":            self.cfg.style,
+                    "speed":            self.cfg.speaking_rate,
+                },
+            }))
+            await tts_ws.send(json.dumps({"text": text}))
+            await tts_ws.send(json.dumps({"text": ""}))
+
+            buf = b""
+            async for raw in tts_ws:
+                if self._stop or seq != self._speak_seq or not self.is_speaking:
+                    return
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if msg.get("audio"):
+                    buf += base64.b64decode(msg["audio"])
+                    n = (len(buf) // 160) * 160
+                    for i in range(0, n, 160):
                         if self._stop or seq != self._speak_seq or not self.is_speaking:
-                            print("[TTS] cancelled mid-stream")
                             return
-                        data = leftover + raw
-                        n = (len(data) // 160) * 160
-                        leftover = data[n:]
-                        for i in range(0, n, 160):
-                            if self._stop or seq != self._speak_seq or not self.is_speaking:
-                                return
-                            frame_b64 = base64.b64encode(data[i:i+160]).decode()
-                            await self.twilio_ws.send_text(json.dumps({
-                                "event":     "media",
-                                "streamSid": self.stream_sid,
-                                "media":     {"payload": frame_b64},
-                            }))
-                            if self.listeners:
-                                self._fanout_nowait(frame_b64, "agent")
-                            sent += 1
+                        frame = base64.b64encode(buf[i:i+160]).decode()
+                        await self.twilio_ws.send_text(json.dumps({
+                            "event": "media", "streamSid": self.stream_sid,
+                            "media": {"payload": frame},
+                        }))
+                        if self.listeners:
+                            self._fanout_nowait(frame, "agent")
+                        sent += 1
+                        if sent % 12 == 0:
+                            await asyncio.sleep(0.20)
+                    buf = buf[n:]
+                if msg.get("isFinal"):
+                    break
 
-                            # Pace in 10-frame blocks (200ms of audio).
-                            # Keeps roughly realtime without per-frame jitter,
-                            # and stays ahead enough that playback never gaps.
-                            if sent % 10 == 0:
-                                await asyncio.sleep(0.16)
-
-                        if self._fanout_buf:
-                            batch, self._fanout_buf = self._fanout_buf, []
-                            asyncio.create_task(self._flush_fanout(batch))
-
-            print(f"[TTS] {sent} frames in {time.time()-t0:.2f}s :: {text[:50]}")
+            print(f"[TTS] {sent} frames ({sent*0.02:.1f}s) in {time.time()-t0:.2f}s :: {text[:45]}")
 
         except Exception as e:
-            print(f"[TTS EXCEPTION] {e}")
+            print(f"[TTS ERROR] {e}")
         finally:
+            if tts_ws:
+                try:
+                    await tts_ws.close()
+                except Exception:
+                    pass
             if seq == self._speak_seq:
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.3)
                 self.is_speaking = False
+                self._last_audio = time.time()
                 self._last_turn = time.time()
+                if not self._stop:
+                    await self._push_status("listening", "Listening…")                
+
 
     async def _stop_speaking(self):
         self.is_speaking = False
@@ -561,10 +775,19 @@ class AgentCallHandler:
                 if not text:
                     continue
 
+                self._last_dg_text = time.time()
+
                 # Barge-in — cancel current speech immediately
-                grace_ok = (time.time() - self._speak_started) > 0.9
+                # "hello", "who's calling", "yeah" etc. are the prospect
+                # engaging, not interrupting. Require a real interruption.
+                FILLER = {"hello", "hi", "hey", "yeah", "yes", "no", "okay", "ok",
+                          "uh", "um", "mhmm", "hmm", "sure", "right", "what"}
+                words = text.lower().strip(" .,?!").split()
+                is_filler = len(words) <= 2 and all(w in FILLER for w in words)
+
+                grace_ok = (time.time() - self._speak_started) > 1.2
                 if (self.is_speaking and self.cfg.allow_interruption
-                        and grace_ok and len(text) > 4):
+                        and grace_ok and not is_filler and len(text) > 8):
                     print(f"[DG] barge-in: {text}")
                     self.metrics.interrupts += 1
                     self._speak_seq += 1        # invalidates in-flight TTS

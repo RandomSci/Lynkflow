@@ -91,6 +91,7 @@ function buildAgentOptions() {
       <button class="agent-opt-tab" data-tab="voice">Voice</button>
       <button class="agent-opt-tab" data-tab="model">Model</button>
       <button class="agent-opt-tab" data-tab="behavior">Behavior</button>
+      <button class="agent-opt-tab" data-tab="voicemail">Voicemail</button>
     </div>
 
     <!-- MESSAGES -->
@@ -210,6 +211,33 @@ function buildAgentOptions() {
       </div>
     </div>
 
+    <div class="agent-opt-pane" data-pane="voicemail">
+      <div class="agent-opt-group">
+        <label class="agent-checkbox-row">
+          <input type="checkbox" id="optVmEnabled" ${agentConfig.voicemail_enabled ? 'checked' : ''} />
+          <span>
+            <span class="agent-checkbox-label">Leave a voicemail</span>
+            <span class="agent-opt-hint">A business that sends you to voicemail is proving your pitch</span>
+          </span>
+        </label>
+      </div>
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">
+          Voicemail message
+          <span class="agent-opt-hint">Placeholders: {business}, {callback}, {callback_spaced}</span>
+        </div>
+        <textarea id="optVmMessage" class="agent-textarea" rows="7">${escAttr(agentConfig.voicemail_message || '')}</textarea>
+      </div>
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">
+          Callback number
+          <span class="agent-opt-hint">Blank uses your Twilio caller ID</span>
+        </div>
+        <input type="text" id="optCallback" class="agent-select"
+               placeholder="+19786843590" value="${escAttr(agentConfig.callback_number || '')}" />
+      </div>
+    </div>    
+
     <div class="agent-opt-footer">
       <button class="agent-reset-btn" id="agentResetBtn">Reset to defaults</button>
       <span id="agentSaveFeedback" class="agent-save-feedback"></span>
@@ -312,6 +340,9 @@ function buildAgentOptions() {
     agentConfig.max_duration_s    = parseInt(p.querySelector('#optMaxDuration').value);
     agentConfig.allow_interruption = p.querySelector('#optInterruption').checked;
     agentConfig.base_url          = p.querySelector('#optBaseUrl').value.trim();
+    agentConfig.voicemail_enabled = p.querySelector('#optVmEnabled').checked;
+    agentConfig.voicemail_message = p.querySelector('#optVmMessage').value;
+    agentConfig.callback_number   = p.querySelector('#optCallback').value.trim();    
 
     await saveAgentConfig();
     renderMetrics();

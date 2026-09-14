@@ -76,6 +76,19 @@ class AgentConfig(BaseModel):
     max_duration_s: int = 300          # hard cap on call length
     allow_interruption: bool = True    # barge-in
 
+    # ── Voicemail ───────────────────────────────────────────────────────────
+    voicemail_enabled: bool = True
+    voicemail_message: str = (
+        "Hi, this is Anna calling for {business}. "
+        "I actually just reached your voicemail — and that's exactly why I'm calling. "
+        "We build AI that answers every call automatically when you're out on a job, "
+        "so you never lose a customer to a missed call again. "
+        "I'll try you again at a better time, but if you want to hear how it works sooner, "
+        "give us a call back at {callback}. That's {callback_spaced}. "
+        "Thanks, and have a good one."
+    )
+    callback_number: str = ""    
+
 
 def load_agent_config() -> AgentConfig:
     if _CONFIG_FILE.exists():
