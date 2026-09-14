@@ -79,6 +79,9 @@ class AgentCallHandler:
         self._vm_left = False
         self._last_dg_text = 0.0        
         self._vad_threshold = 3200        
+        self._rec_agent = bytearray()
+        self._rec_prospect = bytearray()        
+        self.recording_file = None
 
         self.end_phrases = [
             p.strip().lower()
@@ -233,6 +236,7 @@ class AgentCallHandler:
             if not payload:
                 return
             raw = base64.b64decode(payload)
+            self._rec_prospect.extend(raw)            
             if self.listeners:
                 self._fanout_nowait(payload, "prospect")
 
@@ -594,7 +598,7 @@ class AgentCallHandler:
                         if self.listeners:
                             self._fanout_nowait(frame, "agent")
                         sent += 1
-
+                        self._rec_agent.extend(buf[i:i+160])
                         # Pace roughly to realtime, slightly ahead so the
                         # jitter buffer never runs dry
                         if sent % 12 == 0:
@@ -685,6 +689,7 @@ class AgentCallHandler:
                         if self.listeners:
                             self._fanout_nowait(frame, "agent")
                         sent += 1
+                        self._rec_agent.extend(buf[i:i+160])                        
                         if sent % 12 == 0:
                             await asyncio.sleep(0.20)
                     buf = buf[n:]
@@ -723,6 +728,46 @@ class AgentCallHandler:
                 print("[TTS] buffer cleared")
             except Exception as e:
                 print(f"[CLEAR ERROR] {e}")
+
+    def _save_recording(self):
+        """Mix both legs into one WAV. Audio is already in memory — free."""
+        import audioop, wave
+        from pathlib import Path
+
+        if not self._rec_prospect and not self._rec_agent:
+            return None
+
+        rec_dir = Path(__file__).parent / "recordings"
+        rec_dir.mkdir(exist_ok=True)
+
+        try:
+            pro = audioop.ulaw2lin(bytes(self._rec_prospect), 2)
+            agt = audioop.ulaw2lin(bytes(self._rec_agent), 2)
+
+            # Pad to equal length, then mix
+            n = max(len(pro), len(agt))
+            pro = pro.ljust(n, b"\x00")
+            agt = agt.ljust(n, b"\x00")
+            mixed = audioop.add(pro, agt, 2)
+
+            name = (self.lead_info.get("Name") or "unknown")[:40]
+            name = "".join(c if c.isalnum() or c in " -_" else "" for c in name).strip()
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = rec_dir / f"{stamp}_{name or 'call'}_{(self.call_sid or '')[-6:]}.wav"
+
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(8000)
+                w.writeframes(mixed)
+
+            kb = path.stat().st_size / 1024
+            print(f"[RECORDING] {path.name} ({kb:.0f} KB, {len(mixed)/16000:.1f}s)")
+            return path.name
+
+        except Exception as e:
+            print(f"[RECORDING] failed: {e}")
+            return None                
 
     # ── Deepgram ─────────────────────────────────────────────────────────────
 
@@ -847,6 +892,7 @@ class AgentCallHandler:
     async def _cleanup(self):
         if getattr(self, "_cleaned", False):
             return
+        self.recording_file = self._save_recording()        
         self._stop = True
         self.metrics.ended = time.time()
         snap = self.metrics.snapshot()

@@ -14,7 +14,7 @@
   "similarity_boost": 0.75,
   "style": 0.1,
   "speaking_rate": 1.0,
-  "endpointing_ms": 400,
+  "endpointing_ms": 300,
   "utterance_end_ms": 1200,
   "silence_timeout_s": 20,
   "max_duration_s": 300,

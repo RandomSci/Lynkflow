@@ -42,7 +42,9 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent.parent / "front
 _agent_events: dict[str, list] = {}       # call_sid → buffered events
 _agent_queues: dict[str, asyncio.Queue] = {}  # call_sid → live queue for SSE
 _agent_handlers: dict = {}     # call_sid -> AgentCallHandler
-
+_REC_DIR = Path(__file__).parent / "recordings"
+_REC_DIR.mkdir(exist_ok=True)
+app.mount("/recordings", StaticFiles(directory=_REC_DIR), name="recordings")
 
 class TTSRequest(BaseModel):
     text: str
@@ -1096,6 +1098,7 @@ async def agent_stream(websocket: WebSocket):
                 "duration_s": snap["cost"]["duration_s"],
                 "latency":    snap["latency"],
                 "cost":       snap["cost"],
+                "recording": getattr(handler, "recording_file", None),                
             })
         except Exception as e:
             print(f"[HISTORY] failed: {e}")
@@ -1243,3 +1246,13 @@ async def agent_call_price(call_sid: str):
 async def get_analytics(days: int = 30):
     from call_history import summarise
     return JSONResponse(summarise(days))
+
+@app.get("/api/recordings")
+async def list_recordings():
+    files = sorted(_REC_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return JSONResponse([{
+        "name": f.name,
+        "url":  f"/recordings/{f.name}",
+        "size_kb": round(f.stat().st_size / 1024),
+        "mtime": f.stat().st_mtime,
+    } for f in files[:200]])

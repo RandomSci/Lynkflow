@@ -732,3 +732,5 @@ i.an-day-conv { background: #10b981; }
   .an-kpis, .an-kpis--4, .an-kpis--5 { grid-template-columns: repeat(2, 1fr); }
   .an-costrow { grid-template-columns: 90px 1fr 56px 32px; }
 }
+
+.an-audio { height: 30px; max-width: 200px; }.an-audio { height: 30px; max-width: 200px; }

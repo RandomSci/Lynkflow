@@ -1204,6 +1204,9 @@ function renderAnalytics(d) {
       <td class="an-td-num">$${(
         (x.cost?.twilio||0)+(x.cost?.stt||0)+(x.cost?.llm||0)+(x.cost?.tts||0)
       ).toFixed(4)}</td>
+      <td>${x.recording
+        ? `<audio controls preload="none" src="/recordings/${x.recording}" class="an-audio"></audio>`
+        : '<span class="an-td-time">—</span>'}</td>
     </tr>`).join('');
 
   return `
@@ -1273,7 +1276,7 @@ function renderAnalytics(d) {
         <thead><tr>
           <th>When</th><th>Business</th><th>Outcome</th>
           <th class="an-th-num">Duration</th><th class="an-th-num">Turns</th>
-          <th class="an-th-num">Latency</th><th class="an-th-num">Cost</th>
+          <th class="an-th-num">Latency</th><th class="an-th-num">Cost</th><th>Recording</th>
         </tr></thead>
         <tbody>${recentRows}</tbody>
       </table>
