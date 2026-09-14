@@ -17,6 +17,7 @@ import httpx
 import websockets
 from dotenv import load_dotenv
 from fastapi import WebSocket, WebSocketDisconnect
+from metrics import CallMetrics
 
 load_dotenv()
 
@@ -58,6 +59,10 @@ class AgentCallHandler:
         self._nudges = 0
         self._last_turn = time.time()
         self._prospect_spoke = False        
+        self.metrics = CallMetrics(model=cfg.model)
+        self._t_stt_done = 0.0
+        self._t_llm_first = 0.0
+        self._t_tts_first = 0.0        
         self.stream_sid: Optional[str] = None
         self.call_sid:   Optional[str] = None
         self.conversation: list = []
@@ -190,6 +195,7 @@ class AgentCallHandler:
             self.stream_sid = data.get("streamSid")
             start = data.get("start", {})
             self.call_sid = start.get("callSid")
+            self.metrics.call_sid = self.call_sid or ""            
             cp = start.get("customParameters", {}) or {}
             if cp:
                 self.lead_info = {
@@ -285,6 +291,18 @@ class AgentCallHandler:
         self.conversation.append({"role": "user", "content": text})
 
         response = await self._respond()
+
+        # Record latency for this turn
+        if self._t_stt_done and self._t_llm_first and self._t_tts_first:
+            stt_lat = 0.0
+            llm_lat = self._t_llm_first - self._t_stt_done
+            tts_lat = self._t_tts_first - self._t_llm_first
+            self.metrics.record_turn(stt_lat, max(0, llm_lat), max(0, tts_lat))
+            print(f"[LATENCY] llm={llm_lat*1000:.0f}ms tts={tts_lat*1000:.0f}ms "
+                  f"total={(llm_lat+tts_lat)*1000:.0f}ms")
+            self._t_llm_first = 0.0
+            self._t_tts_first = 0.0
+
         if not response:
             return
 
@@ -341,6 +359,8 @@ class AgentCallHandler:
                         if not tok:
                             continue
 
+                        if not full:
+                            self._t_llm_first = time.time()
                         full += tok
                         buf  += tok
                         # Throttle partial updates to ~7/sec instead of per-token
@@ -367,6 +387,11 @@ class AgentCallHandler:
         if buf.strip() and not self._stop and seq == self._speak_seq:
             await self._speak_chunk(buf.strip(), seq)
 
+        # Rough token accounting — 4 chars per token is the usual approximation
+        convo_chars = sum(len(m.get("content", "")) for m in self.conversation)
+        self.metrics.tokens_in  += convo_chars // 4
+        self.metrics.tokens_out += len(full) // 4
+
         final = full.strip().replace("[HANGUP]", "").strip()
         if final and len(final) > 1:
             await self.status_queue.put({
@@ -387,6 +412,8 @@ class AgentCallHandler:
 
         t0 = time.time()
         sent = 0
+        first_byte = 0.0
+        self.metrics.tts_chars += len(text)
         print(f"[TTS] voice={self.cfg.voice_id}")
         try:
             async with httpx.AsyncClient(timeout=30) as c:
@@ -414,6 +441,9 @@ class AgentCallHandler:
 
                     leftover = b""
                     async for raw in r.aiter_bytes(1600):
+                        if not first_byte:
+                            first_byte = time.time()
+                            self._t_tts_first = first_byte
                         if self._stop or seq != self._speak_seq or not self.is_speaking:
                             print("[TTS] cancelled mid-stream")
                             return
@@ -523,10 +553,12 @@ class AgentCallHandler:
                 if (self.is_speaking and self.cfg.allow_interruption
                         and grace_ok and len(text) > 4):
                     print(f"[DG] barge-in: {text}")
+                    self.metrics.interrupts += 1
                     self._speak_seq += 1        # invalidates in-flight TTS
                     await self._stop_speaking()
 
                 if data.get("is_final"):
+                    self._t_stt_done = time.time()
                     print(f"[DG] final: {text}")
                     await self.status_queue.put({
                         "type": "transcript_final", "speaker": "prospect",
@@ -578,6 +610,20 @@ class AgentCallHandler:
 
     async def _cleanup(self):
         self._stop = True
+        self.metrics.ended = time.time()
+        snap = self.metrics.snapshot()
+        print(f"[METRICS] {snap}")
+        try:
+            await self.status_queue.put({"type": "metrics", **snap})
+        except Exception:
+            pass
+        self.metrics.ended = time.time()
+        snap = self.metrics.snapshot()
+        print(f"[METRICS] {snap}")
+        try:
+            await self.status_queue.put({"type": "metrics", **snap})
+        except Exception:
+            pass
         if self.dg_ws:
             try:
                 await self.dg_ws.close()

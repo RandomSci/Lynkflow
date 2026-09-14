@@ -277,3 +277,110 @@
   animation: listenPulse 2s infinite;
 }
 @keyframes listenPulse { 50% { opacity: 0.75; } }
+
+/* ═══ METRICS PANEL — append to agent.css ═══ */
+
+.metrics-panel { margin-top: 14px; }
+.metrics-loading { font-size: 12.5px; color: var(--text-3); padding: 20px 0; text-align: center; }
+
+/* Headline row */
+.metrics-head {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 32px; padding-bottom: 22px;
+  border-bottom: 1px solid var(--border); margin-bottom: 20px;
+}
+.metrics-label {
+  font-size: 11px; font-weight: 600; color: var(--text-3);
+  text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px;
+}
+.metrics-big {
+  font-size: 30px; font-weight: 600; color: var(--text);
+  letter-spacing: -1px; line-height: 1; margin-bottom: 12px;
+}
+.metrics-big span { font-size: 15px; font-weight: 400; color: var(--text-3); margin-left: 3px; }
+
+.metrics-bar {
+  display: flex; height: 5px; border-radius: 3px;
+  overflow: hidden; background: var(--bg-4); margin-bottom: 10px;
+}
+.metrics-seg { display: block; height: 100%; }
+.seg-twilio { background: #10b981; }
+.seg-stt    { background: #f59e0b; }
+.seg-llm    { background: #3b82f6; }
+.seg-tts    { background: #a855f7; }
+
+.metrics-legend { display: flex; flex-wrap: wrap; gap: 12px; }
+.metrics-legend-item {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--text-3);
+}
+.metrics-legend-item b { color: var(--text-2); font-weight: 600; }
+.metrics-legend-item i {
+  width: 7px; height: 7px; border-radius: 2px; display: inline-block;
+}
+.metrics-legend-item i.seg-twilio { background: #10b981; }
+.metrics-legend-item i.seg-stt    { background: #f59e0b; }
+.metrics-legend-item i.seg-llm    { background: #3b82f6; }
+.metrics-legend-item i.seg-tts    { background: #a855f7; }
+
+/* Presets */
+.metrics-presets { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 20px; }
+.metrics-preset-btn {
+  padding: 7px 14px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg-3);
+  color: var(--text-2); font-size: 12px; font-weight: 500;
+  cursor: pointer; transition: all var(--transition); font-family: inherit;
+}
+.metrics-preset-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Component cards */
+.metrics-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.metrics-card {
+  background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 16px;
+}
+.metrics-card-tag {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 10.5px; font-weight: 600; color: var(--text-3);
+  text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 12px;
+}
+.metrics-card-tag i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.dot-stt { background: #f59e0b; }
+.dot-llm { background: #3b82f6; }
+.dot-tts { background: #a855f7; }
+.metrics-card-name { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 2px; }
+.metrics-card-sub  { font-size: 11px; color: var(--text-3); margin-bottom: 14px; }
+.metrics-card-stats { display: flex; flex-direction: column; gap: 7px; }
+.metrics-card-stats > div { display: flex; justify-content: space-between; align-items: baseline; }
+.metrics-card-stats span { font-size: 11px; color: var(--text-3); }
+.metrics-card-stats b    { font-size: 12.5px; color: var(--text); font-weight: 600; }
+
+/* Live results */
+.metrics-live {
+  margin-top: 20px; padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+.metrics-live-head {
+  font-size: 11px; font-weight: 600; color: var(--accent);
+  text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 12px;
+}
+.metrics-live-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 12px; margin-bottom: 12px;
+}
+.metrics-live-grid > div { display: flex; flex-direction: column; gap: 2px; }
+.metrics-live-grid span { font-size: 10.5px; color: var(--text-3); }
+.metrics-live-grid b    { font-size: 14px; color: var(--text); font-weight: 600; }
+.metrics-live-total b   { color: var(--accent); }
+.metrics-live-breakdown {
+  font-size: 11px; color: var(--text-3);
+  padding-top: 10px; border-top: 1px solid var(--border);
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+}
+.metrics-live-permin { color: var(--text-2); font-weight: 600; }
+
+@media (max-width: 900px) {
+  .metrics-head { grid-template-columns: 1fr; gap: 20px; }
+  .metrics-cards { grid-template-columns: 1fr; }
+  .metrics-live-grid { grid-template-columns: repeat(2, 1fr); }
+}

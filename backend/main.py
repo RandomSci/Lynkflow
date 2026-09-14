@@ -1151,3 +1151,71 @@ async def agent_listen(websocket: WebSocket, call_sid: str):
     finally:
         handler.listeners.discard(websocket)
         print(f"[LISTEN] browser detached from {call_sid}")
+
+@app.get("/api/agent/metrics/info")
+async def agent_metrics_info():
+    """Static reference card data + presets for the metrics panel."""
+    from metrics import COMPONENT_INFO, PRESETS, RATES
+    cfg = load_agent_config()
+    model_info = COMPONENT_INFO["model"].get(cfg.model, COMPONENT_INFO["model"]["gpt-4o-mini"])
+
+    est_per_min = (
+        RATES["twilio_voice_us"] + RATES["twilio_media_stream"]
+        + COMPONENT_INFO["transcriber"]["cost_per_min"]
+        + model_info["cost_per_min"]
+        + COMPONENT_INFO["voice"]["cost_per_min"]
+    )
+    est_latency = (
+        COMPONENT_INFO["transcriber"]["typical_latency_ms"]
+        + model_info["typical_latency_ms"]
+        + COMPONENT_INFO["voice"]["typical_latency_ms"]
+        + cfg.endpointing_ms
+    )
+
+    return JSONResponse({
+        "transcriber": COMPONENT_INFO["transcriber"],
+        "model":       model_info,
+        "voice":       COMPONENT_INFO["voice"],
+        "estimated": {
+            "cost_per_min": round(est_per_min, 4),
+            "latency_ms":   est_latency,
+            "endpointing_ms": cfg.endpointing_ms,
+        },
+        "presets": {k: v["label"] for k, v in PRESETS.items()},
+        "rates": RATES,
+    })
+
+
+@app.post("/api/agent/preset/{preset_key}")
+async def agent_apply_preset(preset_key: str):
+    from agent_config import apply_preset
+    cfg = apply_preset(load_agent_config(), preset_key)
+    _save_agent_config(cfg)
+    return JSONResponse({"success": True, "config": cfg.model_dump()})        
+
+@app.get("/api/agent/call-price/{call_sid}")
+async def agent_call_price(call_sid: str):
+    """
+    Fetch the real Twilio price for a completed call.
+    Twilio populates `price` a few seconds after the call ends, so this may
+    return null on the first attempt — the frontend retries.
+    """
+    if not TWILIO_ACCOUNT_SID:
+        raise HTTPException(500, "Twilio credentials not set")
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{call_sid}.json",
+                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            )
+        d = r.json()
+        price = d.get("price")
+        return JSONResponse({
+            "price":      abs(float(price)) if price else None,
+            "unit":       d.get("price_unit", "USD"),
+            "duration_s": int(d.get("duration") or 0),
+            "status":     d.get("status"),
+            "direction":  d.get("direction"),
+        })
+    except Exception as e:
+        return JSONResponse({"price": None, "error": str(e)})

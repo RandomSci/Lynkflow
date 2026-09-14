@@ -314,6 +314,7 @@ function buildAgentOptions() {
     agentConfig.base_url          = p.querySelector('#optBaseUrl').value.trim();
 
     await saveAgentConfig();
+    renderMetrics();
     const fb = p.querySelector('#agentSaveFeedback');
     fb.textContent = 'Saved';
     fb.classList.add('visible');
@@ -616,6 +617,11 @@ function connectAgentEvents(callSid) {
     if (data.type === 'transcript_final') {
       finalizePartial(data.speaker, data.text, data.ts);
     }
+    if (data.type === 'metrics') {
+      lastCallMetrics = data;
+      renderMetrics();
+      fetchRealTwilioPrice(data.call_sid);
+    }
     if (data.type === 'transcript_cancel') {
       const wrap = document.getElementById('agentTranscript');
       const rows = wrap?.querySelectorAll(`.agent-msg--partial[data-speaker="${data.speaker}"]`);
@@ -763,8 +769,10 @@ async function injectAgentUI() {
   if (!dialerTop) return;
   dialerTop.parentNode.insertBefore(buildAgentBar(), dialerTop);
   dialerTop.after(buildTranscriptPanel());
+  dialerTop.after(buildMetricsPanel());
   dialerTop.after(buildAgentOptions());
   applyAgentMode();
+  renderMetrics();
 }
 
 let ringOsc = null, ringCtx = null, ringTimer = null;
@@ -814,3 +822,172 @@ function playTone(freqs, dur, vol) {
 
 function playAnswered() { playTone([880, 1320], 0.14, 0.10); }   // bright ting
 function playEnded()    { playTone([392, 330],  0.30, 0.08); }   // low double
+
+let metricsInfo = null;
+let lastCallMetrics = null;
+
+async function loadMetricsInfo() {
+  try {
+    const res = await fetch('/api/agent/metrics/info');
+    metricsInfo = await res.json();
+  } catch (e) { console.error('metrics info failed', e); }
+  return metricsInfo;
+}
+
+function buildMetricsPanel() {
+  const p = document.createElement('div');
+  p.className = 'card metrics-panel';
+  p.id = 'metricsPanel';
+  p.innerHTML = `<div class="metrics-loading">Loading metrics…</div>`;
+  return p;
+}
+
+async function renderMetrics() {
+  const p = document.getElementById('metricsPanel');
+  if (!p) return;
+  await loadMetricsInfo();
+  if (!metricsInfo) { p.innerHTML = '<div class="metrics-loading">Unavailable</div>'; return; }
+
+  const { transcriber, model, voice, estimated, presets } = metricsInfo;
+  const live = lastCallMetrics;
+
+  // Segment widths for the bars
+  const costParts = [
+    { label: 'Twilio',      v: (metricsInfo.rates.twilio_voice_us + metricsInfo.rates.twilio_media_stream), c: 'seg-twilio' },
+    { label: 'Transcriber', v: transcriber.cost_per_min, c: 'seg-stt' },
+    { label: 'Model',       v: model.cost_per_min,       c: 'seg-llm' },
+    { label: 'Voice',       v: voice.cost_per_min,       c: 'seg-tts' },
+  ];
+  const costSum = costParts.reduce((a, b) => a + b.v, 0) || 1;
+
+  const latParts = [
+    { label: 'Endpointing', v: estimated.endpointing_ms,          c: 'seg-twilio' },
+    { label: 'Transcriber', v: transcriber.typical_latency_ms,    c: 'seg-stt' },
+    { label: 'Model',       v: model.typical_latency_ms,          c: 'seg-llm' },
+    { label: 'Voice',       v: voice.typical_latency_ms,          c: 'seg-tts' },
+  ];
+  const latSum = latParts.reduce((a, b) => a + b.v, 0) || 1;
+
+  const bar = (parts, sum) => parts.map(x =>
+    `<span class="metrics-seg ${x.c}" style="width:${(x.v / sum * 100).toFixed(1)}%" title="${x.label}"></span>`
+  ).join('');
+
+  const legend = (parts, fmt) => parts.map(x =>
+    `<span class="metrics-legend-item"><i class="${x.c}"></i>${x.label} <b>${fmt(x.v)}</b></span>`
+  ).join('');
+
+  p.innerHTML = `
+    <div class="metrics-head">
+      <div class="metrics-headline">
+        <div class="metrics-label">Estimated cost</div>
+        <div class="metrics-big">~$${estimated.cost_per_min.toFixed(3)}<span>/min</span></div>
+        <div class="metrics-bar">${bar(costParts, costSum)}</div>
+        <div class="metrics-legend">${legend(costParts, v => '$' + v.toFixed(3))}</div>
+      </div>
+      <div class="metrics-headline">
+        <div class="metrics-label">Estimated latency</div>
+        <div class="metrics-big">~${estimated.latency_ms}<span>ms</span></div>
+        <div class="metrics-bar">${bar(latParts, latSum)}</div>
+        <div class="metrics-legend">${legend(latParts, v => v + 'ms')}</div>
+      </div>
+    </div>
+
+    <div class="metrics-presets">
+      ${Object.entries(presets).map(([k, label]) =>
+        `<button class="metrics-preset-btn" data-preset="${k}">${label}</button>`).join('')}
+    </div>
+
+    <div class="metrics-cards">
+      <div class="metrics-card">
+        <div class="metrics-card-tag"><i class="dot-stt"></i>Transcriber</div>
+        <div class="metrics-card-name">${transcriber.name}</div>
+        <div class="metrics-card-sub">${transcriber.provider}</div>
+        <div class="metrics-card-stats">
+          <div><span>Latency</span><b>${transcriber.typical_latency_ms}ms</b></div>
+          <div><span>Cost</span><b>$${transcriber.cost_per_min.toFixed(3)}/min</b></div>
+          <div><span>${transcriber.metric_label}</span><b>${transcriber.metric_value}</b></div>
+        </div>
+      </div>
+
+      <div class="metrics-card">
+        <div class="metrics-card-tag"><i class="dot-llm"></i>Model</div>
+        <div class="metrics-card-name">${model.name}</div>
+        <div class="metrics-card-sub">${model.provider}</div>
+        <div class="metrics-card-stats">
+          <div><span>Latency</span><b>${model.typical_latency_ms}ms</b></div>
+          <div><span>Cost</span><b>$${model.cost_per_min.toFixed(3)}/min</b></div>
+          <div><span>${model.metric_label}</span><b>${model.metric_value}</b></div>
+        </div>
+      </div>
+
+      <div class="metrics-card">
+        <div class="metrics-card-tag"><i class="dot-tts"></i>Voice</div>
+        <div class="metrics-card-name">${voice.name}</div>
+        <div class="metrics-card-sub">${voice.provider}</div>
+        <div class="metrics-card-stats">
+          <div><span>Latency</span><b>${voice.typical_latency_ms}ms</b></div>
+          <div><span>Cost</span><b>$${voice.cost_per_min.toFixed(3)}/min</b></div>
+          <div><span>${voice.metric_label}</span><b>${voice.metric_value}</b></div>
+        </div>
+      </div>
+    </div>
+
+    ${live ? `
+    <div class="metrics-live">
+      <div class="metrics-live-head">Last call — measured</div>
+      <div class="metrics-live-grid">
+        <div><span>Duration</span><b>${live.cost.duration_s}s</b></div>
+        <div><span>Turns</span><b>${live.turns}</b></div>
+        <div><span>Interrupts</span><b>${live.interrupts}</b></div>
+        <div><span>Median latency</span><b>${live.latency.total_ms}ms</b></div>
+        <div><span>p95 latency</span><b>${live.latency.total_p95_ms}ms</b></div>
+        <div><span>Model</span><b>${live.latency.llm_ms}ms</b></div>
+        <div><span>Voice</span><b>${live.latency.tts_ms}ms</b></div>
+        <div class="metrics-live-total"><span>Total cost</span><b>$${live.cost.total.toFixed(4)}</b></div>
+      </div>
+      <div class="metrics-live-breakdown">
+        Twilio $${live.cost.twilio.toFixed(4)}${live.cost.twilio_actual ? ' ✓' : ' (est)'} ·
+        STT $${live.cost.stt.toFixed(4)} ·
+        LLM $${live.cost.llm.toFixed(4)} ·
+        TTS $${live.cost.tts.toFixed(4)}
+        <span class="metrics-live-permin">$${live.cost.per_min.toFixed(3)}/min</span>
+      </div>
+    </div>` : ''}
+  `;
+
+  p.querySelectorAll('.metrics-preset-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      await fetch(`/api/agent/preset/${btn.dataset.preset}`, { method: 'POST' });
+      await loadAgentConfig();
+      await renderMetrics();
+      const old = document.getElementById('agentOptionsPanel');
+      if (old) {
+        const wasOpen = old.style.display !== 'none';
+        const fresh = buildAgentOptions();
+        fresh.style.display = wasOpen ? 'block' : 'none';
+        old.replaceWith(fresh);
+      }
+    });
+  });
+}
+
+async function fetchRealTwilioPrice(callSid, attempt = 0) {
+  if (!callSid || attempt > 6) return;
+  try {
+    const res = await fetch(`/api/agent/call-price/${callSid}`);
+    const d = await res.json();
+    if (d.price != null && lastCallMetrics) {
+      // Swap the estimate for the real billed amount
+      const est = lastCallMetrics.cost.twilio;
+      lastCallMetrics.cost.twilio = d.price;
+      lastCallMetrics.cost.total =
+        +(lastCallMetrics.cost.total - est + d.price).toFixed(5);
+      lastCallMetrics.cost.twilio_actual = true;
+      if (d.duration_s) lastCallMetrics.cost.duration_s = d.duration_s;
+      renderMetrics();
+      return;
+    }
+  } catch (e) { /* retry below */ }
+  // Twilio hasn't priced it yet — back off and try again
+  setTimeout(() => fetchRealTwilioPrice(callSid, attempt + 1), 3000);
+}

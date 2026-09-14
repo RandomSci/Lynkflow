@@ -88,3 +88,13 @@ def load_agent_config() -> AgentConfig:
 
 def save_agent_config(cfg: AgentConfig) -> None:
     _CONFIG_FILE.write_text(cfg.model_dump_json(indent=2))
+
+def apply_preset(cfg: AgentConfig, preset_key: str) -> AgentConfig:
+    from metrics import PRESETS
+    p = PRESETS.get(preset_key)
+    if not p:
+        return cfg
+    for k, v in p.items():
+        if k != "label" and hasattr(cfg, k):
+            setattr(cfg, k, v)
+    return cfg    
