@@ -689,6 +689,7 @@ class AgentCallHandler:
         sent = 0
         first = True
         buf = b""
+        playback_started = None
 
         try:
             async for raw in tts_ws:
@@ -719,14 +720,13 @@ class AgentCallHandler:
                             "streamSid": self.stream_sid,
                             "media":     {"payload": frame},
                         }))
+                        if playback_started is None:
+                            playback_started = time.time()
                         if self.listeners:
                             self._fanout_nowait(frame, "agent")
                         sent += 1
                         self._record_agent_frame(buf[i:i+160])
-                        # Pace roughly to realtime, slightly ahead so the
-                        # jitter buffer never runs dry
-                        if sent % 12 == 0:
-                            await asyncio.sleep(0.20)
+                        await self._pace_tts_audio(sent, playback_started)
                     buf = buf[n:]
 
                 if msg.get("isFinal"):
@@ -740,8 +740,11 @@ class AgentCallHandler:
                     "event": "media", "streamSid": self.stream_sid,
                     "media": {"payload": frame},
                 }))
+                if playback_started is None:
+                    playback_started = time.time()
                 self._record_agent_frame(tail)
                 sent += 1
+                await self._pace_tts_audio(sent, playback_started, force=True)
 
             if self._fanout_buf:
                 self._flush_fanout_nowait()
@@ -793,6 +796,7 @@ class AgentCallHandler:
             await tts_ws.send(json.dumps({"text": ""}))
 
             buf = b""
+            playback_started = None
             async for raw in tts_ws:
                 if self._stop or seq != self._speak_seq or not self.is_speaking:
                     return
@@ -811,12 +815,13 @@ class AgentCallHandler:
                             "event": "media", "streamSid": self.stream_sid,
                             "media": {"payload": frame},
                         }))
+                        if playback_started is None:
+                            playback_started = time.time()
                         if self.listeners:
                             self._fanout_nowait(frame, "agent")
                         sent += 1
                         self._record_agent_frame(buf[i:i+160])                        
-                        if sent % 12 == 0:
-                            await asyncio.sleep(0.20)
+                        await self._pace_tts_audio(sent, playback_started)
                     buf = buf[n:]
                 if msg.get("isFinal"):
                     break
@@ -828,8 +833,11 @@ class AgentCallHandler:
                     "event": "media", "streamSid": self.stream_sid,
                     "media": {"payload": frame},
                 }))
+                if playback_started is None:
+                    playback_started = time.time()
                 self._record_agent_frame(tail)
                 sent += 1
+                await self._pace_tts_audio(sent, playback_started, force=True)
 
             print(f"[TTS] {sent} frames ({sent*0.02:.1f}s) in {time.time()-t0:.2f}s :: {text[:45]}")
 
@@ -854,6 +862,17 @@ class AgentCallHandler:
         if len(self._rec_agent) < len(self._rec_prospect):
             self._rec_agent.extend(b"\xff" * (len(self._rec_prospect) - len(self._rec_agent)))
         self._rec_agent.extend(frame)
+
+    async def _pace_tts_audio(self, sent_frames: int, started_at: float, force: bool = False):
+        """Keep Twilio/browser monitor audio close to real-time playback."""
+        if not started_at:
+            return
+        if not force and sent_frames % 5:
+            return
+        target_elapsed = sent_frames * 0.02
+        delay = target_elapsed - (time.time() - started_at)
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
     async def _stop_speaking(self):
