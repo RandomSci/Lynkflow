@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 from datetime import datetime
 from typing import Optional
@@ -37,11 +38,32 @@ TONE_NOTES = {
 
 def render_template(text: str, lead: dict) -> str:
     """Replace {business}, {city}, {category} placeholders with lead data."""
+    business = clean_business_name_for_speech(lead.get("Name") or "your business")
     return (
-        text.replace("{business}", lead.get("Name") or "your business")
+        text.replace("{business}", business)
             .replace("{city}",     lead.get("City") or "")
             .replace("{category}", lead.get("Category") or "your business")
     )
+
+
+def clean_business_name_for_speech(name: str) -> str:
+    """Make scraped business names easier for TTS to pronounce on phone audio."""
+    text = str(name or "").strip()
+    if not text:
+        return "your business"
+
+    text = text.replace("&", " and ")
+    text = re.sub(r"[,|]+", " ", text)
+    replacements = {
+        r"\bHVAC\b": "H V A C",
+        r"\bLLC\b": "L L C",
+        r"\bLTD\b": "limited",
+        r"\bINC\b": "incorporated",
+        r"\bCO\b": "company",
+    }
+    for pattern, repl in replacements.items():
+        text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 class AgentCallHandler:
@@ -82,6 +104,7 @@ class AgentCallHandler:
         self._rec_agent = bytearray()
         self._rec_prospect = bytearray()        
         self.recording_file = None
+        self._script_step = "pitch"
 
         self.end_phrases = [
             p.strip().lower()
@@ -289,6 +312,8 @@ class AgentCallHandler:
             {"role": "system",    "content": system},
             {"role": "assistant", "content": opening},
         ]
+        self._script_step = "pitch"
+        await asyncio.sleep(0.6)
         await self._push_transcript("agent", opening)
         self._speak_seq += 1
         self._last_turn = time.time()
@@ -328,6 +353,9 @@ class AgentCallHandler:
 
         self.conversation.append({"role": "user", "content": text})
 
+        if await self._maybe_scripted_opening_response(text):
+            return
+
         response = await self._respond()
 
         # Record latency for this turn
@@ -360,6 +388,65 @@ class AgentCallHandler:
 
         if "[HANGUP]" in response or any(p in low for p in self.end_phrases):
             await asyncio.sleep(1)
+            await self._hangup()
+
+    def _is_hard_no(self, text: str) -> bool:
+        low = text.lower()
+        return any(p in low for p in (
+            "not interested", "no thanks", "no thank you", "we're good", "we are good",
+            "take me off", "remove me", "don't call", "do not call", "stop calling",
+            "wrong number", "goodbye", "bye",
+        ))
+
+    def _needs_flexible_response(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "who", "what", "why", "how", "price", "cost", "much", "ai", "robot",
+            "where", "number", "email", "info", "information",
+        ))
+
+    async def _maybe_scripted_opening_response(self, text: str) -> bool:
+        """Keep the first two turns on track before handing off to GPT."""
+        if self._script_step not in ("pitch", "hook"):
+            return False
+        if self._needs_flexible_response(text):
+            self._script_step = "done"
+            return False
+
+        if self._is_hard_no(text):
+            self._script_step = "done"
+            await self._send_agent_line("No problem at all, have a great day! [HANGUP]")
+            return True
+
+        if self._script_step == "pitch":
+            self._script_step = "hook"
+            await self._send_agent_line(
+                "We help plumbing businesses stop losing jobs to missed calls. "
+                "We build an AI system that answers your calls automatically and books jobs while you're on site."
+            )
+            return True
+
+        self._script_step = "done"
+        await self._send_agent_line(
+            "Would a quick 10 minute call with our team be worth it to see if it fits your business?"
+        )
+        return True
+
+    async def _send_agent_line(self, line: str):
+        clean = line.replace("[HANGUP]", "").strip()
+        if clean:
+            self.conversation.append({"role": "assistant", "content": clean})
+            await self._push_transcript("agent", clean)
+            self.metrics.turns += 1
+            self._speak_seq += 1
+            await self._speak_chunk(clean, self._speak_seq)
+
+        low = clean.lower()
+        if any(k in low for k in ("no problem at all", "have a great day", "i'll let you go")):
+            if self.outcome != "interested":
+                self.outcome = "not_interested"
+        if "[HANGUP]" in line or any(p in low for p in self.end_phrases):
+            await asyncio.sleep(0.8)
             await self._hangup()
 
     # ── Voicemail ────────────────────────────────────────────────────────────
@@ -464,6 +551,7 @@ class AgentCallHandler:
             audio_task = asyncio.create_task(self._pump_tts_audio(tts_ws, seq, t_start))
 
             # Stream GPT tokens straight into the TTS socket
+            pending_tts = ""
             async with httpx.AsyncClient(timeout=30) as c:
                 async with c.stream(
                     "POST",
@@ -499,10 +587,13 @@ class AgentCallHandler:
                         # Never speak the control token
                         speakable = tok.replace("[HANGUP]", "")
                         if speakable:
-                            try:
-                                await tts_ws.send(json.dumps({"text": speakable}))
-                            except Exception:
-                                break
+                            pending_tts += speakable
+                            if self._should_flush_tts_text(pending_tts):
+                                try:
+                                    await tts_ws.send(json.dumps({"text": pending_tts.strip() + " "}))
+                                    pending_tts = ""
+                                except Exception:
+                                    break
 
                         # Throttled UI update
                         now = time.time()
@@ -517,6 +608,8 @@ class AgentCallHandler:
             # Signal end of input
             if seq == self._speak_seq and not self._stop:
                 try:
+                    if pending_tts.strip():
+                        await tts_ws.send(json.dumps({"text": pending_tts.strip() + " "}))
                     await tts_ws.send(json.dumps({"text": ""}))
                 except Exception:
                     pass
@@ -560,6 +653,21 @@ class AgentCallHandler:
 
         return full.strip() or None
 
+    @staticmethod
+    def _should_flush_tts_text(text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if len(stripped) < 35 and not stripped.endswith(('.', '?', '!')):
+            return False
+        if stripped.endswith(('.', '?', '!', ';', ':')):
+            return True
+        if len(stripped) >= 80 and text[-1].isspace():
+            return True
+        if len(stripped) >= 120:
+            return True
+        return False
+
     async def _pump_tts_audio(self, tts_ws, seq: int, t_start: float):
         """Read audio frames off the TTS socket and pace them into Twilio."""
         sent = 0
@@ -598,7 +706,7 @@ class AgentCallHandler:
                         if self.listeners:
                             self._fanout_nowait(frame, "agent")
                         sent += 1
-                        self._rec_agent.extend(buf[i:i+160])
+                        self._record_agent_frame(buf[i:i+160])
                         # Pace roughly to realtime, slightly ahead so the
                         # jitter buffer never runs dry
                         if sent % 12 == 0:
@@ -610,11 +718,13 @@ class AgentCallHandler:
 
             # Flush any tail
             if buf and not self._stop and seq == self._speak_seq:
-                frame = base64.b64encode(buf.ljust(160, b"\xff")[:160]).decode()
+                tail = buf.ljust(160, b"\xff")[:160]
+                frame = base64.b64encode(tail).decode()
                 await self.twilio_ws.send_text(json.dumps({
                     "event": "media", "streamSid": self.stream_sid,
                     "media": {"payload": frame},
                 }))
+                self._record_agent_frame(tail)
                 sent += 1
 
             if self._fanout_buf:
@@ -689,12 +799,22 @@ class AgentCallHandler:
                         if self.listeners:
                             self._fanout_nowait(frame, "agent")
                         sent += 1
-                        self._rec_agent.extend(buf[i:i+160])                        
+                        self._record_agent_frame(buf[i:i+160])                        
                         if sent % 12 == 0:
                             await asyncio.sleep(0.20)
                     buf = buf[n:]
                 if msg.get("isFinal"):
                     break
+
+            if buf and not self._stop and seq == self._speak_seq:
+                tail = buf.ljust(160, b"\xff")[:160]
+                frame = base64.b64encode(tail).decode()
+                await self.twilio_ws.send_text(json.dumps({
+                    "event": "media", "streamSid": self.stream_sid,
+                    "media": {"payload": frame},
+                }))
+                self._record_agent_frame(tail)
+                sent += 1
 
             print(f"[TTS] {sent} frames ({sent*0.02:.1f}s) in {time.time()-t0:.2f}s :: {text[:45]}")
 
@@ -713,6 +833,12 @@ class AgentCallHandler:
                 self._last_turn = time.time()
                 if not self._stop:
                     await self._push_status("listening", "Listening…")                
+
+    def _record_agent_frame(self, frame: bytes):
+        """Pad agent audio so the mixed WAV preserves call timing."""
+        if len(self._rec_agent) < len(self._rec_prospect):
+            self._rec_agent.extend(b"\xff" * (len(self._rec_prospect) - len(self._rec_agent)))
+        self._rec_agent.extend(frame)
 
 
     async def _stop_speaking(self):
