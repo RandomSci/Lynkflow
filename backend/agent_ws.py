@@ -104,6 +104,10 @@ class AgentCallHandler:
         self._last_handled_text = ""
         self._last_handled_at = 0.0
         self._awaiting_callback_time = False
+        self._pending_greeting_task = None
+        self._last_agent_line = ""
+        self._last_agent_family = ""
+        self._last_agent_line_at = 0.0
         self.followup_note = ""
         self._speak_seq     = 0
         self._loud_frames   = 0      # consecutive frames above threshold
@@ -204,6 +208,33 @@ class AgentCallHandler:
         if self._looks_like_human_greeting(low):
             return False
         return "thank you for calling" in low or "thanks for calling" in low
+
+    def _cancel_pending_greeting(self):
+        if self._pending_greeting_task and not self._pending_greeting_task.done():
+            self._pending_greeting_task.cancel()
+        self._pending_greeting_task = None
+
+    async def _answer_business_greeting_after_delay(self, text: str):
+        try:
+            await asyncio.sleep(1.2)
+            if self._stop or self._prospect_spoke or self._opening_started or self._machine_kind:
+                return
+            print(f"[GREETING] treating as live receptionist: {text[:80]}")
+            self._ensure_conversation_context()
+            self._awaiting_response_since = None
+            self._last_turn = time.time()
+            self._nudges = 0
+            self._prospect_spoke = True
+            if self.outcome == "no_answer":
+                self.outcome = "conversation"
+            self._gatekeeper_mode = True
+            self._script_step = "done"
+            self.conversation.append({"role": "user", "content": text})
+            await self._send_agent_line(
+                "Hi, this is Anna with Lynkflow. Is the owner or office manager available?"
+            )
+        except asyncio.CancelledError:
+            pass
 
     async def run(self):
         await self._push_status("connecting", "Connecting…")
@@ -495,6 +526,8 @@ class AgentCallHandler:
                 await self._stop_speaking()
             return
 
+        self._cancel_pending_greeting()
+
         if kind == "menu":
             print(f"[MACHINE] phone tree: {text[:60]}")
             self.outcome = "ivr"
@@ -518,6 +551,9 @@ class AgentCallHandler:
         if self._looks_like_business_greeting_only(text):
             print(f"[GREETING] waiting for more context: {text[:80]}")
             self._startup_audio_seen = True
+            self._pending_greeting_task = asyncio.create_task(
+                self._answer_business_greeting_after_delay(text)
+            )
             return
 
         self._ensure_conversation_context()
@@ -614,6 +650,19 @@ class AgentCallHandler:
             ))
         )
 
+    def _strongly_confirms_owner(self, text: str) -> bool:
+        low = text.lower().strip(" .,?!")
+        return (
+            low in {
+                "speaking", "this is he", "this is she", "this is him", "this is her",
+                "this is me", "that's me", "that is me",
+            }
+            or any(k in low for k in (
+                "i'm the owner", "i am the owner", "owner speaking", "this is the owner",
+                "i handle that", "i make those decisions", "i'm the manager", "i am the manager",
+            ))
+        )
+
     def _denies_owner(self, text: str) -> bool:
         low = text.lower().strip(" .,?!")
         if low in {"no", "nope", "nah"}:
@@ -649,6 +698,68 @@ class AgentCallHandler:
             "not right now", "busy right now", "too busy", "later",
         ))
 
+    def _allows_pitch(self, text: str) -> bool:
+        low = text.lower().strip(" .,?!")
+        if low in {"yes", "yeah", "yep", "sure", "okay", "ok", "go ahead"}:
+            return True
+        return any(k in low for k in (
+            "30 seconds", "thirty seconds", "give me", "you have 30", "make it quick",
+            "be quick", "what is it", "what's it", "tell me", "go for it", "shoot",
+        ))
+
+    def _declines_pitch(self, text: str) -> bool:
+        low = text.lower().strip(" .,?!")
+        if low in {"no", "nope", "nah", "not really", "no thanks", "no thank you"}:
+            return True
+        return self._is_hard_no(text) or any(k in low for k in (
+            "hang up", "not interested", "don't pitch", "do not pitch", "not a good time",
+            "i'm good", "we're good", "we are good", "don't take cold calls",
+            "do not take cold calls", "no cold calls",
+        ))
+
+    def _asks_what_cold_call(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "what's a cold call", "what is a cold call", "what do you mean cold call",
+            "what does cold call mean", "cold call?", "cold call",
+        ))
+
+    def _asks_if_ai(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "are you ai", "you're ai", "you are ai", "ur ai", "youre ai",
+            "ai assistant", "ai caller", "are you a bot", "you're a bot",
+            "you are a bot", "are you robot", "are you a robot", "robocall",
+            "automated caller", "automated call",
+        ))
+
+    def _asks_why_talk_to_ai(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "why would i talk to you", "why should i talk to you",
+            "why am i talking to you", "why talk to you",
+            "don't want to talk to ai", "do not want to talk to ai",
+            "want to talk to a real person", "talk to a real person",
+            "real person", "human", "actual person",
+        ))
+
+    def _mentions_lynkflow(self, text: str) -> bool:
+        low = text.lower()
+        return "lynkflow" in low or "linkflow" in low or "link flow" in low
+
+    def _callback_time_has_day(self, text: str) -> bool:
+        low = text.lower()
+        return any(k in low for k in (
+            "tomorrow", "today", "monday", "tuesday", "wednesday", "thursday",
+            "friday", "saturday", "sunday", "next week", "this week",
+        ))
+
+    def _callback_time_has_time(self, text: str) -> bool:
+        low = text.lower()
+        if re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)\b", low):
+            return True
+        return any(k in low for k in ("morning", "afternoon", "evening", "noon", "lunch"))
+
     def _has_callback_time_detail(self, text: str) -> bool:
         low = text.lower().strip(" .,?!")
         vague = {
@@ -657,13 +768,14 @@ class AgentCallHandler:
         }
         if low in vague:
             return False
-        if re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?\b", low):
+        if self._callback_time_has_time(low):
             return True
-        return any(k in low for k in (
-            "morning", "afternoon", "evening", "noon", "lunch", "tomorrow", "today",
-            "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
-            "next week", "this week", "after", "before",
-        ))
+        return self._callback_time_has_day(low) or any(k in low for k in ("after", "before"))
+
+    def _callback_clarifying_question(self, text: str) -> str:
+        if self._callback_time_has_day(text) and not self._callback_time_has_time(text):
+            return "Sure, what time tomorrow is usually best?" if "tomorrow" in text.lower() else "Sure, what time is usually best?"
+        return "Sure, what day and time is usually best?"
 
     async def _save_callback_time_and_end(self, text: str):
         tz = self._lead_timezone()
@@ -678,6 +790,33 @@ class AgentCallHandler:
         line += ". Thanks for your help, have a good day. [HANGUP]"
         await self._send_agent_line(line)
 
+    async def _ask_cold_call_permission(self):
+        self._decision_maker_confirmed = True
+        self._gatekeeper_mode = False
+        self._script_step = "cold_call_permission"
+        await self._send_agent_line(
+            "So I'm gonna be honest with you, this is a cold call. I do have something quick to pitch your business. Do you want me to hang up, or can I take 30 seconds and then you can decide?"
+        )
+
+    async def _send_short_owner_pitch(self):
+        self._script_step = "post_pitch"
+        await self._send_agent_line(
+            "Quick version: Lynkflow helps service businesses make sure customer calls still get answered when the team is busy, after hours, or already on another call. Would a quick 10-minute demo with a real person be worth seeing?"
+        )
+
+    @staticmethod
+    def _agent_line_family(line: str) -> str:
+        low = line.lower()
+        if "weren't expecting my call" in low or "being upfront" in low:
+            return "permission_answer"
+        if "this is a cold call" in low or "30 seconds" in low or "quick 30-second" in low:
+            return "permission"
+        if "quick version" in low or "10-minute demo" in low or "real person be worth seeing" in low:
+            return "pitch"
+        if low.startswith("hi, this is anna"):
+            return "intro"
+        return ""
+
     def _is_ambiguous_greeting(self, text: str) -> bool:
         low = text.lower().strip(" .,?!")
         return low in {
@@ -688,17 +827,8 @@ class AgentCallHandler:
     async def _handle_unconfirmed_transcript(self, text: str) -> bool:
         """Keep pre-confirmation turns safe: route first, never pitch."""
         if self._confirms_owner(text):
-            self._decision_maker_confirmed = True
-            self._gatekeeper_mode = False
-            self._script_step = "done"
-            self.conversation.append({
-                "role": "system",
-                "content": (
-                    "The last reply confirmed this is the owner or decision maker. "
-                    "Continue naturally using the pitch reference. Keep it brief and ask one clear next-step question."
-                ),
-            })
-            return False
+            await self._ask_cold_call_permission()
+            return True
 
         self._script_step = "done"
 
@@ -708,14 +838,36 @@ class AgentCallHandler:
 
         if self._awaiting_callback_time:
             if self._has_callback_time_detail(text):
-                await self._save_callback_time_and_end(text)
+                if self._callback_time_has_day(text) and not self._callback_time_has_time(text):
+                    await self._send_agent_line(self._callback_clarifying_question(text))
+                else:
+                    await self._save_callback_time_and_end(text)
             else:
-                await self._send_agent_line("Sure, what day and time is usually best?")
+                await self._send_agent_line(self._callback_clarifying_question(text))
             return True
 
         if self._requests_better_time(text):
             self._awaiting_callback_time = True
-            await self._send_agent_line("Sure, what day and time is usually best?")
+            await self._send_agent_line(self._callback_clarifying_question(text))
+            return True
+
+        if self._asks_why_talk_to_ai(text):
+            self._awaiting_callback_time = True
+            await self._send_agent_line(
+                "Fair question. You do not have to; I can have a real person follow up instead. What day and time works best?"
+            )
+            return True
+
+        if self._asks_if_ai(text):
+            await self._send_agent_line(
+                "Yes, I'm an AI caller from Lynkflow. I was just trying to reach whoever handles customer calls for the business. Is that you?"
+            )
+            return True
+
+        if self._mentions_lynkflow(text) and ("who" in text.lower() or "what" in text.lower()):
+            await self._send_agent_line(
+                "Lynkflow helps trade businesses handle customer calls when nobody can get to the phone. Are you the person who handles that?"
+            )
             return True
 
         if self._owner_unavailable(text):
@@ -761,7 +913,55 @@ class AgentCallHandler:
 
     async def _maybe_scripted_opening_response(self, text: str) -> bool:
         """Keep the first two turns on track before handing off to GPT."""
-        if self._script_step not in ("owner_check", "pitch", "hook"):
+        if self._script_step not in ("owner_check", "cold_call_permission", "post_pitch", "pitch", "hook"):
+            return False
+
+        if self._script_step == "cold_call_permission":
+            if self._declines_pitch(text):
+                self._script_step = "done"
+                await self._send_agent_line("No problem at all. Thanks for your time, have a good day. [HANGUP]")
+                return True
+            if self._asks_what_cold_call(text):
+                await self._send_agent_line(
+                    "It just means you weren't expecting my call. I'm being upfront so you can decide if you want the quick version or if I should let you go."
+                )
+                return True
+            if self._asks_reason(text) or self._asks_agent_identity(text) or self._mentions_lynkflow(text):
+                await self._send_agent_line("It's a cold call about customer calls for your business. Do you want the quick 30-second version, or should I let you go?")
+                return True
+            if self._requests_better_time(text):
+                self._script_step = "done"
+                self._awaiting_callback_time = True
+                await self._send_agent_line(self._callback_clarifying_question(text))
+                return True
+            if self._asks_if_ai(text):
+                await self._send_agent_line(
+                    "Yes, I'm an AI caller from Lynkflow. If you'd rather not continue with me, I can have a real person follow up instead."
+                )
+                return True
+            if self._allows_pitch(text):
+                await self._send_short_owner_pitch()
+                return True
+            await self._send_agent_line("Totally fair. Should I take that as a no, or do you want the quick 30-second version?")
+            return True
+
+        if self._script_step == "post_pitch":
+            if self._declines_pitch(text):
+                self._script_step = "done"
+                await self._send_agent_line("No problem at all. Thanks for your time, have a good day. [HANGUP]")
+                return True
+            if self._allows_pitch(text) or any(k in text.lower() for k in ("demo", "interested", "send", "sure", "okay")):
+                self.outcome = "interested"
+                self._awaiting_callback_time = True
+                self._script_step = "done"
+                await self._send_agent_line("Great. What day and time works best for a quick call with our team?")
+                return True
+            if self._requests_better_time(text):
+                self._awaiting_callback_time = True
+                self._script_step = "done"
+                await self._send_agent_line(self._callback_clarifying_question(text))
+                return True
+            self._script_step = "done"
             return False
 
         if self._is_hard_no(text):
@@ -771,17 +971,8 @@ class AgentCallHandler:
 
         if self._script_step == "owner_check":
             if self._confirms_owner(text):
-                self._script_step = "done"
-                self._gatekeeper_mode = False
-                self._decision_maker_confirmed = True
-                self.conversation.append({
-                    "role": "system",
-                    "content": (
-                        "The last reply confirmed this is the owner or decision maker. "
-                        "Continue naturally using the pitch reference. Keep it brief and ask one clear next-step question."
-                    ),
-                })
-                return False
+                await self._ask_cold_call_permission()
+                return True
 
             if self._owner_unavailable(text):
                 self._script_step = "done"
@@ -830,7 +1021,9 @@ class AgentCallHandler:
         return any(k in low for k in (
             "what's this about", "what is this about", "what is it about", "what's it about",
             "tell me more", "more info", "bit more", "a bit more", "what for", "why are you calling",
-            "regarding", "in regards to", "what do you need",
+            "regarding", "in regards to", "what do you need", "what are you calling for",
+            "what's the reason", "what is the reason", "what do you do", "what do you guys do",
+            "what is lynkflow", "what's lynkflow", "what does lynkflow do",
         ))
 
     def _offers_transfer_or_message(self, text: str) -> bool:
@@ -848,18 +1041,14 @@ class AgentCallHandler:
         ))
 
     async def _handle_gatekeeper_transcript(self, text: str) -> bool:
-        if self._confirms_owner(text):
-            self._gatekeeper_mode = False
-            self._decision_maker_confirmed = True
-            self._script_step = "done"
-            self.conversation.append({
-                "role": "system",
-                "content": (
-                    "The last reply confirmed this is the owner or decision maker. "
-                    "Continue naturally using the pitch reference. Keep it brief and ask one clear next-step question."
-                ),
-            })
-            return False
+        low = text.lower().strip(" .,?!")
+        if low in {"yes", "yeah", "yep"}:
+            await self._send_agent_line("Great, could you connect me with them?")
+            return True
+
+        if self._strongly_confirms_owner(text):
+            await self._ask_cold_call_permission()
+            return True
 
         if self._is_hard_no(text):
             await self._send_agent_line("No problem, I'll try another time. Thanks for your help, have a good day! [HANGUP]")
@@ -867,14 +1056,36 @@ class AgentCallHandler:
 
         if self._awaiting_callback_time:
             if self._has_callback_time_detail(text):
-                await self._save_callback_time_and_end(text)
+                if self._callback_time_has_day(text) and not self._callback_time_has_time(text):
+                    await self._send_agent_line(self._callback_clarifying_question(text))
+                else:
+                    await self._save_callback_time_and_end(text)
             else:
-                await self._send_agent_line("Sure, what day and time is usually best?")
+                await self._send_agent_line(self._callback_clarifying_question(text))
             return True
 
         if self._requests_better_time(text):
             self._awaiting_callback_time = True
-            await self._send_agent_line("Sure, what day and time is usually best?")
+            await self._send_agent_line(self._callback_clarifying_question(text))
+            return True
+
+        if self._asks_why_talk_to_ai(text):
+            self._awaiting_callback_time = True
+            await self._send_agent_line(
+                "Fair question. You do not have to; I can have a real person follow up instead. What day and time works best?"
+            )
+            return True
+
+        if self._asks_if_ai(text):
+            await self._send_agent_line(
+                "Yes, I'm an AI caller from Lynkflow. I was just trying to reach the owner or office manager. Are they available?"
+            )
+            return True
+
+        if self._mentions_lynkflow(text) and ("who" in text.lower() or "what" in text.lower()):
+            await self._send_agent_line(
+                "Lynkflow helps trade businesses handle customer calls when nobody can get to the phone. Is the owner or office manager available?"
+            )
             return True
 
         if self._asks_agent_identity(text):
@@ -921,6 +1132,33 @@ class AgentCallHandler:
     async def _send_agent_line(self, line: str):
         clean = line.replace("[HANGUP]", "").strip()
         if clean:
+            now = time.time()
+            norm = re.sub(r"\s+", " ", clean.lower().strip(" .,?!"))
+            last = self._last_agent_line
+            family = self._agent_line_family(clean)
+            repeated_intro = norm.startswith("hi, this is anna") and last.startswith("hi, this is anna")
+            repeated_family = family and family == self._last_agent_family
+            if (norm == last or repeated_intro or repeated_family) and (now - self._last_agent_line_at) < 12:
+                if repeated_intro and last != "sorry, i may have cut in there is the owner or office manager available":
+                    clean = "Sorry, I may have cut in there. Is the owner or office manager available?"
+                    norm = re.sub(r"\s+", " ", clean.lower().strip(" .,?!"))
+                    family = "intro"
+                elif family == "permission" and last != "it's a cold call about customer calls for your business do you want the quick 30-second version, or should i let you go":
+                    clean = "It's a cold call about customer calls for your business. Do you want the quick 30-second version, or should I let you go?"
+                    norm = re.sub(r"\s+", " ", clean.lower().strip(" .,?!"))
+                    family = "permission"
+                elif family == "pitch" and last != "short version we help cover overflow and after-hours calls would a quick demo with a real person be useful":
+                    clean = "Short version: we help cover overflow and after-hours calls. Would a quick demo with a real person be useful?"
+                    norm = re.sub(r"\s+", " ", clean.lower().strip(" .,?!"))
+                    family = "pitch"
+                else:
+                    print(f"[TURN] suppressing repeated agent line: {clean[:80]}")
+                    clean = ""
+
+        if clean:
+            self._last_agent_line = norm
+            self._last_agent_family = family
+            self._last_agent_line_at = time.time()
             self._ensure_conversation_context()
             self._opening_started = True
             self.conversation.append({"role": "assistant", "content": clean})
@@ -1129,6 +1367,10 @@ class AgentCallHandler:
                 self._mark_listening_for_response()
                 if not self._stop:
                     await self._push_status("listening", "Listening…")
+
+        if self._stop or seq != self._speak_seq:
+            print("[PIPELINE] discarded interrupted response")
+            return None
 
         final = full.strip().replace("[HANGUP]", "").strip()
         if final:
