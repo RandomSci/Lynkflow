@@ -8,8 +8,38 @@
 }
 .agent-bar--active { border-color: var(--accent-border); background: var(--accent-dim); }
 .agent-bar-left { display: flex; align-items: center; gap: 14px; }
+.agent-bar-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
 .agent-bar-title { font-size: 13.5px; font-weight: 600; }
 .agent-bar-sub { font-size: 11.5px; color: var(--text-3); margin-top: 1px; }
+
+.autodial-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.autodial-field { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-3); }
+.autodial-field input {
+  width: 54px; padding: 7px 8px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--bg-3); color: var(--text);
+  font-size: 12px; font-family: inherit;
+}
+.autodial-btn {
+  padding: 8px 12px; border-radius: var(--radius-sm); border: 1px solid var(--accent);
+  background: var(--accent); color: #fff; font-size: 12.5px; font-weight: 600;
+  cursor: pointer; transition: opacity var(--transition), background var(--transition);
+}
+.autodial-btn:hover { opacity: 0.88; }
+.autodial-btn.running { background: var(--red); border-color: var(--red); }
+.autodial-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.autodial-status { min-width: 168px; font-size: 11.5px; color: var(--text-3); }
+
+.autodial-page-controls { margin-bottom: 14px; }
+.autodial-page-grid { display: grid; grid-template-columns: auto minmax(240px, 1fr) auto auto minmax(160px, auto); gap: 12px; align-items: end; }
+.autodial-control-field { display: flex; flex-direction: column; gap: 6px; font-size: 11.5px; color: var(--text-3); }
+.autodial-control-field input {
+  padding: 9px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  background: var(--bg-3); color: var(--text); font-size: 12.5px; font-family: inherit;
+}
+.autodial-control-field--switch { align-items: flex-start; justify-content: end; }
+.autodial-control-field--switch input { width: 18px; height: 18px; accent-color: var(--accent); }
+.autodial-control-field--url input { min-width: 260px; font-family: ui-monospace, monospace; }
+.autodial-help-text { margin-top: 10px; color: var(--text-3); font-size: 12px; line-height: 1.5; }
 
 .agent-switch { position: relative; display: inline-block; flex-shrink: 0; cursor: pointer; }
 .agent-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
@@ -118,6 +148,11 @@
 
 @media (max-width: 640px) {
   .agent-bar { flex-direction: column; align-items: stretch; gap: 12px; }
+  .agent-bar-right { justify-content: flex-start; }
+  .autodial-controls { width: 100%; }
+  .autodial-status { width: 100%; }
+  .autodial-page-grid { grid-template-columns: 1fr; align-items: stretch; }
+  .autodial-control-field--url input { min-width: 0; }
   .agent-voice-grid { grid-template-columns: 1fr 1fr; }
   .agent-tone-btn { min-width: 100%; }
 }
@@ -217,6 +252,47 @@
   content: '▋'; animation: blink 1s step-end infinite; margin-left: 2px; opacity: 0.5;
 }
 @keyframes blink { 50% { opacity: 0; } }
+
+/* Auto dial monitor */
+.autodial-monitor-panel { margin-top: 14px; }
+.autodial-monitor { display: flex; flex-direction: column; gap: 14px; }
+.autodial-monitor-empty {
+  color: var(--text-3); font-size: 12.5px; text-align: center;
+  padding: 18px 10px; border: 1px dashed var(--border); border-radius: var(--radius-sm);
+}
+.autodial-monitor-empty.small { padding: 12px 10px; text-align: left; }
+.autodial-summary-row {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 10px; background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.autodial-summary-row span { font-size: 11.5px; color: var(--text-3); }
+.autodial-summary-row b { color: var(--text); }
+.autodial-monitor-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 14px; }
+.autodial-section-title { font-size: 11px; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+.autodial-active-list, .autodial-event-list { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 2px; }
+.autodial-call-card, .autodial-event {
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-3);
+}
+.autodial-call-head, .autodial-event-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.autodial-call-name { color: var(--text); font-size: 13px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.autodial-call-state {
+  flex-shrink: 0; padding: 2px 7px; border-radius: 999px;
+  background: var(--accent-dim); color: var(--accent); font-size: 10.5px; text-transform: capitalize;
+}
+.autodial-call-phone, .autodial-event-meta { margin-top: 4px; color: var(--text-3); font-size: 11.5px; }
+.autodial-call-line { margin-top: 8px; color: var(--text-3); font-size: 12.5px; line-height: 1.45; }
+.autodial-call-line.has-line { color: var(--text-2); }
+.autodial-call-line b { color: var(--text); }
+.autodial-event-head span { color: var(--text-2); font-size: 12px; font-weight: 650; text-transform: capitalize; }
+.autodial-event-head em { color: var(--text-3); font-size: 10.5px; font-style: normal; }
+.autodial-event-body { margin-top: 6px; color: var(--text-2); font-size: 12.5px; line-height: 1.45; }
+.autodial-event-audio { width: 100%; height: 30px; margin-top: 8px; }
+
+@media (max-width: 900px) {
+  .autodial-monitor-grid { grid-template-columns: 1fr; }
+}
 
 /* ═══ TRANSCRIPT AS RIGHT RAIL (wide screens) ═══ */
 

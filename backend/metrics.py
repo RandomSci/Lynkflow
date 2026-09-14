@@ -26,6 +26,8 @@ RATES = {
     # OpenAI — per 1M tokens, converted at runtime
     "gpt-4o-mini_in":      0.150,
     "gpt-4o-mini_out":     0.600,
+    "gpt-4.1_in":          2.000,
+    "gpt-4.1_out":         8.000,
     "gpt-4o_in":           2.500,
     "gpt-4o_out":         10.000,
 
@@ -51,6 +53,11 @@ COMPONENT_INFO = {
             "name": "GPT-4o", "provider": "OpenAI",
             "typical_latency_ms": 720, "cost_per_min": 0.045,
             "metric_label": "Intelligence", "metric_value": "22",
+        },
+        "gpt-4.1": {
+            "name": "GPT-4.1", "provider": "OpenAI",
+            "typical_latency_ms": 900, "cost_per_min": 0.055,
+            "metric_label": "Intelligence", "metric_value": "25",
         },
     },
     "voice": {
@@ -112,7 +119,7 @@ class CallMetrics:
     turns:       int = 0
     interrupts:  int = 0
 
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-4.1"
 
     # ── recording ────────────────────────────────────────────────────────────
 

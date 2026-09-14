@@ -122,11 +122,16 @@ class AgentCallHandler:
     MENU_MARKERS = [
         "press one", "press two", "press three", "press zero",
         "press 1", "press 2", "press 3", "press 0",
+        "press any key", "any key to continue", "key to continue",
+        "did not detect a key", "didn't detect a key", "key press",
+        "press pound", "press the pound", "press star", "press the star",
+        "press #", "press *", "enter your", "say or press",
         "dial by name", "extension number", "main menu",
         "for emergency service", "for sales", "for billing",
         "please listen as our options", "options have changed",
         "please hold", "your call is important",
         "currently assisting other customers",
+        "automated system", "automated attendant", "auto attendant",
     ]
 
     # Voicemail — CAN leave a message
@@ -166,6 +171,14 @@ class AgentCallHandler:
             return True
         # Receptionists often say: "Thank you for calling X, this is Frankie..."
         return bool(re.search(r"\b(thank you|thanks) for calling\b.+\b(how (may|can)|this is)\b", low))
+
+    def _looks_like_business_greeting_only(self, text: str) -> bool:
+        low = text.lower()
+        if any(m in low for m in self.MENU_MARKERS + self.VOICEMAIL_MARKERS):
+            return False
+        if self._looks_like_human_greeting(low):
+            return False
+        return "thank you for calling" in low or "thanks for calling" in low
 
     async def run(self):
         await self._push_status("connecting", "Connecting…")
@@ -396,6 +409,10 @@ class AgentCallHandler:
                 await self._hangup()
             return
 
+        if self._looks_like_business_greeting_only(text):
+            print(f"[GREETING] waiting for more context: {text[:80]}")
+            return
+
         self.conversation.append({"role": "user", "content": text})
 
         if self._gatekeeper_mode and await self._handle_gatekeeper_transcript(text):
@@ -520,7 +537,7 @@ class AgentCallHandler:
                 self._gatekeeper_mode = True
                 self._gatekeeper_contact_asked = True
                 await self._send_agent_line(
-                    "No worries at all. What's the best way to reach the owner directly - phone, email, or a good callback time?"
+                    "No worries. What's the best way to reach them directly - phone, email, or a better time to call?"
                 )
                 return True
 
@@ -535,7 +552,7 @@ class AgentCallHandler:
                 return False
 
             await self._send_agent_line(
-                "Before I go further, are you the owner or the person who handles decisions for the business?"
+                "Before I go further, are you the owner or office manager?"
             )
             return True
 
@@ -607,8 +624,8 @@ class AgentCallHandler:
 
         if self._asks_reason(text):
             await self._send_agent_line(
-                "We're reaching out because missed calls can cost trade businesses real jobs. "
-                "I just need the best way to reach the owner about their business phone line."
+                "It's regarding their business phone line. "
+                "What's the best way to reach the owner or office manager?"
             )
             self._gatekeeper_contact_asked = True
             return True
@@ -616,25 +633,25 @@ class AgentCallHandler:
         if self._owner_unavailable(text) or self._offers_transfer_or_message(text) or self._denies_owner(text):
             if self._gatekeeper_contact_asked:
                 await self._send_agent_line(
-                    "Sure, please tell them Anna from Lynkflow called about their business phone line. "
-                    "What's the best callback number or email for the owner?"
+                    "Sure, please let them know Anna from Lynkflow called about their business phone line. "
+                    "What's the best callback number or email for them?"
                 )
             else:
                 await self._send_agent_line(
-                    "No worries. What's the best way to reach the owner directly - phone, email, or a good callback time?"
+                    "No worries. What's the best way to reach them directly - phone, email, or a better time to call?"
                 )
                 self._gatekeeper_contact_asked = True
             return True
 
         if not self._gatekeeper_contact_asked:
             await self._send_agent_line(
-                "What's the best way to reach the owner directly - phone, email, or a good callback time?"
+                "What's the best way to reach the owner or office manager - phone, email, or a better time to call?"
             )
             self._gatekeeper_contact_asked = True
             return True
 
         await self._send_agent_line(
-            "Got it. Please let them know Anna from Lynkflow called about their business phone line. Thanks for your help, have a good day! [HANGUP]"
+            "Got it. Please let them know Anna from Lynkflow called regarding their business phone line. Thanks for your help, have a good day! [HANGUP]"
         )
         return True
 

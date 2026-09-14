@@ -14,9 +14,15 @@ let listenQueuedSamples = 0;
 let listenRetries = 0;
 let listenPingTimer = null;
 let agentCallActive = false;
+let autoDialEventSource = null;
+let autoDialRunning = false;
+let autoDialSnapshot = null;
+let autoDialEvents = [];
+let autoDialRefreshTimer = null;
 
 const LISTEN_TARGET_BUFFER_S = 0.12;
 const LISTEN_MAX_BUFFER_S = 0.6;
+const AUTODIAL_CONCURRENCY_KEY = 'lynkflow_autodial_concurrency';
 
 const VOICES = [
   { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah',   desc: 'Warm, professional female' },
@@ -173,6 +179,7 @@ function buildAgentOptions() {
       <div class="agent-opt-group">
         <div class="agent-opt-label">Model</div>
         <select id="optModel" class="agent-select">
+          <option value="gpt-4.1" ${agentConfig.model === 'gpt-4.1' ? 'selected' : ''}>GPT-4.1 — strongest reasoning</option>
           <option value="gpt-4o-mini" ${agentConfig.model === 'gpt-4o-mini' ? 'selected' : ''}>GPT-4o Mini — faster, cheaper</option>
           <option value="gpt-4o" ${agentConfig.model === 'gpt-4o' ? 'selected' : ''}>GPT-4o — smarter, slower</option>
         </select>
@@ -875,6 +882,239 @@ function escapeHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+function getStoredAutoDialConcurrency() {
+  return Math.max(1, Math.min(15, parseInt(localStorage.getItem(AUTODIAL_CONCURRENCY_KEY) || '1')));
+}
+
+function setStoredAutoDialConcurrency(value) {
+  const safe = Math.max(1, Math.min(15, parseInt(value || '1')));
+  localStorage.setItem(AUTODIAL_CONCURRENCY_KEY, String(safe));
+  return safe;
+}
+
+async function loadAutoDialMonitorPage() {
+  if (typeof setActiveNav === 'function') setActiveNav('autodial');
+  await loadAgentConfig();
+
+  const area = document.getElementById('contentArea');
+  if (!area) return;
+  area.innerHTML = '';
+  area.className = 'content-area fade-in';
+
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `
+    <div class="module-header">
+      <div class="module-eyebrow">Closed Loop Calling</div>
+      <div class="module-title">⚡ Auto Dial Monitor</div>
+    </div>
+    <div class="card autodial-page-controls">
+      <div class="card-label">Auto Dial Controls</div>
+      <div class="autodial-page-grid">
+        <label class="autodial-control-field autodial-control-field--switch">
+          <span>AI Agent Mode</span>
+          <input type="checkbox" id="autoDialAgentEnabled" ${agentConfig.enabled ? 'checked' : ''} />
+        </label>
+        <label class="autodial-control-field autodial-control-field--url">
+          <span>Public URL</span>
+          <input type="text" id="autoDialBaseUrl" value="${escAttr(agentConfig.base_url || '')}" placeholder="https://your-tunnel.trycloudflare.com" />
+        </label>
+        <label class="autodial-control-field">
+          <span>Parallel calls</span>
+          <input type="number" id="autoDialConcurrency" min="1" max="15" value="${getStoredAutoDialConcurrency()}" />
+        </label>
+        <button class="autodial-btn" id="autoDialBtn">Start Auto</button>
+        <span class="autodial-status" id="autoDialStatus">Idle</span>
+      </div>
+      <div class="autodial-help-text">Calls only blank, New, Retry, or Queued leads. Already-called, DNC, Interested, and Not Interested leads are skipped.</div>
+    </div>
+    <div class="card autodial-monitor-panel" id="autoDialMonitorPanel">
+      <div class="card-label">Auto Dial Monitor</div>
+      <div class="autodial-monitor" id="autoDialMonitor">
+        <div class="autodial-monitor-empty">Start auto dial to see active calls and transcript snippets here.</div>
+      </div>
+    </div>
+  `;
+  area.appendChild(wrap);
+
+  document.getElementById('autoDialAgentEnabled')?.addEventListener('change', async (e) => {
+    agentConfig.enabled = e.target.checked;
+    await saveAgentConfig();
+    renderAutoDialMonitor();
+  });
+  document.getElementById('autoDialBaseUrl')?.addEventListener('change', async (e) => {
+    agentConfig.base_url = e.target.value.trim();
+    await saveAgentConfig();
+  });
+  document.getElementById('autoDialConcurrency')?.addEventListener('change', (e) => {
+    e.target.value = setStoredAutoDialConcurrency(e.target.value);
+  });
+  document.getElementById('autoDialBtn')?.addEventListener('click', handleAutoDialBtn);
+
+  connectAutoDialEvents();
+  await loadAutoDialStatus();
+  renderAutoDialMonitor();
+}
+
+async function handleAutoDialBtn() {
+  if (autoDialRunning) return stopAutoDial();
+  return startAutoDial();
+}
+
+async function startAutoDial() {
+  const baseInput = document.getElementById('autoDialBaseUrl');
+  const concurrencyInput = document.getElementById('autoDialConcurrency');
+  if (baseInput) {
+    agentConfig.base_url = baseInput.value.trim();
+    await saveAgentConfig();
+  }
+  const concurrency = setStoredAutoDialConcurrency(concurrencyInput?.value || getStoredAutoDialConcurrency());
+  if (concurrencyInput) concurrencyInput.value = concurrency;
+
+  if (!agentConfig.enabled) return setAutoDialText('Turn on AI Agent Mode first');
+  if (!agentConfig.base_url) return setAutoDialText('Set your public URL first');
+
+  setAutoDialText('Starting...');
+  try {
+    const res = await fetch('/api/agent/autodial/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ concurrency, base_url: agentConfig.base_url }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.detail || 'Failed to start auto dialer');
+    updateAutoDialUi(data);
+    connectAutoDialEvents();
+  } catch (e) {
+    setAutoDialText(`Error: ${e.message}`);
+  }
+}
+
+async function stopAutoDial() {
+  setAutoDialText('Stopping...');
+  try {
+    const res = await fetch('/api/agent/autodial/stop', { method: 'POST' });
+    updateAutoDialUi(await res.json());
+  } catch (e) {
+    setAutoDialText(`Stop failed: ${e.message}`);
+  }
+}
+
+async function loadAutoDialStatus() {
+  try {
+    const res = await fetch('/api/agent/autodial/status');
+    updateAutoDialUi(await res.json());
+  } catch (e) {
+    setAutoDialText('Unavailable');
+  }
+}
+
+function connectAutoDialEvents() {
+  if (autoDialEventSource) return;
+  autoDialEventSource = new EventSource('/api/agent/autodial/events');
+  autoDialEventSource.onmessage = (e) => {
+    let data;
+    try { data = JSON.parse(e.data); } catch { return; }
+    if (data.type === 'ping') return;
+    rememberAutoDialEvent(data);
+    updateAutoDialUi(data.snapshot || data);
+    if (data.type === 'call_finished' || data.type === 'call_failed') scheduleAutoDialLeadRefresh();
+  };
+  autoDialEventSource.onerror = () => {
+    autoDialEventSource?.close();
+    autoDialEventSource = null;
+    setTimeout(connectAutoDialEvents, 3000);
+  };
+}
+
+function updateAutoDialUi(snapshot) {
+  if (snapshot) autoDialSnapshot = snapshot;
+  if (snapshot) autoDialRunning = !!snapshot.running;
+  const btn = document.getElementById('autoDialBtn');
+  const input = document.getElementById('autoDialConcurrency');
+  const status = autoDialSnapshot || {};
+  if (btn) {
+    btn.textContent = autoDialRunning ? 'Stop Auto' : 'Start Auto';
+    btn.classList.toggle('running', autoDialRunning);
+  }
+  if (input) input.disabled = autoDialRunning;
+  setAutoDialText(`Active ${status.active || 0}/${status.concurrency || getStoredAutoDialConcurrency()} · Queued ${status.queued || 0} · Done ${status.completed || 0}`);
+  renderAutoDialMonitor();
+}
+
+function setAutoDialText(text) {
+  const el = document.getElementById('autoDialStatus');
+  if (el) el.textContent = text;
+}
+
+function rememberAutoDialEvent(event) {
+  if (!event || event.type === 'status') return;
+  autoDialEvents.unshift(event);
+  autoDialEvents = autoDialEvents.slice(0, 50);
+}
+
+function scheduleAutoDialLeadRefresh() {
+  if (autoDialRefreshTimer) clearTimeout(autoDialRefreshTimer);
+  autoDialRefreshTimer = setTimeout(() => {
+    if (typeof fetchLeads === 'function') fetchLeads();
+  }, 1200);
+}
+
+function renderAutoDialMonitor() {
+  const wrap = document.getElementById('autoDialMonitor');
+  if (!wrap) return;
+  const snap = autoDialSnapshot || {};
+  const activeCalls = snap.active_calls || [];
+
+  const activeHtml = activeCalls.length ? activeCalls.map(call => `
+    <div class="autodial-call-card">
+      <div class="autodial-call-head">
+        <span class="autodial-call-name">${escapeHtml(call.name || 'Unknown')}</span>
+        <span class="autodial-call-state">${escapeHtml(call.state || 'dialing')}</span>
+      </div>
+      <div class="autodial-call-phone">${escapeHtml(call.phone || '')}</div>
+      <div class="autodial-call-line ${call.last_speaker ? 'has-line' : ''}">
+        ${call.last_speaker ? `<b>${call.last_speaker === 'agent' ? 'Agent' : 'Lead'}:</b> ${escapeHtml(call.last_text || '')}` : 'Waiting for transcript...'}
+      </div>
+    </div>
+  `).join('') : '<div class="autodial-monitor-empty small">No active calls.</div>';
+
+  const eventsHtml = autoDialEvents.slice(0, 25).map(renderAutoDialEvent).join('') || '<div class="autodial-monitor-empty small">No events yet.</div>';
+  wrap.innerHTML = `
+    <div class="autodial-summary-row">
+      <span>Running: <b>${autoDialRunning ? 'Yes' : 'No'}</b></span>
+      <span>Active: <b>${snap.active || 0}</b></span>
+      <span>Queued: <b>${snap.queued || 0}</b></span>
+      <span>Done: <b>${snap.completed || 0}</b></span>
+      <span>Skipped: <b>${snap.skipped || 0}</b></span>
+      <span>Failed: <b>${snap.failed || 0}</b></span>
+    </div>
+    <div class="autodial-monitor-grid">
+      <div><div class="autodial-section-title">Active Calls</div><div class="autodial-active-list">${activeHtml}</div></div>
+      <div><div class="autodial-section-title">Recent Events</div><div class="autodial-event-list">${eventsHtml}</div></div>
+    </div>
+  `;
+}
+
+function renderAutoDialEvent(event) {
+  const label = event.type === 'call_event'
+    ? (event.event === 'transcript' ? (event.speaker === 'agent' ? 'Agent' : 'Lead') : 'Status')
+    : String(event.type || '').replace(/_/g, ' ');
+  const body = event.type === 'call_event'
+    ? (event.text || event.message || '')
+    : (event.message || event.status || event.outcome || event.error || '');
+  const recording = event.recording
+    ? `<audio controls preload="none" src="/recordings/${encodeURIComponent(event.recording)}" class="autodial-event-audio"></audio>`
+    : '';
+  return `
+    <div class="autodial-event">
+      <div class="autodial-event-head"><span>${escapeHtml(label)}</span><em>${escapeHtml(event.ts || '')}</em></div>
+      <div class="autodial-event-meta">${escapeHtml(event.name ? event.name + ' · ' : '')}${escapeHtml(event.phone || '')}</div>
+      <div class="autodial-event-body">${escapeHtml(body)}</div>
+      ${recording}
+    </div>
+  `;
 }
 
 // ── Injection ───────────────────────────────────────────────────────────────

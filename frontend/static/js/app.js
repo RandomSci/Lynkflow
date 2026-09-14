@@ -78,6 +78,16 @@ function renderNav() {
   dialerItem.addEventListener('click', () => { loadDialer(); closeSidebar(); });
   nav.appendChild(dialerItem);
 
+  const autoMonitorItem = document.createElement('div');
+  autoMonitorItem.className = 'nav-item';
+  autoMonitorItem.dataset.id = 'autodial';
+  autoMonitorItem.innerHTML = `<span class="nav-icon">⚡</span><span>Auto Monitor</span>`;
+  autoMonitorItem.addEventListener('click', () => {
+    if (typeof loadAutoDialMonitorPage === 'function') loadAutoDialMonitorPage();
+    closeSidebar();
+  });
+  nav.appendChild(autoMonitorItem);
+
   const analyticsItem = document.createElement('div');
   analyticsItem.className = 'nav-item';
   analyticsItem.dataset.id = 'analytics';

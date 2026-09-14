@@ -5,6 +5,7 @@ import json
 import os
 import hashlib
 import urllib.parse
+import time
 from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -45,6 +46,122 @@ _agent_handlers: dict = {}     # call_sid -> AgentCallHandler
 _REC_DIR = Path(__file__).parent / "recordings"
 _REC_DIR.mkdir(exist_ok=True)
 app.mount("/recordings", StaticFiles(directory=_REC_DIR), name="recordings")
+
+# ── Auto dialer state (in-memory per server process) ─────────────────────────
+_autodial_state = {
+    "running": False,
+    "concurrency": 1,
+    "base_url": "",
+    "queue": [],
+    "active": {},
+    "completed": 0,
+    "failed": 0,
+    "skipped": 0,
+    "started_at": None,
+    "task": None,
+    "events": [],
+}
+_autodial_listeners: set[asyncio.Queue] = set()
+_autodial_lock = asyncio.Lock()
+
+_AUTODIAL_ELIGIBLE_STATUSES = {"", "new", "retry", "queued"}
+
+
+def _phone_key(phone: str) -> str:
+    d = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    return d[-10:] if len(d) >= 10 else d
+
+
+def _format_us_phone(phone: str) -> str:
+    d = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if len(d) == 10:
+        return f"+1{d}"
+    if len(d) == 11 and d.startswith("1"):
+        return f"+{d}"
+    return str(phone or "").strip()
+
+
+def _is_autodial_eligible(lead: dict) -> bool:
+    if not _phone_key(lead.get("Phone", "")):
+        return False
+    status = str(lead.get("Status", "")).strip().lower()
+    return status in _AUTODIAL_ELIGIBLE_STATUSES
+
+
+def _autodial_snapshot() -> dict:
+    active = _autodial_state["active"]
+    return {
+        "running": _autodial_state["running"],
+        "concurrency": _autodial_state["concurrency"],
+        "queued": len(_autodial_state["queue"]),
+        "active": len(active),
+        "completed": _autodial_state["completed"],
+        "failed": _autodial_state["failed"],
+        "skipped": _autodial_state["skipped"],
+        "active_calls": [
+            {
+                "call_sid": sid,
+                "name": item.get("lead", {}).get("Name", ""),
+                "phone": item.get("phone", ""),
+                "state": item.get("state", "dialing"),
+                "last_speaker": item.get("last_speaker", ""),
+                "last_text": item.get("last_text", ""),
+                "updated_at": item.get("updated_at"),
+                "started_at": item.get("started_at"),
+            }
+            for sid, item in active.items()
+        ],
+    }
+
+
+async def _autodial_broadcast(event: dict):
+    event = {**event, "snapshot": _autodial_snapshot(), "ts": datetime.now().strftime("%H:%M:%S")}
+    _autodial_state["events"].append(event)
+    _autodial_state["events"] = _autodial_state["events"][-100:]
+    for q in list(_autodial_listeners):
+        try:
+            await q.put(event)
+        except Exception:
+            _autodial_listeners.discard(q)
+
+
+async def _autodial_note_call_event(call_sid: str, event: dict):
+    async with _autodial_lock:
+        item = _autodial_state["active"].get(call_sid)
+        if not item:
+            return
+
+        payload = {
+            "type": "call_event",
+            "call_sid": call_sid,
+            "name": item.get("lead", {}).get("Name", ""),
+            "phone": item.get("phone", ""),
+        }
+
+        if event.get("type") == "status":
+            item["state"] = event.get("state", "")
+            item["updated_at"] = time.time()
+            payload.update({
+                "event": "status",
+                "state": event.get("state", ""),
+                "message": event.get("message", ""),
+            })
+        elif event.get("type") in ("transcript", "transcript_final"):
+            text = (event.get("text") or "").strip()
+            if not text:
+                return
+            item["last_speaker"] = event.get("speaker", "")
+            item["last_text"] = text
+            item["updated_at"] = time.time()
+            payload.update({
+                "event": "transcript",
+                "speaker": event.get("speaker", ""),
+                "text": text,
+            })
+        else:
+            return
+
+    await _autodial_broadcast(payload)
 
 class TTSRequest(BaseModel):
     text: str
@@ -87,6 +204,119 @@ async def generate_tts(req: TTSRequest):
 
     audio_path.write_bytes(resp.content)
     return JSONResponse({"url": f"/static/audio/{cache_key}.mp3", "cached": False})
+
+
+async def _fetch_leads_from_sheet() -> list[dict]:
+    if not GOOGLE_SHEETS_API_KEY or not GOOGLE_SHEET_ID:
+        raise HTTPException(status_code=500, detail="Google Sheets credentials not set in .env")
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/Sheet1?key={GOOGLE_SHEETS_API_KEY}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Sheets error: {resp.text}")
+    data = resp.json()
+    rows = data.get("values", [])
+    if len(rows) < 2:
+        return []
+    headers = rows[0]
+    leads = []
+    for row in rows[1:]:
+        lead = {}
+        for i, h in enumerate(headers):
+            lead[h.strip()] = row[i].strip() if i < len(row) else ""
+        if lead.get("Phone"):
+            leads.append(lead)
+    return leads
+
+
+async def _update_lead_record(name: str, phone: str, status: str, notes: str = "", lead: dict | None = None) -> dict:
+    if not status:
+        raise HTTPException(status_code=400, detail="status required")
+
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lead = lead or {}
+
+    apps_script_url = os.getenv("GOOGLE_APPS_SCRIPT_URL")
+    if apps_script_url:
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                resp = await client.post(
+                    apps_script_url,
+                    json={"name": name, "phone": phone, "status": status,
+                          "notes": notes, "date": date_str},
+                )
+            result = resp.json()
+            if result.get("ok"):
+                return {"success": True, "method": "apps_script"}
+        except Exception as e:
+            print(f"Apps Script update failed ({e}), falling back to n8n")
+
+    webhook_payload = {
+        "name":   name,
+        "phone":  phone,
+        "status": status,
+        "notes":  notes,
+        "date":   date_str,
+        **lead,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://boil-refined-shingle.ngrok-free.dev/webhook/6ba4a9af-5e6c-43bd-84de-2cd6f3d59b8f",
+                json=webhook_payload,
+            )
+        return {"success": resp.status_code == 200, "method": "n8n_webhook"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def _start_agent_call(phone: str, lead: dict, base_url: str) -> str:
+    phone = _format_us_phone(phone)
+    base_url = (base_url or "").rstrip("/")
+
+    if not phone:
+        raise HTTPException(400, "phone required")
+    if not base_url:
+        raise HTTPException(400, "base_url required (your ngrok / production URL)")
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_CALLER_ID]):
+        raise HTTPException(500, "Twilio credentials not set in .env")
+
+    cfg = load_agent_config()
+    if cfg.base_url != base_url:
+        cfg.base_url = base_url
+        _save_agent_config(cfg)
+
+    lead_phone = urllib.parse.quote(phone)
+    lead_name  = urllib.parse.quote(lead.get("Name", ""))
+    lead_city  = urllib.parse.quote(lead.get("City", ""))
+    lead_cat   = urllib.parse.quote(lead.get("Category", ""))
+    twiml_url  = (
+        f"{base_url}/api/agent/twiml"
+        f"?phone={lead_phone}&name={lead_name}&city={lead_city}&category={lead_cat}"
+    )
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json",
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            data={
+                "To":   phone,
+                "From": TWILIO_CALLER_ID,
+                "Url":  twiml_url,
+                "StatusCallback": f"{base_url}/api/agent/call-status",
+                "StatusCallbackMethod": "POST",
+                "StatusCallbackEvent": ["initiated", "ringing", "answered", "completed"],
+                "Timeout": "30",
+            },
+        )
+
+    if r.status_code not in (200, 201):
+        raise HTTPException(502, f"Twilio error: {r.text}")
+
+    call_sid = r.json()["sid"]
+    _agent_queues[call_sid] = asyncio.Queue()
+    _agent_events[call_sid] = []
+    return call_sid
 
 
 @app.post("/api/update-lead")
@@ -139,47 +369,7 @@ async def update_lead(request: Request):
     notes  = data.get("notes", "")
     lead   = data.get("lead", {})   # full lead object from frontend
 
-    if not status:
-        raise HTTPException(status_code=400, detail="status required")
-
-    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    # ── Option 1: Google Apps Script (targeted cell update) ──────────────────
-    apps_script_url = os.getenv("GOOGLE_APPS_SCRIPT_URL")
-    if apps_script_url:
-        try:
-            async with httpx.AsyncClient(timeout=12) as client:
-                resp = await client.post(
-                    apps_script_url,
-                    json={"name": name, "phone": phone, "status": status,
-                          "notes": notes, "date": date_str},
-                )
-            result = resp.json()
-            if result.get("ok"):
-                return JSONResponse({"success": True, "method": "apps_script"})
-        except Exception as e:
-            print(f"Apps Script update failed ({e}), falling back to n8n")
-
-    # ── Option 2: n8n webhook — send FULL lead so n8n has all columns ────────
-    # Note: this only helps if your n8n workflow uses all fields for the row write.
-    # Fix your n8n workflow to use a "Find Row" + "Update Specific Cells" pattern.
-    webhook_payload = {
-        "name":   name,
-        "phone":  phone,
-        "status": status,
-        "notes":  notes,
-        "date":   date_str,
-        **lead,  # all original fields from the sheet row
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                "https://boil-refined-shingle.ngrok-free.dev/webhook/6ba4a9af-5e6c-43bd-84de-2cd6f3d59b8f",
-                json=webhook_payload,
-            )
-        return JSONResponse({"success": resp.status_code == 200, "method": "n8n_webhook"})
-    except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)})
+    return JSONResponse(await _update_lead_record(name, phone, status, notes, lead))
 
 
 @app.get("/api/twilio/token")
@@ -206,26 +396,7 @@ async def twiml_voice(request: Request):
 
 @app.get("/api/leads")
 async def get_leads():
-    if not GOOGLE_SHEETS_API_KEY or not GOOGLE_SHEET_ID:
-        raise HTTPException(status_code=500, detail="Google Sheets credentials not set in .env")
-    url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/Sheet1?key={GOOGLE_SHEETS_API_KEY}"
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Sheets error: {resp.text}")
-    data = resp.json()
-    rows = data.get("values", [])
-    if len(rows) < 2:
-        return JSONResponse([])
-    headers = rows[0]
-    leads = []
-    for row in rows[1:]:
-        lead = {}
-        for i, h in enumerate(headers):
-            lead[h.strip()] = row[i].strip() if i < len(row) else ""
-        if lead.get("Phone"):
-            leads.append(lead)
-    return JSONResponse(leads)
+    return JSONResponse(await _fetch_leads_from_sheet())
 
 
 @app.get("/api/modules")
@@ -880,52 +1051,207 @@ async def agent_initiate(request: Request):
     lead     = data.get("lead", {})
     base_url = data.get("base_url", "").rstrip("/")
 
-    if not phone:
-        raise HTTPException(400, "phone required")
-    if not base_url:
-        raise HTTPException(400, "base_url required (your ngrok / production URL)")
-    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_CALLER_ID]):
-        raise HTTPException(500, "Twilio credentials not set in .env")
-
-    # Persist base_url into config so TwiML callback knows it too
-    cfg = load_agent_config()
-    if cfg.base_url != base_url:
-        cfg.base_url = base_url
-        _save_agent_config(cfg)
-
-    # Build TwiML callback URL
-    lead_phone = urllib.parse.quote(phone)
-    lead_name  = urllib.parse.quote(lead.get("Name", ""))
-    lead_city  = urllib.parse.quote(lead.get("City", ""))
-    lead_cat   = urllib.parse.quote(lead.get("Category", ""))
-    twiml_url  = (
-        f"{base_url}/api/agent/twiml"
-        f"?phone={lead_phone}&name={lead_name}&city={lead_city}&category={lead_cat}"
-    )
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(
-            f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json",
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-            data={
-                "To":   phone,
-                "From": TWILIO_CALLER_ID,
-                "Url":  twiml_url,
-                "StatusCallback": f"{base_url}/api/agent/call-status",
-                "StatusCallbackMethod": "POST",
-                "StatusCallbackEvent": ["initiated", "ringing", "answered", "completed"],
-                "Timeout": "30",
-            },
-        )
-
-    if r.status_code not in (200, 201):
-        raise HTTPException(502, f"Twilio error: {r.text}")
-
-    call_sid = r.json()["sid"]
-    _agent_queues[call_sid] = asyncio.Queue()
-    _agent_events[call_sid] = []
-
+    call_sid = await _start_agent_call(phone, lead, base_url)
     return JSONResponse({"success": True, "call_sid": call_sid})
+
+
+def _status_from_outcome(outcome: str, call_status: str = "") -> str:
+    outcome = (outcome or "").lower()
+    call_status = (call_status or "").lower()
+    if outcome == "interested":
+        return "Interested"
+    if outcome in ("voicemail", "voicemail_left"):
+        return "Voicemail"
+    if outcome == "ivr":
+        return "Phone Tree"
+    if outcome == "not_interested":
+        return "Not Interested"
+    if outcome == "no_answer" or call_status == "no-answer":
+        return "No Answer"
+    if call_status == "busy":
+        return "Busy"
+    if call_status in ("failed", "canceled"):
+        return "Call Failed"
+    return "Called"
+
+
+async def _autodial_loop():
+    await _autodial_broadcast({"type": "started", "message": "Auto dialer started"})
+    seen = set()
+
+    try:
+        while True:
+            async with _autodial_lock:
+                running = _autodial_state["running"]
+                room = _autodial_state["concurrency"] - len(_autodial_state["active"])
+                done = not _autodial_state["queue"] and not _autodial_state["active"]
+                base_url = _autodial_state["base_url"]
+
+            if not running:
+                await _autodial_broadcast({"type": "stopped", "message": "Auto dialer stopped"})
+                break
+            if done:
+                async with _autodial_lock:
+                    _autodial_state["running"] = False
+                await _autodial_broadcast({"type": "completed", "message": "Auto dialer finished all eligible leads"})
+                break
+
+            launched = 0
+            while room > 0:
+                lead = None
+                async with _autodial_lock:
+                    while _autodial_state["queue"]:
+                        candidate = _autodial_state["queue"].pop(0)
+                        key = _phone_key(candidate.get("Phone", ""))
+                        if not key or key in seen or not _is_autodial_eligible(candidate):
+                            _autodial_state["skipped"] += 1
+                            continue
+                        if any(_phone_key(item.get("phone", "")) == key for item in _autodial_state["active"].values()):
+                            _autodial_state["skipped"] += 1
+                            continue
+                        seen.add(key)
+                        lead = candidate
+                        break
+
+                if not lead:
+                    break
+
+                phone = _format_us_phone(lead.get("Phone", ""))
+                try:
+                    call_sid = await _start_agent_call(phone, lead, base_url)
+                    async with _autodial_lock:
+                        _autodial_state["active"][call_sid] = {
+                            "lead": lead,
+                            "phone": phone,
+                            "started_at": time.time(),
+                        }
+                    await _update_lead_record(lead.get("Name", ""), phone, "Calling", "Auto dialer started call", lead)
+                    await _autodial_broadcast({
+                        "type": "call_started",
+                        "call_sid": call_sid,
+                        "name": lead.get("Name", ""),
+                        "phone": phone,
+                    })
+                    launched += 1
+                    room -= 1
+                    await asyncio.sleep(0.7)  # avoid bursting Twilio/API callbacks
+                except Exception as e:
+                    async with _autodial_lock:
+                        _autodial_state["failed"] += 1
+                    await _update_lead_record(lead.get("Name", ""), phone, "Call Failed", str(e), lead)
+                    await _autodial_broadcast({
+                        "type": "call_failed",
+                        "name": lead.get("Name", ""),
+                        "phone": phone,
+                        "error": str(e),
+                    })
+                    room -= 1
+
+            if not launched:
+                await asyncio.sleep(1)
+    finally:
+        async with _autodial_lock:
+            _autodial_state["task"] = None
+
+
+async def _autodial_finish_call(call_sid: str, outcome: str = "", call_status: str = "", recording: str = ""):
+    async with _autodial_lock:
+        item = _autodial_state["active"].pop(call_sid, None)
+        if not item:
+            return
+        _autodial_state["completed"] += 1
+
+    lead = item.get("lead", {})
+    phone = item.get("phone", lead.get("Phone", ""))
+    status = _status_from_outcome(outcome, call_status)
+    notes = f"Auto dial outcome: {outcome or call_status or 'completed'}"
+    if recording:
+        notes += f"; recording: {recording}"
+    result = await _update_lead_record(lead.get("Name", ""), phone, status, notes, lead)
+    await _autodial_broadcast({
+        "type": "call_finished",
+        "call_sid": call_sid,
+        "name": lead.get("Name", ""),
+        "phone": phone,
+        "status": status,
+        "outcome": outcome or call_status,
+        "recording": recording,
+        "update": result,
+    })
+
+
+@app.post("/api/agent/autodial/start")
+async def autodial_start(request: Request):
+    data = await request.json()
+    base_url = (data.get("base_url") or load_agent_config().base_url or "").rstrip("/")
+    concurrency = max(1, min(15, int(data.get("concurrency", 1))))
+    leads = await _fetch_leads_from_sheet()
+    eligible = [lead for lead in leads if _is_autodial_eligible(lead)]
+    skipped = len(leads) - len(eligible)
+
+    if not base_url:
+        raise HTTPException(400, "base_url required")
+    if not eligible:
+        raise HTTPException(400, "no eligible leads found (only blank/New/Retry/Queued statuses are called)")
+
+    async with _autodial_lock:
+        if _autodial_state["running"]:
+            return JSONResponse({"success": True, "already_running": True, **_autodial_snapshot()})
+
+        _autodial_state.update({
+            "running": True,
+            "concurrency": concurrency,
+            "base_url": base_url,
+            "queue": eligible,
+            "active": {},
+            "completed": 0,
+            "failed": 0,
+            "skipped": skipped,
+            "started_at": time.time(),
+            "events": [],
+        })
+        _autodial_state["task"] = asyncio.create_task(_autodial_loop())
+
+    return JSONResponse({"success": True, **_autodial_snapshot()})
+
+
+@app.post("/api/agent/autodial/stop")
+async def autodial_stop():
+    async with _autodial_lock:
+        _autodial_state["running"] = False
+        _autodial_state["queue"] = []
+    await _autodial_broadcast({"type": "stopping", "message": "Stopping after active calls finish"})
+    return JSONResponse({"success": True, **_autodial_snapshot()})
+
+
+@app.get("/api/agent/autodial/status")
+async def autodial_status():
+    return JSONResponse(_autodial_snapshot())
+
+
+@app.get("/api/agent/autodial/events")
+async def autodial_events():
+    async def stream():
+        q = asyncio.Queue()
+        _autodial_listeners.add(q)
+        try:
+            for evt in _autodial_state["events"][-25:]:
+                yield f"data: {json.dumps(evt)}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'snapshot': _autodial_snapshot()})}\n\n"
+            while True:
+                try:
+                    evt = await asyncio.wait_for(q.get(), timeout=30)
+                    yield f"data: {json.dumps(evt)}\n\n"
+                except asyncio.TimeoutError:
+                    yield "data: {\"type\":\"ping\"}\n\n"
+        finally:
+            _autodial_listeners.discard(q)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/agent/twiml")
@@ -996,6 +1322,8 @@ async def agent_call_status(request: Request):
         await _agent_queues[call_sid].put({
             "type": "status", "state": "ended", "message": f"Call {call_status}"
         })
+        if call_sid not in _agent_handlers:
+            await _autodial_finish_call(call_sid, call_status=call_status)
 
     return Response(content="", media_type="text/plain")
 
@@ -1068,6 +1396,9 @@ async def agent_stream(websocket: WebSocket):
                 if q:
                     await q.put(event)
 
+                if event.get("type") in ("status", "transcript", "transcript_final"):
+                    await _autodial_note_call_event(sid, event)
+
                 if handler._stop:
                     break
             except asyncio.TimeoutError:
@@ -1080,8 +1411,6 @@ async def agent_stream(websocket: WebSocket):
     try:
         await asyncio.gather(handler.run(), _relay_status())
     finally:
-        if handler.call_sid:
-            _agent_handlers.pop(handler.call_sid, None)
         try:
             from call_history import record_call
             snap = handler.metrics.snapshot()
@@ -1100,8 +1429,16 @@ async def agent_stream(websocket: WebSocket):
                 "cost":       snap["cost"],
                 "recording": getattr(handler, "recording_file", None),                
             })
+            await _autodial_finish_call(
+                handler.call_sid,
+                outcome=handler.outcome,
+                recording=getattr(handler, "recording_file", None) or "",
+            )
         except Exception as e:
             print(f"[HISTORY] failed: {e}")
+        finally:
+            if handler.call_sid:
+                _agent_handlers.pop(handler.call_sid, None)
 
 
 @app.get("/api/agent/events/{call_sid}")
