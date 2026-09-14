@@ -10,7 +10,7 @@ _CONFIG_FILE = Path(__file__).parent / "agent_config.json"
 
 
 DEFAULT_FIRST_MESSAGE = (
-    "Hi, am I reaching the owner or office manager of {business}?"
+    "Hi there, this is Anna. Am I speaking with the owner or office manager?"
 )
 
 DEFAULT_SYSTEM_PROMPT = """# ROLE

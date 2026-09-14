@@ -220,19 +220,7 @@ class AgentCallHandler:
             if self._stop or self._prospect_spoke or self._opening_started or self._machine_kind:
                 return
             print(f"[GREETING] treating as live receptionist: {text[:80]}")
-            self._ensure_conversation_context()
-            self._awaiting_response_since = None
-            self._last_turn = time.time()
-            self._nudges = 0
-            self._prospect_spoke = True
-            if self.outcome == "no_answer":
-                self.outcome = "conversation"
-            self._gatekeeper_mode = True
-            self._script_step = "done"
-            self.conversation.append({"role": "user", "content": text})
-            await self._send_agent_line(
-                "Hi, this is Anna with Lynkflow. Is the owner or office manager available?"
-            )
+            await self._respond_to_human_text(text)
         except asyncio.CancelledError:
             pass
 
@@ -556,6 +544,9 @@ class AgentCallHandler:
             )
             return
 
+        await self._respond_to_human_text(text)
+
+    async def _respond_to_human_text(self, text: str):
         self._ensure_conversation_context()
         self._awaiting_response_since = None
         self._last_turn = time.time()
@@ -565,19 +556,92 @@ class AgentCallHandler:
             self.outcome = "conversation"
 
         self.conversation.append({"role": "user", "content": text})
-
-        if self._gatekeeper_mode and await self._handle_gatekeeper_transcript(text):
-            return
-
-        if await self._maybe_scripted_opening_response(text):
-            return
-
-        if not self._decision_maker_confirmed:
-            if await self._handle_unconfirmed_transcript(text):
-                return
+        self._update_human_state_from_text(text)
 
         self._opening_started = True
-        response = await self._respond()
+        response = await self._respond_with_policy_note()
+
+        await self._handle_agent_response(response)
+
+    def _update_human_state_from_text(self, text: str):
+        if self._decision_maker_confirmed:
+            if self._script_step in ("owner_check", "done"):
+                self._script_step = "cold_call_permission"
+        elif self._confirms_owner(text):
+            self._decision_maker_confirmed = True
+            self._gatekeeper_mode = False
+            self._script_step = "cold_call_permission"
+        elif self._looks_like_gatekeeper(text) or self._denies_owner(text) or self._owner_unavailable(text):
+            self._gatekeeper_mode = True
+            self._script_step = "gatekeeper"
+
+        if self._awaiting_callback_time and self._has_callback_time_detail(text):
+            self.outcome = "callback"
+            self.followup_note = f"Callback requested: {text.strip()}"
+            tz = self._lead_timezone()
+            if tz:
+                self.followup_note += f" ({tz})"
+        elif self._requests_better_time(text):
+            self._awaiting_callback_time = True
+            if self._has_callback_time_detail(text):
+                self.outcome = "callback"
+                self.followup_note = f"Callback requested: {text.strip()}"
+                tz = self._lead_timezone()
+                if tz:
+                    self.followup_note += f" ({tz})"
+
+    def _human_policy_note(self) -> str:
+        if self._awaiting_callback_time:
+            tz = self._lead_timezone()
+            tz_note = f" The lead timezone is {tz}." if tz else ""
+            return (
+                "Runtime policy for this next reply: The person is asking for a callback or better time. "
+                "Do not pitch. If they gave enough day/time detail, confirm it briefly and end politely with [HANGUP]. "
+                "If they gave only a day, ask what time. If they gave only a vague time, ask what day and time."
+                + tz_note
+            )
+
+        if not self._decision_maker_confirmed:
+            return (
+                "Runtime policy for this next reply: A human is speaking, but decision-maker authority is not confirmed. "
+                "Answer their exact question first in normal language. If they ask whether this is recorded, automated, or AI, "
+                "be honest: it is an AI caller, not a prerecorded message. Do not say only 'got it'. Do not pitch. "
+                "After answering, ask one natural routing question to reach the owner/office manager or the person who handles customer calls."
+            )
+
+        if self._script_step == "cold_call_permission":
+            return (
+                "Runtime policy for this next reply: This is a confirmed owner/decision-maker. "
+                "Do not pitch yet unless they already allowed it. If they ask a question, answer it first. "
+                "Otherwise ask the honest cold-call permission question in a natural way: this is a cold call, you have something quick to pitch, "
+                "and they can either hang up or give you 30 seconds then decide."
+            )
+
+        if self._script_step == "post_pitch":
+            return (
+                "Runtime policy for this next reply: The short pitch was given. Respond to what they said. "
+                "If interested, book a real-person demo/callback. If not interested, end politely."
+            )
+
+        return (
+            "Runtime policy for this next reply: Respond conversationally to the human's exact words. "
+            "Stay brief, ask one question at a time, never restart the call, and never repeat a prior line."
+        )
+
+    async def _respond_with_policy_note(self) -> Optional[str]:
+        note = {"role": "system", "content": self._human_policy_note()}
+        self.conversation.append(note)
+        try:
+            return await self._respond()
+        finally:
+            try:
+                self.conversation.remove(note)
+            except ValueError:
+                pass
+
+    async def _handle_agent_response(self, response: Optional[str]):
+        if not response:
+            return
 
         # Record latency for this turn
         if self._t_stt_done and self._t_llm_first and self._t_tts_first:
@@ -590,14 +654,15 @@ class AgentCallHandler:
             self._t_llm_first = 0.0
             self._t_tts_first = 0.0
 
-        if not response:
-            return
-
         clean = response.replace("[HANGUP]", "").strip()
         if clean:
             self.conversation.append({"role": "assistant", "content": clean})
 
         low = clean.lower()
+        if "this is a cold call" in low or "30 seconds" in low:
+            self._script_step = "cold_call_permission"
+        if any(k in low for k in ("quick version", "10-minute demo", "real person be worth")):
+            self._script_step = "post_pitch"
         # Classify interest from what the agent asked for
         if any(k in low for k in ("what day works", "callback", "spell that",
                                   "best number to reach", "our team will reach out")):
@@ -632,10 +697,13 @@ class AgentCallHandler:
             "how may i help", "how can i help", "how may we help", "how can we help",
             "how may i assist", "how can i assist", "can i help", "may i help",
             "how can i direct", "how may i direct", "what can i get you",
-            "what can i help", "how can i get you", "this is", "speaking with",
+            "what can i help", "how can i get you", "speaking with",
         )):
             return True
-        return bool(re.search(r"\b(great|good) day at\b", low))
+        return bool(
+            re.search(r"\b(great|good) day at\b", low)
+            or re.search(r"\bthis is\s+[a-z][a-z]+\b", low)
+        )
 
     def _confirms_owner(self, text: str) -> bool:
         low = text.lower().strip(" .,?!")
@@ -813,7 +881,7 @@ class AgentCallHandler:
             return "permission"
         if "quick version" in low or "10-minute demo" in low or "real person be worth seeing" in low:
             return "pitch"
-        if low.startswith("hi, this is anna"):
+        if low.startswith("hi, this is anna") or low.startswith("hi there"):
             return "intro"
         return ""
 
@@ -882,7 +950,7 @@ class AgentCallHandler:
             self._gatekeeper_mode = True
             line = "No problem. Is the owner or office manager available?"
             if not self._opening_started:
-                line = "Hi, this is Anna with Lynkflow. Is the owner or office manager available?"
+                line = "Hi there, this is Anna. Is the owner or office manager available?"
             await self._send_agent_line(
                 line
             )
@@ -890,7 +958,7 @@ class AgentCallHandler:
 
         if self._asks_agent_identity(text):
             await self._send_agent_line(
-                "This is Anna with Lynkflow. I was trying to reach whoever handles customer calls for the business. Is that you?"
+                "My name is Anna. I'm calling with Lynkflow about customer calls for the business. Are you the person who handles that?"
             )
             return True
 
@@ -902,12 +970,12 @@ class AgentCallHandler:
 
         if self._is_ambiguous_greeting(text):
             await self._send_agent_line(
-                "Hi, this is Anna with Lynkflow. Are you the owner or office manager?"
+                "Hi there, this is Anna. Am I speaking with the owner or office manager?"
             )
             return True
 
         await self._send_agent_line(
-            "Hi, this is Anna with Lynkflow. Are you the owner or the person who handles customer calls?"
+            "Hi there, this is Anna. Am I speaking with the owner or the person who handles customer calls?"
         )
         return True
 
@@ -1037,7 +1105,9 @@ class AgentCallHandler:
         low = text.lower()
         return any(k in low for k in (
             "your name", "who are you", "who's calling", "who is calling",
-            "company name", "where are you calling from", "number for callback",
+            "who is this", "who's this", "who am i speaking with",
+            "company name", "what company", "which company",
+            "where are you calling from", "number for callback",
         ))
 
     async def _handle_gatekeeper_transcript(self, text: str) -> bool:
@@ -1078,7 +1148,7 @@ class AgentCallHandler:
 
         if self._asks_if_ai(text):
             await self._send_agent_line(
-                "Yes, I'm an AI caller from Lynkflow. I was just trying to reach the owner or office manager. Are they available?"
+                "Yes, I'm an AI caller with Lynkflow. I was trying to reach the owner or office manager. Are they available?"
             )
             return True
 
@@ -1091,7 +1161,7 @@ class AgentCallHandler:
         if self._asks_agent_identity(text):
             cb = self._callback_number() or "the number I called from"
             await self._send_agent_line(
-                f"My name is Anna with Lynkflow, and the best callback is {cb}. What's the best way to reach the owner or office manager directly?"
+                f"My name is Anna, calling with Lynkflow. The best callback is {cb}. What's the best way to reach the owner or office manager directly?"
             )
             self._gatekeeper_contact_asked = True
             return True
@@ -1136,7 +1206,7 @@ class AgentCallHandler:
             norm = re.sub(r"\s+", " ", clean.lower().strip(" .,?!"))
             last = self._last_agent_line
             family = self._agent_line_family(clean)
-            repeated_intro = norm.startswith("hi, this is anna") and last.startswith("hi, this is anna")
+            repeated_intro = family == "intro" and self._last_agent_family == "intro"
             repeated_family = family and family == self._last_agent_family
             if (norm == last or repeated_intro or repeated_family) and (now - self._last_agent_line_at) < 12:
                 if repeated_intro and last != "sorry, i may have cut in there is the owner or office manager available":
