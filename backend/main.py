@@ -1,11 +1,16 @@
 from dotenv import load_dotenv
 load_dotenv()
 import asyncio
+import base64
 import json
 import os
 import hashlib
 import urllib.parse
 import time
+import uuid
+import re
+import wave
+import audioop
 from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -14,15 +19,19 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Res
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
+import websockets
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse, Dial
 from agent_config import AgentConfig, load_agent_config, save_agent_config as _save_agent_config
 from agent_ws import AgentCallHandler
+from agent_live_ws import GPTLiveCallHandler
 
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+SIM_LEAD_VOICE_ID = os.getenv("SIM_LEAD_VOICE_ID", "TxGEqnHWrfWFTfGW9XjX")
 AUDIO_CACHE_DIR = Path(__file__).parent.parent / "frontend" / "static" / "audio"
 AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -60,6 +69,9 @@ _autodial_state = {
     "started_at": None,
     "task": None,
     "events": [],
+    "test_mode": False,
+    "sim_scenario": "mixed",
+    "sim_endpoint": "",
 }
 _autodial_listeners: set[asyncio.Queue] = set()
 _autodial_lock = asyncio.Lock()
@@ -101,6 +113,8 @@ def _autodial_snapshot() -> dict:
     return {
         "running": _autodial_state["running"],
         "concurrency": _autodial_state["concurrency"],
+        "test_mode": _autodial_state.get("test_mode", False),
+        "sim_scenario": _autodial_state.get("sim_scenario", "mixed"),
         "queued": len(_autodial_state["queue"]),
         "active": len(active),
         "completed": _autodial_state["completed"],
@@ -111,6 +125,7 @@ def _autodial_snapshot() -> dict:
                 "call_sid": sid,
                 "name": item.get("lead", {}).get("Name", ""),
                 "phone": item.get("phone", ""),
+                "mode": item.get("mode", "live"),
                 "state": item.get("state", "dialing"),
                 "last_speaker": item.get("last_speaker", ""),
                 "last_text": item.get("last_text", ""),
@@ -276,6 +291,37 @@ async def _update_lead_record(name: str, phone: str, status: str, notes: str = "
         return {"success": resp.status_code == 200, "method": "n8n_webhook"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+async def _fetch_twilio_call_price(call_sid: str) -> float | None:
+    if not call_sid or not TWILIO_ACCOUNT_SID:
+        return None
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{call_sid}.json",
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+        )
+    if resp.status_code != 200:
+        return None
+    price = resp.json().get("price")
+    if price in (None, ""):
+        return None
+    return abs(float(price))
+
+
+async def _store_twilio_actual_price(call_sid: str):
+    for delay in (3, 6, 10, 20):
+        await asyncio.sleep(delay)
+        try:
+            price = await _fetch_twilio_call_price(call_sid)
+            if price is None:
+                continue
+            from call_history import update_twilio_price
+            if update_twilio_price(call_sid, price):
+                print(f"[TWILIO PRICE] stored actual price for {call_sid}: {price}")
+            return
+        except Exception as e:
+            print(f"[TWILIO PRICE] fetch failed for {call_sid}: {e}")
 
 
 async def _start_agent_call(phone: str, lead: dict, base_url: str) -> str:
@@ -1087,6 +1133,420 @@ def _status_from_outcome(outcome: str, call_status: str = "") -> str:
     return "Called"
 
 
+def _sim_initial_utterances(lead: dict, scenario: str) -> list[str]:
+    business = lead.get("Name") or "the business"
+    scenario = (scenario or "mixed").lower()
+    if scenario == "owner_skeptical":
+        return ["Hello, this is the owner."]
+    if scenario == "owner_busy":
+        return ["Hello, this is Mike, I'm the owner but I'm pretty busy."]
+    if scenario == "recorded_message":
+        return [
+            "This call may be recorded for quality assurance purposes.",
+            f"Thank you for calling {business}, this is Pam, how may I help you?",
+        ]
+    if scenario == "callback":
+        return [f"Thank you for calling {business}, this is Jenny, how can I help you?"]
+    if scenario == "not_interested":
+        return ["Hello, this is the owner."]
+    return [f"Thank you for calling {business}, this is Pam, how may I help you?"]
+
+
+def _default_sim_leads(limit: int) -> list[dict]:
+    names = [
+        "Mother Modern Plumbing, Sewer & Drain",
+        "Blair Norris Plumbing",
+        "Carlisle Plumbing",
+        "Zoom Drain",
+        "Advanced Restoration Solutions",
+        "NuFlow Indy",
+        "RESTORM",
+        "B N C Plumbing Company",
+        "McDougalle Water Sewer Services",
+        "AAA Acme Plumbing",
+    ]
+    leads = []
+    for i in range(max(1, limit)):
+        name = names[i % len(names)]
+        if i >= len(names):
+            name = f"{name} Test {i + 1}"
+        leads.append({
+            "Name": name,
+            "Phone": f"+15550100{i:03d}",
+            "City": "Test City",
+            "State": "IN",
+            "Category": "Plumber",
+            "Timezone": "Eastern",
+            "Status": "Queued",
+            "Notes": "Generated GPT lead test record; no real phone call.",
+        })
+    return leads
+
+
+def _sim_lead_prompt(lead: dict, scenario: str) -> str:
+    business = lead.get("Name") or "the business"
+    category = lead.get("Category") or "service business"
+    timezone = _lead_timezone(lead) or "local time"
+    scenario_notes = {
+        "mixed": "Act as a realistic receptionist first. Ask who is calling or what it is about. Do not be overly helpful.",
+        "owner_skeptical": "Act as a skeptical owner. Ask if this is AI or a recorded message, then decide if the caller earns 30 seconds.",
+        "owner_busy": "Act as a busy owner. If the caller is respectful, offer a better callback time.",
+        "recorded_message": "Act as a receptionist who is suspicious that the caller is a recording or AI.",
+        "callback": "Act as a receptionist who cannot transfer but can offer a callback time tomorrow morning.",
+        "not_interested": "Act as an owner who is not interested and wants the call to end politely.",
+    }
+    return f"""
+You are a simulated phone lead for QA testing an outbound AI caller.
+Business: {business}
+Category: {category}
+Timezone: {timezone}
+Scenario: {scenario_notes.get((scenario or 'mixed').lower(), scenario_notes['mixed'])}
+
+Rules:
+- Reply as the lead only. Do not explain your reasoning.
+- Keep replies short and natural for a phone call: usually 3-15 words.
+- You may interrupt, be confused, ask who is calling, ask whether this is AI, ask whether it is recorded, say the owner is unavailable, ask for a callback, or say no.
+- Do not be too cooperative. Behave like a real business phone answerer.
+- If the caller says goodbye or clearly ends the call, return done=true.
+
+Return strict JSON only: {{"text":"lead reply", "done":false, "outcome":"conversation"}}
+""".strip()
+
+
+async def _openai_chat_json(messages: list[dict], model: str = "gpt-4o-mini", max_tokens: int = 120) -> dict:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": 0.65,
+                "max_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+            },
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI simulator error: {resp.text}")
+    content = resp.json()["choices"][0]["message"].get("content", "{}")
+    try:
+        return json.loads(content)
+    except Exception:
+        return {"text": content.strip(), "done": False, "outcome": "conversation"}
+
+
+async def _simulated_lead_reply(lead: dict, scenario: str, history: list[dict], endpoint: str = "") -> dict:
+    payload = {"lead": lead, "scenario": scenario, "history": history}
+    if endpoint:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post(endpoint, json=payload)
+        if resp.status_code != 200:
+            raise RuntimeError(f"sim endpoint error: {resp.status_code} {resp.text}")
+        data = resp.json()
+        return {
+            "text": str(data.get("text") or data.get("reply") or "").strip(),
+            "done": bool(data.get("done", False)),
+            "outcome": data.get("outcome", "conversation"),
+        }
+
+    messages = [{"role": "system", "content": _sim_lead_prompt(lead, scenario)}]
+    for item in history[-16:]:
+        role = "assistant" if item.get("speaker") == "lead" else "user"
+        messages.append({"role": role, "content": item.get("text", "")})
+    data = await _openai_chat_json(messages)
+    text = str(data.get("text") or data.get("reply") or "").strip()
+    return {"text": text, "done": bool(data.get("done", False)), "outcome": data.get("outcome", "conversation")}
+
+
+async def _sim_agent_text_response(handler: AgentCallHandler) -> str | None:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": handler.cfg.model,
+                "messages": handler.conversation,
+                "temperature": handler.cfg.temperature,
+                "max_tokens": handler.cfg.max_tokens,
+            },
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI agent test error: {resp.text}")
+    text = resp.json()["choices"][0]["message"].get("content", "").strip()
+    clean = text.replace("[HANGUP]", "").strip()
+    if clean:
+        await handler.status_queue.put({
+            "type": "transcript_final", "speaker": "agent", "text": clean,
+            "ts": datetime.now().strftime("%H:%M:%S"),
+        })
+    handler.metrics.tokens_in += sum(len(m.get("content", "")) for m in handler.conversation) // 4
+    handler.metrics.tokens_out += len(text) // 4
+    return text or None
+
+
+async def _drain_sim_events(call_sid: str, queue: asyncio.Queue) -> str:
+    last_agent = ""
+    while True:
+        try:
+            event = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if event.get("type") in ("status", "transcript", "transcript_final"):
+            await _autodial_note_call_event(call_sid, event)
+        if event.get("type") in ("transcript", "transcript_final") and event.get("speaker") == "agent":
+            last_agent = event.get("text", "")
+    return last_agent
+
+
+def _save_sim_transcript(lead: dict, phone: str, call_sid: str, scenario: str, history: list[dict], outcome: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_. -]+", "", lead.get("Name") or "GPT Lead Test").strip()
+    name = re.sub(r"\s+", " ", name)[:42] or "GPT Lead Test"
+    suffix = call_sid[-6:] if call_sid else uuid.uuid4().hex[:6]
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}_{suffix}_sim.txt"
+    path = _REC_DIR / filename
+    lines = [
+        "GPT Lead Test Transcript",
+        f"Business: {lead.get('Name', '')}",
+        f"Phone: {phone}",
+        f"Scenario: {scenario}",
+        f"Outcome: {outcome}",
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        "",
+    ]
+    for item in history:
+        speaker = "Lead" if item.get("speaker") == "lead" else "Agent"
+        lines.append(f"{speaker}: {item.get('text', '')}")
+    path.write_text("\n".join(lines) + "\n")
+    return filename
+
+
+async def _elevenlabs_ulaw_tts(text: str, voice_id: str, cfg: AgentConfig) -> bytes:
+    if not ELEVENLABS_API_KEY:
+        return b""
+    text = (text or "").strip()
+    if not text:
+        return b""
+
+    ws_url = (
+        f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input"
+        f"?model_id=eleven_flash_v2_5&output_format=ulaw_8000&auto_mode=true"
+    )
+    tts_ws = None
+    audio = bytearray()
+    try:
+        headers = {"xi-api-key": ELEVENLABS_API_KEY}
+        try:
+            tts_ws = await websockets.connect(ws_url, additional_headers=headers)
+        except TypeError:
+            tts_ws = await websockets.connect(ws_url, extra_headers=headers)
+
+        await tts_ws.send(json.dumps({
+            "text": " ",
+            "voice_settings": {
+                "stability": getattr(cfg, "stability", 0.55),
+                "similarity_boost": getattr(cfg, "similarity_boost", 0.75),
+                "style": getattr(cfg, "style", 0.05),
+                "speed": getattr(cfg, "speaking_rate", 1.0),
+            },
+        }))
+        await tts_ws.send(json.dumps({"text": text}))
+        await tts_ws.send(json.dumps({"text": ""}))
+
+        async for raw in tts_ws:
+            msg = json.loads(raw)
+            if msg.get("audio"):
+                audio.extend(base64.b64decode(msg["audio"]))
+            if msg.get("isFinal"):
+                break
+    except Exception as e:
+        print(f"[SIM TTS] failed for {voice_id}: {e}")
+        return b""
+    finally:
+        if tts_ws:
+            try:
+                await tts_ws.close()
+            except Exception:
+                pass
+    return bytes(audio)
+
+
+def _sim_recording_filename(lead: dict, call_sid: str, ext: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_. -]+", "", lead.get("Name") or "GPT Lead Test").strip()
+    name = re.sub(r"\s+", " ", name)[:42] or "GPT Lead Test"
+    suffix = call_sid[-6:] if call_sid else uuid.uuid4().hex[:6]
+    return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}_{suffix}_sim.{ext}"
+
+
+async def _save_sim_audio_recording(lead: dict, call_sid: str, history: list[dict], cfg: AgentConfig) -> str:
+    if not ELEVENLABS_API_KEY:
+        return ""
+
+    filename = _sim_recording_filename(lead, call_sid, "wav")
+    path = _REC_DIR / filename
+    pcm = bytearray()
+    silence = b"\x00\x00" * int(8000 * 0.35)
+
+    for item in history:
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        voice_id = getattr(cfg, "voice_id", ELEVENLABS_VOICE_ID) if item.get("speaker") == "agent" else SIM_LEAD_VOICE_ID
+        ulaw = await _elevenlabs_ulaw_tts(text, voice_id, cfg)
+        if not ulaw:
+            continue
+        pcm.extend(audioop.ulaw2lin(ulaw, 2))
+        pcm.extend(silence)
+
+    if not pcm:
+        return ""
+
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(8000)
+        wav.writeframes(bytes(pcm))
+    return filename
+
+
+async def _finish_sim_call(call_sid: str, outcome: str, message: str = "", recording: str = ""):
+    async with _autodial_lock:
+        item = _autodial_state["active"].pop(call_sid, None)
+        if not item:
+            return
+        _autodial_state["completed"] += 1
+    lead = item.get("lead", {})
+    await _autodial_broadcast({
+        "type": "call_finished",
+        "call_sid": call_sid,
+        "name": lead.get("Name", ""),
+        "phone": item.get("phone", ""),
+        "status": "Tested",
+        "outcome": outcome,
+        "recording": recording,
+        "message": message or "GPT lead simulation finished; no real call placed and sheet not updated",
+        "update": {"success": True, "method": "test_mode_no_sheet_update"},
+    })
+
+
+async def _run_simulated_agent_call(call_sid: str, lead: dict, phone: str, scenario: str, endpoint: str):
+    cfg = load_agent_config()
+    status_queue = asyncio.Queue()
+    handler = AgentCallHandler(twilio_ws=None, cfg=cfg, lead_info=lead, status_queue=status_queue)
+    handler.call_sid = call_sid
+    handler.stream_sid = call_sid
+
+    async def no_audio(_text: str, _seq: int):
+        return None
+
+    async def sim_hangup():
+        handler._stop = True
+
+    handler._speak_chunk = no_audio
+    handler._respond = lambda: _sim_agent_text_response(handler)
+    handler._hangup = sim_hangup
+
+    history: list[dict] = []
+    outcome = "conversation"
+    try:
+        await status_queue.put({"type": "status", "state": "active", "message": f"GPT lead test: {scenario}"})
+        await _drain_sim_events(call_sid, status_queue)
+
+        openings = _sim_initial_utterances(lead, scenario)
+        lead_text = openings.pop(0) if openings else "Hello?"
+        for _turn in range(14):
+            if not lead_text:
+                break
+            history.append({"speaker": "lead", "text": lead_text})
+            await status_queue.put({
+                "type": "transcript_final", "speaker": "prospect", "text": lead_text,
+                "ts": datetime.now().strftime("%H:%M:%S"),
+            })
+            await handler._handle_transcript(lead_text)
+            last_agent = await _drain_sim_events(call_sid, status_queue)
+            if last_agent:
+                history.append({"speaker": "agent", "text": last_agent})
+            if handler._stop:
+                break
+            if not last_agent and openings:
+                lead_text = openings.pop(0)
+                await asyncio.sleep(0.4)
+                continue
+            if not last_agent:
+                break
+            reply = await _simulated_lead_reply(lead, scenario, history, endpoint)
+            lead_text = reply.get("text", "")
+            outcome = reply.get("outcome") or outcome
+            if reply.get("done"):
+                if lead_text:
+                    history.append({"speaker": "lead", "text": lead_text})
+                    await status_queue.put({
+                        "type": "transcript_final", "speaker": "prospect", "text": lead_text,
+                        "ts": datetime.now().strftime("%H:%M:%S"),
+                    })
+                    await handler._handle_transcript(lead_text)
+                    last_agent = await _drain_sim_events(call_sid, status_queue)
+                    if last_agent:
+                        history.append({"speaker": "agent", "text": last_agent})
+                break
+            await asyncio.sleep(0.4)
+        final_outcome = handler.outcome if handler.outcome != "no_answer" else outcome
+        transcript_file = _save_sim_transcript(lead, phone, call_sid, scenario, history, final_outcome)
+        audio_file = await _save_sim_audio_recording(lead, call_sid, history, cfg)
+        recording = audio_file or transcript_file
+        try:
+            from call_history import record_call
+            handler.metrics.ended = time.time()
+            snap = handler.metrics.snapshot()
+            duration_s = round(max(0.1, handler.metrics.ended - handler.metrics.started), 1)
+            llm_cost = snap.get("cost", {}).get("llm", 0.0)
+            record_call({
+                "call_sid": call_sid,
+                "business": lead.get("Name", ""),
+                "phone": phone,
+                "city": lead.get("City", ""),
+                "category": lead.get("Category", ""),
+                "answered": bool(history),
+                "outcome": final_outcome,
+                "turns": sum(1 for item in history if item.get("speaker") == "agent"),
+                "interrupts": 0,
+                "duration_s": duration_s,
+                "latency": snap.get("latency", {}),
+                "cost": {
+                    "twilio": 0.0,
+                    "stt": 0.0,
+                    "llm": llm_cost,
+                    "tts": 0.0,
+                    "total": llm_cost,
+                    "per_min": round(llm_cost / (duration_s / 60), 4) if duration_s else 0.0,
+                    "duration_min": round(duration_s / 60, 3),
+                    "duration_s": duration_s,
+                },
+                "recording": recording,
+                "transcript_file": transcript_file,
+                "test_mode": True,
+                "sim_scenario": scenario,
+            })
+        except Exception as e:
+            print(f"[SIM HISTORY] failed: {e}")
+        await _finish_sim_call(call_sid, final_outcome, recording=recording)
+    except Exception as e:
+        async with _autodial_lock:
+            _autodial_state["active"].pop(call_sid, None)
+            _autodial_state["failed"] += 1
+        await _autodial_broadcast({
+            "type": "call_failed",
+            "call_sid": call_sid,
+            "name": lead.get("Name", ""),
+            "phone": phone,
+            "error": str(e),
+            "message": "GPT lead simulation failed",
+        })
+
+
 async def _autodial_loop():
     await _autodial_broadcast({"type": "started", "message": "Auto dialer started"})
     seen = set()
@@ -1098,6 +1558,9 @@ async def _autodial_loop():
                 room = _autodial_state["concurrency"] - len(_autodial_state["active"])
                 done = not _autodial_state["queue"] and not _autodial_state["active"]
                 base_url = _autodial_state["base_url"]
+                test_mode = _autodial_state.get("test_mode", False)
+                sim_scenario = _autodial_state.get("sim_scenario", "mixed")
+                sim_endpoint = _autodial_state.get("sim_endpoint", "")
 
             if not running:
                 await _autodial_broadcast({"type": "stopped", "message": "Auto dialer stopped"})
@@ -1130,27 +1593,42 @@ async def _autodial_loop():
 
                 phone = _format_us_phone(lead.get("Phone", ""))
                 try:
-                    call_sid = await _start_agent_call(phone, lead, base_url)
-                    async with _autodial_lock:
-                        _autodial_state["active"][call_sid] = {
-                            "lead": lead,
-                            "phone": phone,
-                            "started_at": time.time(),
-                        }
-                    await _update_lead_record(lead.get("Name", ""), phone, "Calling", "Auto dialer started call", lead)
+                    if test_mode:
+                        call_sid = f"SIM{uuid.uuid4().hex[:24]}"
+                        async with _autodial_lock:
+                            _autodial_state["active"][call_sid] = {
+                                "lead": lead,
+                                "phone": phone,
+                                "mode": "test",
+                                "state": "testing",
+                                "started_at": time.time(),
+                            }
+                        asyncio.create_task(_run_simulated_agent_call(call_sid, lead, phone, sim_scenario, sim_endpoint))
+                    else:
+                        call_sid = await _start_agent_call(phone, lead, base_url)
+                        async with _autodial_lock:
+                            _autodial_state["active"][call_sid] = {
+                                "lead": lead,
+                                "phone": phone,
+                                "started_at": time.time(),
+                            }
+                        await _update_lead_record(lead.get("Name", ""), phone, "Calling", "Auto dialer started call", lead)
                     await _autodial_broadcast({
                         "type": "call_started",
                         "call_sid": call_sid,
                         "name": lead.get("Name", ""),
                         "phone": phone,
+                        "mode": "test" if test_mode else "live",
+                        "message": "GPT lead simulation started" if test_mode else "Auto dialer started call",
                     })
                     launched += 1
                     room -= 1
-                    await asyncio.sleep(0.7)  # avoid bursting Twilio/API callbacks
+                    await asyncio.sleep(0.2 if test_mode else 0.7)  # avoid bursting Twilio/API callbacks
                 except Exception as e:
                     async with _autodial_lock:
                         _autodial_state["failed"] += 1
-                    await _update_lead_record(lead.get("Name", ""), phone, "Call Failed", str(e), lead)
+                    if not test_mode:
+                        await _update_lead_record(lead.get("Name", ""), phone, "Call Failed", str(e), lead)
                     await _autodial_broadcast({
                         "type": "call_failed",
                         "name": lead.get("Name", ""),
@@ -1199,11 +1677,31 @@ async def autodial_start(request: Request):
     data = await request.json()
     base_url = (data.get("base_url") or load_agent_config().base_url or "").rstrip("/")
     concurrency = max(1, min(15, int(data.get("concurrency", 1))))
-    leads = await _fetch_leads_from_sheet()
-    eligible = [lead for lead in leads if _is_autodial_eligible(lead)]
-    skipped = len(leads) - len(eligible)
+    test_mode = bool(data.get("test_mode", False))
+    sim_scenario = str(data.get("sim_scenario") or "mixed").strip() or "mixed"
+    sim_endpoint = str(data.get("sim_endpoint") or "").strip()
+    test_limit = max(1, min(25, int(data.get("test_limit") or 5)))
 
-    if not base_url:
+    if test_mode:
+        leads = _default_sim_leads(test_limit)
+        eligible = leads
+        skipped = 0
+    else:
+        try:
+            leads = await _fetch_leads_from_sheet()
+            eligible = [lead for lead in leads if _is_autodial_eligible(lead)]
+            skipped = len(leads) - len(eligible)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"Could not load leads from Google Sheets: {e}")
+
+    if test_mode:
+        if not OPENAI_API_KEY:
+            raise HTTPException(500, "OPENAI_API_KEY not set for GPT lead test mode")
+        eligible = eligible[:test_limit]
+        skipped = max(0, len(leads) - len(eligible)) if leads else 0
+    elif not base_url:
         raise HTTPException(400, "base_url required")
     if not eligible:
         raise HTTPException(400, "no eligible leads found (only blank/New/Retry/Queued statuses are called)")
@@ -1223,6 +1721,9 @@ async def autodial_start(request: Request):
             "skipped": skipped,
             "started_at": time.time(),
             "events": [],
+            "test_mode": test_mode,
+            "sim_scenario": sim_scenario,
+            "sim_endpoint": sim_endpoint,
         })
         _autodial_state["task"] = asyncio.create_task(_autodial_loop())
 
@@ -1236,6 +1737,16 @@ async def autodial_stop():
         _autodial_state["queue"] = []
     await _autodial_broadcast({"type": "stopping", "message": "Stopping after active calls finish"})
     return JSONResponse({"success": True, **_autodial_snapshot()})
+
+
+@app.post("/api/agent/simulated-lead/respond")
+async def simulated_lead_respond(request: Request):
+    """Custom endpoint contract for test-mode lead simulators."""
+    data = await request.json()
+    lead = data.get("lead") or {}
+    scenario = str(data.get("scenario") or "mixed")
+    history = data.get("history") or []
+    return JSONResponse(await _simulated_lead_reply(lead, scenario, history, endpoint=""))
 
 
 @app.get("/api/agent/autodial/status")
@@ -1380,7 +1891,8 @@ async def agent_stream(websocket: WebSocket):
     cfg          = load_agent_config()
     status_queue = asyncio.Queue()
 
-    handler = AgentCallHandler(
+    Handler = GPTLiveCallHandler if getattr(cfg, "voice_engine", "gpt_live") == "gpt_live" else AgentCallHandler
+    handler = Handler(
         twilio_ws    = websocket,
         cfg          = cfg,
         lead_info    = lead_info,
@@ -1436,6 +1948,9 @@ async def agent_stream(websocket: WebSocket):
                 "phone":      handler.lead_info.get("Phone", ""),
                 "city":       handler.lead_info.get("City", ""),
                 "category":   handler.lead_info.get("Category", ""),
+                "voice_engine": getattr(cfg, "voice_engine", "gpt_live"),
+                "live_model": getattr(cfg, "live_model", "gpt-live-1"),
+                "live_voice": getattr(cfg, "live_voice", "gleam"),
                 "answered":   handler.metrics.turns > 0,
                 "outcome":    handler.outcome,
                 "turns":      snap["turns"],
@@ -1443,9 +1958,12 @@ async def agent_stream(websocket: WebSocket):
                 "duration_s": snap["cost"]["duration_s"],
                 "latency":    snap["latency"],
                 "cost":       snap["cost"],
+                "live_seconds": snap.get("live_seconds", 0.0),
+                "live_usage_source": snap.get("live_usage_source", "none"),
                 "recording": getattr(handler, "recording_file", None),
                 "followup_note": getattr(handler, "followup_note", ""),
             })
+            asyncio.create_task(_store_twilio_actual_price(handler.call_sid))
             await _autodial_finish_call(
                 handler.call_sid,
                 outcome=handler.outcome,
@@ -1534,29 +2052,48 @@ async def agent_metrics_info():
     """Static reference card data + presets for the metrics panel."""
     from metrics import COMPONENT_INFO, PRESETS, RATES
     cfg = load_agent_config()
-    model_info = COMPONENT_INFO["model"].get(cfg.model, COMPONENT_INFO["model"]["gpt-4o-mini"])
+    using_live = getattr(cfg, "voice_engine", "gpt_live") == "gpt_live"
+    model_key = getattr(cfg, "live_model", "gpt-live-1") if using_live else cfg.model
+    model_info = COMPONENT_INFO["model"].get(model_key, COMPONENT_INFO["model"]["gpt-4o-mini"])
+    transcriber_info = {
+        "name": "Built into GPT-Live",
+        "provider": "OpenAI",
+        "typical_latency_ms": 0,
+        "cost_per_min": 0.0,
+        "metric_label": "Separate STT",
+        "metric_value": "None",
+    } if using_live else COMPONENT_INFO["transcriber"]
+    voice_info = {
+        "name": f"GPT-Live {getattr(cfg, 'live_voice', 'gleam')}",
+        "provider": "OpenAI",
+        "typical_latency_ms": 0,
+        "cost_per_min": 0.0,
+        "metric_label": "Separate TTS",
+        "metric_value": "None",
+    } if using_live else COMPONENT_INFO["voice"]
 
     est_per_min = (
         RATES["twilio_voice_us"] + RATES["twilio_media_stream"]
-        + COMPONENT_INFO["transcriber"]["cost_per_min"]
+        + transcriber_info["cost_per_min"]
         + model_info["cost_per_min"]
-        + COMPONENT_INFO["voice"]["cost_per_min"]
+        + voice_info["cost_per_min"]
     )
     est_latency = (
-        COMPONENT_INFO["transcriber"]["typical_latency_ms"]
+        transcriber_info["typical_latency_ms"]
         + model_info["typical_latency_ms"]
-        + COMPONENT_INFO["voice"]["typical_latency_ms"]
-        + cfg.endpointing_ms
+        + voice_info["typical_latency_ms"]
+        + (0 if using_live else cfg.endpointing_ms)
     )
 
     return JSONResponse({
-        "transcriber": COMPONENT_INFO["transcriber"],
+        "engine": "gpt_live" if using_live else "chained",
+        "transcriber": transcriber_info,
         "model":       model_info,
-        "voice":       COMPONENT_INFO["voice"],
+        "voice":       voice_info,
         "estimated": {
             "cost_per_min": round(est_per_min, 4),
             "latency_ms":   est_latency,
-            "endpointing_ms": cfg.endpointing_ms,
+            "endpointing_ms": 0 if using_live else cfg.endpointing_ms,
         },
         "presets": {k: v["label"] for k, v in PRESETS.items()},
         "rates": RATES,
@@ -1580,19 +2117,10 @@ async def agent_call_price(call_sid: str):
     if not TWILIO_ACCOUNT_SID:
         raise HTTPException(500, "Twilio credentials not set")
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(
-                f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{call_sid}.json",
-                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-            )
-        d = r.json()
-        price = d.get("price")
+        price = await _fetch_twilio_call_price(call_sid)
         return JSONResponse({
-            "price":      abs(float(price)) if price else None,
-            "unit":       d.get("price_unit", "USD"),
-            "duration_s": int(d.get("duration") or 0),
-            "status":     d.get("status"),
-            "direction":  d.get("direction"),
+            "price": price,
+            "unit": "USD",
         })
     except Exception as e:
         return JSONResponse({"price": None, "error": str(e)})

@@ -33,6 +33,42 @@ def record_call(entry: dict) -> None:
         pass
 
 
+def update_twilio_price(call_sid: str, price: float) -> bool:
+    """Patch a stored call with the actual Twilio price once Twilio exposes it."""
+    if not call_sid or price is None or not _HISTORY_FILE.exists():
+        return False
+    try:
+        lines = _HISTORY_FILE.read_text().splitlines()
+        changed = False
+        out = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                out.append(line)
+                continue
+            if entry.get("call_sid") == call_sid:
+                cost = entry.setdefault("cost", {})
+                old = float(cost.get("twilio") or 0.0)
+                delta = float(price) - old
+                cost["twilio"] = round(float(price), 5)
+                cost["twilio_actual"] = True
+                cost["total"] = round(float(cost.get("total") or 0.0) + delta, 5)
+                mins = float(cost.get("duration_min") or 0.0)
+                if mins > 0:
+                    cost["per_min"] = round(cost["total"] / mins, 4)
+                changed = True
+            out.append(json.dumps(entry))
+        if changed:
+            _HISTORY_FILE.write_text("\n".join(out) + "\n")
+        return changed
+    except Exception as e:
+        print(f"[HISTORY] twilio price update failed: {e}")
+        return False
+
+
 def load_calls(days: int = 30) -> list:
     if not _HISTORY_FILE.exists():
         return []
@@ -79,7 +115,8 @@ def summarise(days: int = 30) -> dict:
     def csum(k): return sum(c.get("cost", {}).get(k, 0) for c in calls)
     c_twilio, c_stt = csum("twilio"), csum("stt")
     c_llm, c_tts    = csum("llm"), csum("tts")
-    c_total = c_twilio + c_stt + c_llm + c_tts
+    c_gpt_live = csum("gpt_live")
+    c_total = c_twilio + c_stt + c_llm + c_tts + c_gpt_live
 
     def lat(k):
         vals = [c["latency"][k] for c in calls
@@ -99,7 +136,7 @@ def summarise(days: int = 30) -> dict:
         b["calls"] += 1
         if c.get("answered"): b["connected"] += 1
         if c.get("turns", 0) >= 2 and c.get("outcome") != "ivr": b["conversations"] += 1
-        b["cost"]    += sum(c.get("cost", {}).get(k, 0) for k in ("twilio","stt","llm","tts"))
+        b["cost"]    += sum(c.get("cost", {}).get(k, 0) for k in ("twilio","stt","llm","tts","gpt_live"))
         b["minutes"] += c.get("duration_s", 0) / 60.0
     daily = sorted(buckets.values(), key=lambda x: x["date"])
     for d in daily:
@@ -131,6 +168,7 @@ def summarise(days: int = 30) -> dict:
         "cost": {
             "twilio": round(c_twilio, 4), "stt": round(c_stt, 4),
             "llm": round(c_llm, 4),       "tts": round(c_tts, 4),
+            "gpt_live": round(c_gpt_live, 4),
             "total": round(c_total, 4),
             "per_call":         safe_div(c_total, total),
             "per_min":          safe_div(c_total, minutes),

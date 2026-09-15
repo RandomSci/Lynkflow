@@ -610,6 +610,20 @@ class AgentCallHandler:
             )
 
         if self._script_step == "cold_call_permission":
+            permission_was_asked = any(
+                m.get("role") == "assistant"
+                and ("cold call" in m.get("content", "").lower() or "30 seconds" in m.get("content", "").lower())
+                for m in self.conversation[-6:]
+            )
+            if permission_was_asked:
+                return (
+                    "Runtime policy for this next reply: You already asked the full cold-call permission question. "
+                    "Do not restart it, do not repeat the full wording, and do not say 'this is a cold call' again unless they specifically ask what a cold call means. "
+                    "Answer the person's exact question first. "
+                    "If they ask who you are, say you are Anna with Lynkflow. If they ask what Lynkflow is, say it helps service businesses cover customer calls when nobody can answer. "
+                    "Then ask only this short follow-up: 'Do you want the quick version, or should I let you go?' "
+                    "If they say no, not interested, or sound annoyed, end politely with [HANGUP]."
+                )
             return (
                 "Runtime policy for this next reply: This is a confirmed owner/decision-maker. "
                 "Do not pitch yet unless they already allowed it. If they ask a question, answer it first. "

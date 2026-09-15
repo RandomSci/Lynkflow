@@ -32,7 +32,8 @@
 .autodial-page-controls { margin-bottom: 14px; }
 .autodial-page-grid { display: grid; grid-template-columns: auto minmax(240px, 1fr) auto auto minmax(160px, auto); gap: 12px; align-items: end; }
 .autodial-control-field { display: flex; flex-direction: column; gap: 6px; font-size: 11.5px; color: var(--text-3); }
-.autodial-control-field input {
+.autodial-control-field input,
+.autodial-control-field select {
   padding: 9px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border);
   background: var(--bg-3); color: var(--text); font-size: 12.5px; font-family: inherit;
 }
@@ -40,6 +41,8 @@
 .autodial-control-field--switch input { width: 18px; height: 18px; accent-color: var(--accent); }
 .autodial-control-field--url input { min-width: 260px; font-family: ui-monospace, monospace; }
 .autodial-help-text { margin-top: 10px; color: var(--text-3); font-size: 12px; line-height: 1.5; }
+.autodial-event-transcript { display: inline-flex; margin-top: 8px; color: var(--accent); font-size: 12px; text-decoration: none; }
+.autodial-event-transcript:hover { text-decoration: underline; }
 
 .agent-switch { position: relative; display: inline-block; flex-shrink: 0; cursor: pointer; }
 .agent-switch input { opacity: 0; width: 0; height: 0; position: absolute; }

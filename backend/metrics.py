@@ -34,6 +34,9 @@ RATES = {
     # ElevenLabs — per 1000 characters
     "eleven_flash_v2_5":   0.030,
     "eleven_turbo_v2_5":   0.050,
+
+    # OpenAI GPT-Live — voice session per minute, Twilio excluded elsewhere
+    "gpt-live-1":           0.050,
 }
 
 # Reference figures shown in the UI cards
@@ -58,6 +61,11 @@ COMPONENT_INFO = {
             "name": "GPT-4.1", "provider": "OpenAI",
             "typical_latency_ms": 900, "cost_per_min": 0.055,
             "metric_label": "Intelligence", "metric_value": "25",
+        },
+        "gpt-live-1": {
+            "name": "GPT-Live 1", "provider": "OpenAI · full-duplex voice",
+            "typical_latency_ms": 250, "cost_per_min": RATES["gpt-live-1"],
+            "metric_label": "Voice engine", "metric_value": "Full duplex",
         },
     },
     "voice": {
@@ -131,6 +139,9 @@ class CallMetrics:
         self.turns += 1
 
     def duration_min(self) -> float:
+        live_seconds = getattr(self, "live_seconds", 0.0)
+        if live_seconds:
+            return max(0.0, live_seconds / 60.0)
         end = self.ended or time.time()
         return max(0.0, (end - self.started) / 60.0)
 
@@ -140,25 +151,35 @@ class CallMetrics:
         mins = self.duration_min()
 
         twilio = (RATES["twilio_voice_us"] + RATES["twilio_media_stream"]) * mins
-        stt    = RATES["deepgram_nova3"] * mins
 
         m = self.model
-        llm = (
-            self.tokens_in  / 1_000_000 * RATES.get(f"{m}_in",  RATES["gpt-4o-mini_in"]) +
-            self.tokens_out / 1_000_000 * RATES.get(f"{m}_out", RATES["gpt-4o-mini_out"])
-        )
-        tts = self.tts_chars / 1000 * RATES["eleven_flash_v2_5"]
+        if m == "gpt-live-1":
+            stt = 0.0
+            llm = 0.0
+            tts = 0.0
+            gpt_live = RATES["gpt-live-1"] * mins
+        else:
+            stt = RATES["deepgram_nova3"] * mins
+            llm = (
+                self.tokens_in  / 1_000_000 * RATES.get(f"{m}_in",  RATES["gpt-4o-mini_in"]) +
+                self.tokens_out / 1_000_000 * RATES.get(f"{m}_out", RATES["gpt-4o-mini_out"])
+            )
+            tts = self.tts_chars / 1000 * RATES["eleven_flash_v2_5"]
+            gpt_live = 0.0
 
-        total = twilio + stt + llm + tts
+        total = twilio + stt + llm + tts + gpt_live
         return {
             "twilio": round(twilio, 5),
             "stt":    round(stt, 5),
             "llm":    round(llm, 5),
             "tts":    round(tts, 5),
+            "gpt_live": round(gpt_live, 5),
             "total":  round(total, 5),
             "per_min": round(total / mins, 4) if mins > 0.01 else 0.0,
             "duration_min": round(mins, 3),
             "duration_s":   round(mins * 60, 1),
+            "gpt_live_seconds": round(getattr(self, "live_seconds", 0.0), 3),
+            "gpt_live_usage_source": getattr(self, "live_usage_source", "none"),
         }
 
     # ── latency ──────────────────────────────────────────────────────────────
@@ -189,4 +210,6 @@ class CallMetrics:
             "tokens_in":  self.tokens_in,
             "tokens_out": self.tokens_out,
             "tts_chars":  self.tts_chars,
+            "live_seconds": getattr(self, "live_seconds", 0.0),
+            "live_usage_source": getattr(self, "live_usage_source", "none"),
         }

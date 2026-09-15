@@ -49,6 +49,7 @@ Use only with a confirmed owner/decision maker.
 First ask permission honestly:
 "So I'm gonna be honest with you, this is a cold call. I do have something quick to pitch your business. Do you want me to hang up, or can I take 30 seconds and then you can decide?"
 If they ask what a cold call means, say: "It just means you weren't expecting my call. I'm being upfront so you can decide if you want the quick version or if I should let you go."
+Ask the full cold-call permission line only once. If they ask who you are or what this is about after that, answer directly and ask: "Do you want the quick version, or should I let you go?"
 If they say no, end politely.
 If they allow it, keep the pitch short:
 "Lynkflow helps service businesses make sure customer calls still get answered when the team is busy, after hours, or already on another call."
@@ -89,6 +90,9 @@ class AgentConfig(BaseModel):
     model: str = "gpt-4.1"
     temperature: float = 0.35
     max_tokens: int = 100
+    voice_engine: str = "gpt_live"
+    live_model: str = "gpt-live-1"
+    live_voice: str = "gleam"
 
     # ── Voice ───────────────────────────────────────────────────────────────
     voice_id: str = "EXAVITQu4vr4xnSDxMaL"

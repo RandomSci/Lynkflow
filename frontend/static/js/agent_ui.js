@@ -23,6 +23,10 @@ let autoDialRefreshTimer = null;
 const LISTEN_TARGET_BUFFER_S = 0.12;
 const LISTEN_MAX_BUFFER_S = 0.6;
 const AUTODIAL_CONCURRENCY_KEY = 'lynkflow_autodial_concurrency';
+const AUTODIAL_TEST_MODE_KEY = 'lynkflow_autodial_test_mode';
+const AUTODIAL_TEST_SCENARIO_KEY = 'lynkflow_autodial_test_scenario';
+const AUTODIAL_TEST_LIMIT_KEY = 'lynkflow_autodial_test_limit';
+const AUTODIAL_SIM_ENDPOINT_KEY = 'lynkflow_autodial_sim_endpoint';
 
 const VOICES = [
   { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah',   desc: 'Warm, professional female' },
@@ -177,7 +181,25 @@ function buildAgentOptions() {
     <!-- MODEL -->
     <div class="agent-opt-pane" data-pane="model">
       <div class="agent-opt-group">
-        <div class="agent-opt-label">Model</div>
+        <div class="agent-opt-label">
+          Production Voice Engine
+          <span class="agent-opt-hint">Live calls use GPT-Live for speech, reasoning, and interruption handling</span>
+        </div>
+        <select id="optVoiceEngine" class="agent-select">
+          <option value="gpt_live" ${(agentConfig.voice_engine || 'gpt_live') === 'gpt_live' ? 'selected' : ''}>GPT-Live — production</option>
+          <option value="chained" ${agentConfig.voice_engine === 'chained' ? 'selected' : ''}>Legacy chain — Deepgram + GPT + ElevenLabs</option>
+        </select>
+      </div>
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">GPT-Live Voice</div>
+        <select id="optLiveVoice" class="agent-select">
+          ${['gleam', 'meridian', 'quartz', 'ripple', 'willow', 'vesper', 'delta', 'cinder'].map(v =>
+            `<option value="${v}" ${(agentConfig.live_voice || 'gleam') === v ? 'selected' : ''}>${v}</option>`
+          ).join('')}
+        </select>
+      </div>
+      <div class="agent-opt-group">
+        <div class="agent-opt-label">Legacy/Test Text Model</div>
         <select id="optModel" class="agent-select">
           <option value="gpt-4.1" ${agentConfig.model === 'gpt-4.1' ? 'selected' : ''}>GPT-4.1 — strongest reasoning</option>
           <option value="gpt-4o-mini" ${agentConfig.model === 'gpt-4o-mini' ? 'selected' : ''}>GPT-4o Mini — faster, cheaper</option>
@@ -332,6 +354,9 @@ function buildAgentOptions() {
     agentConfig.first_message     = p.querySelector('#optFirstMessage').value;
     agentConfig.system_prompt     = p.querySelector('#optSystemPrompt').value;
     agentConfig.end_call_phrases  = p.querySelector('#optEndPhrases').value;
+    agentConfig.voice_engine      = p.querySelector('#optVoiceEngine')?.value || 'gpt_live';
+    agentConfig.live_model        = 'gpt-live-1';
+    agentConfig.live_voice        = p.querySelector('#optLiveVoice')?.value || 'gleam';
     agentConfig.model             = p.querySelector('#optModel').value;
     agentConfig.temperature       = parseFloat(p.querySelector('#optTemperature').value);
     agentConfig.max_tokens        = parseInt(p.querySelector('#optMaxTokens').value);
@@ -894,6 +919,45 @@ function setStoredAutoDialConcurrency(value) {
   return safe;
 }
 
+function getStoredAutoDialTestMode() {
+  return localStorage.getItem(AUTODIAL_TEST_MODE_KEY) === '1';
+}
+
+function setStoredAutoDialTestMode(value) {
+  localStorage.setItem(AUTODIAL_TEST_MODE_KEY, value ? '1' : '0');
+  return !!value;
+}
+
+function getStoredAutoDialTestScenario() {
+  return localStorage.getItem(AUTODIAL_TEST_SCENARIO_KEY) || 'mixed';
+}
+
+function setStoredAutoDialTestScenario(value) {
+  const safe = value || 'mixed';
+  localStorage.setItem(AUTODIAL_TEST_SCENARIO_KEY, safe);
+  return safe;
+}
+
+function getStoredAutoDialTestLimit() {
+  return Math.max(1, Math.min(25, parseInt(localStorage.getItem(AUTODIAL_TEST_LIMIT_KEY) || '5')));
+}
+
+function setStoredAutoDialTestLimit(value) {
+  const safe = Math.max(1, Math.min(25, parseInt(value || '5')));
+  localStorage.setItem(AUTODIAL_TEST_LIMIT_KEY, String(safe));
+  return safe;
+}
+
+function getStoredAutoDialSimEndpoint() {
+  return localStorage.getItem(AUTODIAL_SIM_ENDPOINT_KEY) || '';
+}
+
+function setStoredAutoDialSimEndpoint(value) {
+  const safe = (value || '').trim();
+  localStorage.setItem(AUTODIAL_SIM_ENDPOINT_KEY, safe);
+  return safe;
+}
+
 async function loadAutoDialMonitorPage() {
   if (typeof setActiveNav === 'function') setActiveNav('autodial');
   await loadAgentConfig();
@@ -924,10 +988,33 @@ async function loadAutoDialMonitorPage() {
           <span>Parallel calls</span>
           <input type="number" id="autoDialConcurrency" min="1" max="15" value="${getStoredAutoDialConcurrency()}" />
         </label>
+        <label class="autodial-control-field autodial-control-field--switch">
+          <span>GPT Lead Test Mode</span>
+          <input type="checkbox" id="autoDialTestMode" ${getStoredAutoDialTestMode() ? 'checked' : ''} />
+        </label>
+        <label class="autodial-control-field">
+          <span>Lead scenario</span>
+          <select id="autoDialTestScenario">
+            <option value="mixed" ${getStoredAutoDialTestScenario() === 'mixed' ? 'selected' : ''}>Mixed receptionist</option>
+            <option value="recorded_message" ${getStoredAutoDialTestScenario() === 'recorded_message' ? 'selected' : ''}>Recorded/AI question</option>
+            <option value="owner_skeptical" ${getStoredAutoDialTestScenario() === 'owner_skeptical' ? 'selected' : ''}>Skeptical owner</option>
+            <option value="owner_busy" ${getStoredAutoDialTestScenario() === 'owner_busy' ? 'selected' : ''}>Busy owner</option>
+            <option value="callback" ${getStoredAutoDialTestScenario() === 'callback' ? 'selected' : ''}>Callback request</option>
+            <option value="not_interested" ${getStoredAutoDialTestScenario() === 'not_interested' ? 'selected' : ''}>Not interested</option>
+          </select>
+        </label>
+        <label class="autodial-control-field">
+          <span>Test calls</span>
+          <input type="number" id="autoDialTestLimit" min="1" max="25" value="${getStoredAutoDialTestLimit()}" />
+        </label>
+        <label class="autodial-control-field autodial-control-field--url">
+          <span>Custom lead endpoint</span>
+          <input type="text" id="autoDialSimEndpoint" value="${escAttr(getStoredAutoDialSimEndpoint())}" placeholder="Blank = built-in GPT lead simulator" />
+        </label>
         <button class="autodial-btn" id="autoDialBtn">Start Auto</button>
         <span class="autodial-status" id="autoDialStatus">Idle</span>
       </div>
-      <div class="autodial-help-text">Calls only blank, New, Retry, or Queued leads. Already-called, DNC, Interested, and Not Interested leads are skipped.</div>
+      <div class="autodial-help-text" id="autoDialHelpText">Calls only blank, New, Retry, or Queued leads. In GPT Lead Test Mode, no Twilio calls are placed and the spreadsheet is not updated.</div>
     </div>
     <div class="card autodial-monitor-panel" id="autoDialMonitorPanel">
       <div class="card-label">Auto Dial Monitor</div>
@@ -950,6 +1037,19 @@ async function loadAutoDialMonitorPage() {
   document.getElementById('autoDialConcurrency')?.addEventListener('change', (e) => {
     e.target.value = setStoredAutoDialConcurrency(e.target.value);
   });
+  document.getElementById('autoDialTestMode')?.addEventListener('change', (e) => {
+    setStoredAutoDialTestMode(e.target.checked);
+    updateAutoDialUi(autoDialSnapshot || {});
+  });
+  document.getElementById('autoDialTestScenario')?.addEventListener('change', (e) => {
+    setStoredAutoDialTestScenario(e.target.value);
+  });
+  document.getElementById('autoDialTestLimit')?.addEventListener('change', (e) => {
+    e.target.value = setStoredAutoDialTestLimit(e.target.value);
+  });
+  document.getElementById('autoDialSimEndpoint')?.addEventListener('change', (e) => {
+    e.target.value = setStoredAutoDialSimEndpoint(e.target.value);
+  });
   document.getElementById('autoDialBtn')?.addEventListener('click', handleAutoDialBtn);
 
   connectAutoDialEvents();
@@ -965,6 +1065,12 @@ async function handleAutoDialBtn() {
 async function startAutoDial() {
   const baseInput = document.getElementById('autoDialBaseUrl');
   const concurrencyInput = document.getElementById('autoDialConcurrency');
+  const testMode = document.getElementById('autoDialTestMode')?.checked || false;
+  const scenario = document.getElementById('autoDialTestScenario')?.value || getStoredAutoDialTestScenario();
+  const testLimit = setStoredAutoDialTestLimit(document.getElementById('autoDialTestLimit')?.value || getStoredAutoDialTestLimit());
+  const simEndpoint = setStoredAutoDialSimEndpoint(document.getElementById('autoDialSimEndpoint')?.value || '');
+  setStoredAutoDialTestMode(testMode);
+  setStoredAutoDialTestScenario(scenario);
   if (baseInput) {
     agentConfig.base_url = baseInput.value.trim();
     await saveAgentConfig();
@@ -973,14 +1079,21 @@ async function startAutoDial() {
   if (concurrencyInput) concurrencyInput.value = concurrency;
 
   if (!agentConfig.enabled) return setAutoDialText('Turn on AI Agent Mode first');
-  if (!agentConfig.base_url) return setAutoDialText('Set your public URL first');
+  if (!testMode && !agentConfig.base_url) return setAutoDialText('Set your public URL first');
 
-  setAutoDialText('Starting...');
+  setAutoDialText(testMode ? 'Starting GPT lead test...' : 'Starting...');
   try {
     const res = await fetch('/api/agent/autodial/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ concurrency, base_url: agentConfig.base_url }),
+      body: JSON.stringify({
+        concurrency,
+        base_url: agentConfig.base_url,
+        test_mode: testMode,
+        sim_scenario: scenario,
+        sim_endpoint: simEndpoint,
+        test_limit: testLimit,
+      }),
     });
     const data = await res.json();
     if (!res.ok || !data.success) throw new Error(data.detail || 'Failed to start auto dialer');
@@ -1033,13 +1146,28 @@ function updateAutoDialUi(snapshot) {
   if (snapshot) autoDialRunning = !!snapshot.running;
   const btn = document.getElementById('autoDialBtn');
   const input = document.getElementById('autoDialConcurrency');
+  const baseInput = document.getElementById('autoDialBaseUrl');
+  const testToggle = document.getElementById('autoDialTestMode');
+  const scenarioInput = document.getElementById('autoDialTestScenario');
+  const testLimitInput = document.getElementById('autoDialTestLimit');
+  const simEndpointInput = document.getElementById('autoDialSimEndpoint');
+  const help = document.getElementById('autoDialHelpText');
   const status = autoDialSnapshot || {};
+  const testMode = autoDialRunning ? !!status.test_mode : getStoredAutoDialTestMode();
   if (btn) {
     btn.textContent = autoDialRunning ? 'Stop Auto' : 'Start Auto';
     btn.classList.toggle('running', autoDialRunning);
   }
   if (input) input.disabled = autoDialRunning;
-  setAutoDialText(`Active ${status.active || 0}/${status.concurrency || getStoredAutoDialConcurrency()} · Queued ${status.queued || 0} · Done ${status.completed || 0}`);
+  if (baseInput) baseInput.disabled = autoDialRunning || testMode;
+  if (testToggle) testToggle.disabled = autoDialRunning;
+  if (scenarioInput) scenarioInput.disabled = autoDialRunning || !testMode;
+  if (testLimitInput) testLimitInput.disabled = autoDialRunning || !testMode;
+  if (simEndpointInput) simEndpointInput.disabled = autoDialRunning || !testMode;
+  if (help) help.textContent = testMode
+    ? 'GPT Lead Test Mode is ON: no Twilio calls are placed and the spreadsheet is not updated. Blank endpoint uses the built-in GPT lead simulator.'
+    : 'Calls only blank, New, Retry, or Queued leads. Already-called, DNC, Interested, and Not Interested leads are skipped.';
+  setAutoDialText(`${testMode ? 'TEST · ' : ''}Active ${status.active || 0}/${status.concurrency || getStoredAutoDialConcurrency()} · Queued ${status.queued || 0} · Done ${status.completed || 0}`);
   renderAutoDialMonitor();
 }
 
@@ -1071,7 +1199,7 @@ function renderAutoDialMonitor() {
     <div class="autodial-call-card">
       <div class="autodial-call-head">
         <span class="autodial-call-name">${escapeHtml(call.name || 'Unknown')}</span>
-        <span class="autodial-call-state">${escapeHtml(call.state || 'dialing')}</span>
+        <span class="autodial-call-state">${call.mode === 'test' ? 'TEST · ' : ''}${escapeHtml(call.state || 'dialing')}</span>
       </div>
       <div class="autodial-call-phone">${escapeHtml(call.phone || '')}</div>
       <div class="autodial-call-line ${call.last_speaker ? 'has-line' : ''}">
@@ -1104,9 +1232,7 @@ function renderAutoDialEvent(event) {
   const body = event.type === 'call_event'
     ? (event.text || event.message || '')
     : (event.message || event.status || event.outcome || event.error || '');
-  const recording = event.recording
-    ? `<audio controls preload="none" src="/recordings/${encodeURIComponent(event.recording)}" class="autodial-event-audio"></audio>`
-    : '';
+  const recording = event.recording ? renderAutoDialRecording(event.recording) : '';
   return `
     <div class="autodial-event">
       <div class="autodial-event-head"><span>${escapeHtml(label)}</span><em>${escapeHtml(event.ts || '')}</em></div>
@@ -1115,6 +1241,14 @@ function renderAutoDialEvent(event) {
       ${recording}
     </div>
   `;
+}
+
+function renderAutoDialRecording(recording) {
+  const src = `/recordings/${encodeURIComponent(recording)}`;
+  if (String(recording).toLowerCase().endsWith('.txt')) {
+    return `<a href="${src}" target="_blank" rel="noopener" class="autodial-event-transcript">Open test transcript</a>`;
+  }
+  return `<audio controls preload="none" src="${src}" class="autodial-event-audio"></audio>`;
 }
 
 // ── Injection ───────────────────────────────────────────────────────────────
@@ -1301,8 +1435,9 @@ async function renderMetrics() {
       </div>
       <div class="metrics-live-breakdown">
         Twilio $${live.cost.twilio.toFixed(4)}${live.cost.twilio_actual ? ' ✓' : ' (est)'} ·
+        GPT-Live $${(live.cost.gpt_live || 0).toFixed(4)}${live.cost.gpt_live_usage_source && live.cost.gpt_live_usage_source !== 'none' ? ` (${live.cost.gpt_live_usage_source.replace(/_/g, ' ')})` : ''} ·
         STT $${live.cost.stt.toFixed(4)} ·
-        LLM $${live.cost.llm.toFixed(4)} ·
+        Text LLM $${live.cost.llm.toFixed(4)} ·
         TTS $${live.cost.tts.toFixed(4)}
         <span class="metrics-live-permin">$${live.cost.per_min.toFixed(3)}/min</span>
       </div>
@@ -1527,10 +1662,10 @@ function renderAnalytics(d) {
       <td class="an-td-num">${x.turns || 0}</td>
       <td class="an-td-num">${x.latency?.total_ms || 0}ms</td>
       <td class="an-td-num">$${(
-        (x.cost?.twilio||0)+(x.cost?.stt||0)+(x.cost?.llm||0)+(x.cost?.tts||0)
+        (x.cost?.twilio||0)+(x.cost?.gpt_live||0)+(x.cost?.stt||0)+(x.cost?.llm||0)+(x.cost?.tts||0)
       ).toFixed(4)}</td>
       <td>${x.recording
-        ? `<audio controls preload="none" src="/recordings/${x.recording}" class="an-audio"></audio>`
+        ? renderAutoDialRecording(x.recording)
         : '<span class="an-td-time">—</span>'}</td>
     </tr>`).join('');
 
@@ -1543,7 +1678,7 @@ function renderAnalytics(d) {
       ${kpi('Conversations',   t.conversations, `${r.conversation}% of calls`)}
       ${kpi('Interested',      t.interested, `${r.interest}% of calls`)}
       ${kpi('Talk time',       t.minutes + 'm')}
-      ${kpi('Total spend',     '$' + c.total.toFixed(2))}
+      ${kpi('Total spend',     '$' + c.total.toFixed(2), 'Twilio + GPT-Live + legacy components')}
     </div>
   </div>
 
@@ -1556,8 +1691,8 @@ function renderAnalytics(d) {
       ${kpi('Per interested lead', c.per_interested ? '$' + c.per_interested.toFixed(3) : '—')}
     </div>
     <div class="an-costsplit">
-      ${[['Twilio','seg-twilio',c.twilio],['Transcriber','seg-stt',c.stt],
-         ['Model','seg-llm',c.llm],['Voice','seg-tts',c.tts]].map(([n,cl,v]) => `
+      ${[['Twilio','seg-twilio',c.twilio],['GPT-Live','seg-llm',c.gpt_live || 0],['Transcriber','seg-stt',c.stt],
+         ['Text LLM','seg-llm',c.llm],['Legacy Voice','seg-tts',c.tts]].map(([n,cl,v]) => `
         <div class="an-costrow">
           <span class="an-costrow-name"><i class="${cl}"></i>${n}</span>
           <span class="an-costrow-bar"><span class="${cl}" style="width:${c.total ? v/c.total*100 : 0}%"></span></span>
