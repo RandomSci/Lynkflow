@@ -31,6 +31,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_CALLER_ID = os.getenv("TWILIO_CALLER_ID", "")
 
 
 TONE_NOTES = {
@@ -38,6 +39,26 @@ TONE_NOTES = {
     "friendly": "Be warm and conversational without sounding fake.",
     "direct": "Be brief and straight to the point.",
 }
+
+
+IVR_MARKERS = [
+    "press 1", "press one", "press 2", "press two", "press 3", "press three",
+    "press 4", "press four", "press 5", "press five", "press 6", "press six",
+    "press 7", "press seven", "press 8", "press eight", "press 9", "press nine",
+    "press 0", "press zero", "press pound", "press the pound", "press star",
+    "press the star", "press #", "press *", "press any key", "keypad",
+    "enter your", "enter the", "enter a", "enter zip", "enter your zip",
+    "zip code", "postal code", "extension", "extension number", "dial by name",
+    "main menu", "menu options", "please listen", "options have changed",
+    "office is currently closed", "office is closed", "currently closed",
+    "operators are busy", "all of our operators are busy", "after normal business hours",
+    "directory", "company directory", "coordinated directory",
+    "for sales", "for service", "for billing", "for emergency service",
+    "say or press", "to continue", "to repeat", "hold for", "currently assisting",
+    "automated system", "automated attendant", "auto attendant", "answering service",
+    "connect you to your local", "connect you to a local", "local technician",
+    "local text section", "local tech",
+]
 
 
 def _clean_filename(s: str) -> str:
@@ -59,6 +80,8 @@ class GPTLiveCallHandler:
         self.live_session_id = ""
         self.live_started = False
         self._pending_audio: list[str] = []
+        self._out_audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._out_audio_task = None
         self._stop = False
         self._cleaned = False
 
@@ -67,8 +90,9 @@ class GPTLiveCallHandler:
         self.followup_note = ""
         self.recording_file = None
 
-        self._rec_agent = bytearray()
-        self._rec_prospect = bytearray()
+        self._rec_agent_pcm = bytearray()
+        self._rec_prospect_pcm = bytearray()
+        self._rec_started_at = time.time()
         self._fanout_buf: list = []
         self._fanout_inflight = 0
         self._fanout_flush_task = None
@@ -80,6 +104,12 @@ class GPTLiveCallHandler:
         self._last_status = ""
         self._live_usage_seconds = 0.0
         self._live_usage_source = "local_duration_fallback"
+        self._call_started_at = time.time()
+        self._last_input_transcript_at = 0.0
+        self._last_clear_at = 0.0
+        self._audio_clear_seq = 0
+        self._prospect_loud_frames = 0
+        self._barge_vad_threshold = 2600
         self.end_phrases = [
             p.strip().lower()
             for p in (getattr(cfg, "end_call_phrases", "") or "").split(",")
@@ -95,9 +125,26 @@ class GPTLiveCallHandler:
 
         try:
             await self._connect_live()
-            await asyncio.gather(self._twilio_loop(), self._live_loop())
+            await asyncio.gather(self._twilio_loop(), self._live_loop(), self._watchdog())
         finally:
             await self._cleanup()
+
+    async def _watchdog(self):
+        while not self._stop:
+            await asyncio.sleep(1)
+            now = time.time()
+            elapsed = now - self._call_started_at
+            if self.call_sid and self.outcome == "no_answer" and elapsed > max(25, getattr(self.cfg, "silence_timeout_s", 20)):
+                print("[GPT-LIVE WATCHDOG] no human transcript detected")
+                await self._push_status("ended", "No human detected")
+                await self._hangup()
+                return
+            max_duration = getattr(self.cfg, "max_duration_s", 300) or 300
+            if elapsed > max_duration and self.outcome not in {"conversation", "interested", "callback"}:
+                print("[GPT-LIVE WATCHDOG] max duration without useful conversation")
+                await self._push_status("ended", "Max duration reached")
+                await self._hangup()
+                return
 
     def _instructions(self) -> str:
         business = self.lead_info.get("Name") or "the business"
@@ -110,9 +157,11 @@ class GPTLiveCallHandler:
         if timezone:
             context += f". Timezone: {timezone}"
         tone = TONE_NOTES.get(getattr(self.cfg, "tone", "professional"), TONE_NOTES["professional"])
+        callback = (getattr(self.cfg, "callback_number", "") or TWILIO_CALLER_ID or "the number I called from").strip()
         return (
             f"{getattr(self.cfg, 'system_prompt', '')}\n\n"
             f"{context}.\n"
+            f"Your callback number: {callback}.\n"
             f"Tone: {tone}\n\n"
             "Live voice behavior:\n"
             "- You are on a phone call. Keep replies short and natural.\n"
@@ -120,6 +169,8 @@ class GPTLiveCallHandler:
             "- Answer the exact question first, then continue naturally.\n"
             "- Do not repeat a previous line or restart the call.\n"
             "- Do not pitch until a decision maker has allowed the 30-second pitch.\n"
+            "- Never invent phone numbers, emails, prices, company details, or names. Use only the callback number above.\n"
+            "- If leaving a message, give your name, Lynkflow, the callback number above, and a brief reason.\n"
             "- If they decline, want to end, or ask to be removed, politely end.\n"
             "- Never speak bracketed control tokens aloud."
         )
@@ -191,6 +242,7 @@ class GPTLiveCallHandler:
 
         if evt == "start":
             self.stream_sid = data.get("streamSid")
+            self._rec_started_at = time.time()
             start = data.get("start", {})
             self.call_sid = start.get("callSid")
             self.metrics.call_sid = self.call_sid or ""
@@ -214,6 +266,18 @@ class GPTLiveCallHandler:
             raw = base64.b64decode(payload)
             self._record_prospect_frame(raw)
             self._fanout_nowait(payload, "prospect")
+            if self._agent_turn_open:
+                try:
+                    rms = audioop.rms(audioop.ulaw2lin(raw, 2), 2)
+                except Exception:
+                    rms = 0
+                if rms > self._barge_vad_threshold:
+                    self._prospect_loud_frames += 1
+                    if self._prospect_loud_frames >= 6:
+                        await self._clear_twilio_output("barge-in")
+                        self._prospect_loud_frames = 0
+                else:
+                    self._prospect_loud_frames = max(0, self._prospect_loud_frames - 1)
             await self._send_live_audio(payload)
             return
 
@@ -240,6 +304,8 @@ class GPTLiveCallHandler:
         if typ == "session.started":
             self.live_started = True
             self.live_session_id = event.get("session", {}).get("id", "")
+            if not self._out_audio_task or self._out_audio_task.done():
+                self._out_audio_task = asyncio.create_task(self._pump_twilio_audio())
             await self._push_status("listening", "GPT-Live listening")
             for payload in self._pending_audio:
                 await self._send_live_audio(payload)
@@ -255,6 +321,10 @@ class GPTLiveCallHandler:
                 self._input_text += delta
                 text = self._input_text.strip()
                 if text:
+                    self._last_input_transcript_at = time.time()
+                    if self._is_ivr_text(text):
+                        await self._handle_ivr_detected(text)
+                        return
                     self.outcome = "conversation" if self.outcome == "no_answer" else self.outcome
                     await self._push_partial("prospect", text)
             return
@@ -266,7 +336,10 @@ class GPTLiveCallHandler:
                     self._agent_turn_open = True
                     self.metrics.turns += 1
                     await self._push_status("speaking", "GPT-Live speaking")
-                await self._send_twilio_audio(delta)
+                try:
+                    await self._out_audio_queue.put(base64.b64decode(delta))
+                except Exception:
+                    pass
             return
 
         if typ == "session.output_transcript.delta":
@@ -304,6 +377,85 @@ class GPTLiveCallHandler:
             msg = err.get("message") or json.dumps(err)
             print(f"[GPT-LIVE ERROR] {msg}")
             await self._push_status("ended", f"GPT-Live error: {msg}")
+
+    async def _pump_twilio_audio(self):
+        sent_frames = 0
+        playback_started = None
+        buf = b""
+        while not self._stop:
+            chunk = await self._out_audio_queue.get()
+            if chunk is None:
+                return
+            buf += chunk
+            n = (len(buf) // 160) * 160
+            seq = self._audio_clear_seq
+            for i in range(0, n, 160):
+                if self._stop:
+                    return
+                if seq != self._audio_clear_seq:
+                    buf = b""
+                    break
+                frame_raw = buf[i:i + 160]
+                if not frame_raw:
+                    continue
+                if not self.stream_sid:
+                    continue
+                frame = base64.b64encode(frame_raw).decode("ascii")
+                try:
+                    await self.twilio_ws.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": frame},
+                    }))
+                except Exception as e:
+                    print(f"[GPT-LIVE TWILIO AUDIO] {e}")
+                    return
+                if playback_started is None:
+                    playback_started = time.time()
+                sent_frames += 1
+                self._record_agent_frame(frame_raw)
+                self._fanout_nowait(frame, "agent")
+                target_elapsed = sent_frames * 0.02
+                delay = target_elapsed - (time.time() - playback_started)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            buf = buf[n:]
+            if not buf and self._out_audio_queue.empty():
+                self._agent_turn_open = False
+
+    async def _clear_twilio_output(self, reason: str):
+        now = time.time()
+        if now - self._last_clear_at < 0.7:
+            return
+        self._last_clear_at = now
+        self._audio_clear_seq += 1
+        while True:
+            try:
+                self._out_audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        if self.stream_sid:
+            try:
+                await self.twilio_ws.send_text(json.dumps({
+                    "event": "clear",
+                    "streamSid": self.stream_sid,
+                }))
+                print(f"[GPT-LIVE] cleared Twilio audio ({reason})")
+            except Exception as e:
+                print(f"[GPT-LIVE CLEAR ERROR] {e}")
+        self._agent_turn_open = False
+
+    def _is_ivr_text(self, text: str) -> bool:
+        low = text.lower()
+        return any(marker in low for marker in IVR_MARKERS)
+
+    async def _handle_ivr_detected(self, text: str):
+        print(f"[GPT-LIVE IVR] {text[:120]}")
+        self.outcome = "ivr"
+        await self._push_partial("prospect", text)
+        await self._push_status("ended", "Phone tree / IVR detected")
+        await self._clear_twilio_output("ivr")
+        await self._hangup()
 
     async def _send_twilio_audio(self, payload_b64: str):
         if not self.stream_sid:
@@ -350,6 +502,10 @@ class GPTLiveCallHandler:
             print(f"[GPT-LIVE HANGUP ERROR] {e}")
 
     async def _close_live(self):
+        try:
+            await self._out_audio_queue.put(None)
+        except Exception:
+            pass
         if self.live_ws:
             try:
                 await self.live_ws.send(json.dumps({"type": "session.close"}))
@@ -385,7 +541,6 @@ class GPTLiveCallHandler:
         if speaker == "agent":
             text = self._output_text.replace("[HANGUP]", "").strip()
             self._output_text = ""
-            self._agent_turn_open = False
         else:
             text = self._input_text.strip()
             self._input_text = ""
@@ -398,15 +553,29 @@ class GPTLiveCallHandler:
             })
 
     def _record_prospect_frame(self, frame: bytes):
-        self._rec_prospect.extend(frame)
-        self._rec_agent.extend(b"\xff" * len(frame))
+        self._mix_recording_frame(frame, self._rec_prospect_pcm)
 
     def _record_agent_frame(self, frame: bytes):
-        self._rec_agent.extend(frame)
-        self._rec_prospect.extend(b"\xff" * len(frame))
+        self._mix_recording_frame(frame, self._rec_agent_pcm)
+
+    def _mix_recording_frame(self, frame: bytes, lane: bytearray):
+        try:
+            pcm = audioop.ulaw2lin(frame, 2)
+        except Exception:
+            return
+        offset = max(0, int((time.time() - self._rec_started_at) * 8000) * 2)
+        end = offset + len(pcm)
+        if len(lane) < end:
+            lane.extend(b"\x00" * (end - len(lane)))
+        existing = bytes(lane[offset:end])
+        try:
+            mixed = audioop.add(existing, pcm, 2)
+        except Exception:
+            mixed = pcm
+        lane[offset:end] = mixed
 
     def _save_recording(self) -> str | None:
-        if not self._rec_agent and not self._rec_prospect:
+        if not self._rec_agent_pcm and not self._rec_prospect_pcm:
             return None
         rec_dir = Path(__file__).parent / "recordings"
         rec_dir.mkdir(exist_ok=True)
@@ -415,20 +584,17 @@ class GPTLiveCallHandler:
         filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}_{suffix}.wav"
         path = rec_dir / filename
 
-        a = bytes(self._rec_agent)
-        p = bytes(self._rec_prospect)
-        n = max(len(a), len(p))
-        a = a.ljust(n, b"\xff")
-        p = p.ljust(n, b"\xff")
         try:
-            pcm_agent = audioop.ulaw2lin(a, 2)
-            pcm_prospect = audioop.ulaw2lin(p, 2)
-            mixed = audioop.add(pcm_agent, pcm_prospect, 2)
+            n = max(len(self._rec_agent_pcm), len(self._rec_prospect_pcm))
+            agent = bytes(self._rec_agent_pcm).ljust(n, b"\x00")
+            prospect = bytes(self._rec_prospect_pcm).ljust(n, b"\x00")
+            stereo = audioop.tostereo(prospect, 2, 1.0, 0.0)
+            stereo = audioop.add(stereo, audioop.tostereo(agent, 2, 0.0, 1.0), 2)
             with wave.open(str(path), "wb") as wav:
-                wav.setnchannels(1)
+                wav.setnchannels(2)
                 wav.setsampwidth(2)
                 wav.setframerate(8000)
-                wav.writeframes(mixed)
+                wav.writeframes(stereo)
             return filename
         except Exception as e:
             print(f"[GPT-LIVE RECORDING] failed: {e}")
@@ -476,13 +642,18 @@ class GPTLiveCallHandler:
         self._cleaned = True
         self._stop = True
         self.metrics.ended = time.time()
+        try:
+            await self._out_audio_queue.put(None)
+        except Exception:
+            pass
         if not self._live_usage_seconds:
             self._live_usage_seconds = max(0.0, self.metrics.ended - self.metrics.started)
         self.metrics.live_seconds = self._live_usage_seconds
         self.metrics.live_usage_source = self._live_usage_source
         await self._finalize_transcript("prospect")
         await self._finalize_transcript("agent")
-        self.recording_file = self._save_recording()
+        if not self.recording_file:
+            self.recording_file = self._save_recording()
         snap = self.metrics.snapshot()
         try:
             await self.status_queue.put({"type": "metrics", **snap})

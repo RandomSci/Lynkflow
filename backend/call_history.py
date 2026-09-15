@@ -69,6 +69,35 @@ def update_twilio_price(call_sid: str, price: float) -> bool:
         return False
 
 
+def update_recording_file(call_sid: str, recording: str) -> bool:
+    """Patch a stored call with the authoritative recording file."""
+    if not call_sid or not recording or not _HISTORY_FILE.exists():
+        return False
+    try:
+        lines = _HISTORY_FILE.read_text().splitlines()
+        changed = False
+        out = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                out.append(line)
+                continue
+            if entry.get("call_sid") == call_sid:
+                entry["recording"] = recording
+                entry["recording_source"] = "twilio_dual_channel"
+                changed = True
+            out.append(json.dumps(entry))
+        if changed:
+            _HISTORY_FILE.write_text("\n".join(out) + "\n")
+        return changed
+    except Exception as e:
+        print(f"[HISTORY] recording update failed: {e}")
+        return False
+
+
 def load_calls(days: int = 30) -> list:
     if not _HISTORY_FILE.exists():
         return []

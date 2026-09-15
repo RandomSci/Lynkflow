@@ -52,6 +52,8 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent.parent / "front
 _agent_events: dict[str, list] = {}       # call_sid → buffered events
 _agent_queues: dict[str, asyncio.Queue] = {}  # call_sid → live queue for SSE
 _agent_handlers: dict = {}     # call_sid -> AgentCallHandler
+_call_leads: dict[str, dict] = {}  # call_sid -> lead metadata for late Twilio callbacks
+_pending_recordings: dict[str, str] = {}  # call_sid -> Twilio recording saved before history write
 _REC_DIR = Path(__file__).parent / "recordings"
 _REC_DIR.mkdir(exist_ok=True)
 app.mount("/recordings", StaticFiles(directory=_REC_DIR), name="recordings")
@@ -324,6 +326,27 @@ async def _store_twilio_actual_price(call_sid: str):
             print(f"[TWILIO PRICE] fetch failed for {call_sid}: {e}")
 
 
+def _safe_recording_name(name: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_. -]+", "", str(name or "")).strip()
+    return re.sub(r"\s+", " ", text)[:42] or "Twilio Recording"
+
+
+async def _download_twilio_recording(call_sid: str, recording_sid: str, recording_url: str, lead_name: str = "") -> str:
+    if not recording_url:
+        return ""
+    url = recording_url if recording_url.endswith(".wav") else f"{recording_url}.wav"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+    if resp.status_code != 200:
+        raise RuntimeError(f"Twilio recording download failed: {resp.status_code} {resp.text[:200]}")
+
+    name = _safe_recording_name(lead_name)
+    suffix = (recording_sid or call_sid or uuid.uuid4().hex)[-6:]
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}_{suffix}_twilio.wav"
+    (_REC_DIR / filename).write_bytes(resp.content)
+    return filename
+
+
 async def _start_agent_call(phone: str, lead: dict, base_url: str) -> str:
     phone = _format_us_phone(phone)
     base_url = (base_url or "").rstrip("/")
@@ -362,6 +385,11 @@ async def _start_agent_call(phone: str, lead: dict, base_url: str) -> str:
                 "StatusCallback": f"{base_url}/api/agent/call-status",
                 "StatusCallbackMethod": "POST",
                 "StatusCallbackEvent": ["initiated", "ringing", "answered", "completed"],
+                "Record": "true",
+                "RecordingChannels": "dual",
+                "RecordingStatusCallback": f"{base_url}/api/agent/recording-status",
+                "RecordingStatusCallbackMethod": "POST",
+                "RecordingStatusCallbackEvent": ["completed"],
                 "Timeout": "30",
             },
         )
@@ -372,6 +400,7 @@ async def _start_agent_call(phone: str, lead: dict, base_url: str) -> str:
     call_sid = r.json()["sid"]
     _agent_queues[call_sid] = asyncio.Queue()
     _agent_events[call_sid] = []
+    _call_leads[call_sid] = {**lead, "Phone": phone}
     return call_sid
 
 
@@ -1854,6 +1883,47 @@ async def agent_call_status(request: Request):
     return Response(content="", media_type="text/plain")
 
 
+@app.post("/api/agent/recording-status")
+async def agent_recording_status(request: Request):
+    form = await request.form()
+    call_sid = form.get("CallSid", "")
+    recording_sid = form.get("RecordingSid", "")
+    recording_url = form.get("RecordingUrl", "")
+    recording_status = form.get("RecordingStatus", "")
+    print(f"[RECORDING STATUS] {call_sid} {recording_status} {recording_sid}")
+
+    if recording_status and recording_status != "completed":
+        return Response(content="", media_type="text/plain")
+
+    handler = _agent_handlers.get(call_sid)
+    lead_name = handler.lead_info.get("Name", "") if handler else ""
+    if not lead_name:
+        item = _autodial_state.get("active", {}).get(call_sid, {})
+        lead_name = item.get("lead", {}).get("Name", "")
+    if not lead_name:
+        lead_name = _call_leads.get(call_sid, {}).get("Name", "")
+
+    try:
+        filename = await _download_twilio_recording(call_sid, recording_sid, recording_url, lead_name)
+        if filename:
+            if handler:
+                handler.recording_file = filename
+            from call_history import update_recording_file
+            if not update_recording_file(call_sid, filename):
+                _pending_recordings[call_sid] = filename
+            await _autodial_broadcast({
+                "type": "recording_ready",
+                "call_sid": call_sid,
+                "name": lead_name,
+                "recording": filename,
+                "message": "Twilio dual-channel recording saved",
+            })
+    except Exception as e:
+        print(f"[RECORDING DOWNLOAD] failed for {call_sid}: {e}")
+
+    return Response(content="", media_type="text/plain")
+
+
 @app.post("/api/agent/end/{call_sid}")
 async def agent_end_call(call_sid: str):
     """Frontend-triggered hangup."""
@@ -1942,6 +2012,7 @@ async def agent_stream(websocket: WebSocket):
         try:
             from call_history import record_call
             snap = handler.metrics.snapshot()
+            recording_file = _pending_recordings.pop(handler.call_sid, None) or getattr(handler, "recording_file", None)
             record_call({
                 "call_sid":   handler.call_sid,
                 "business":   handler.lead_info.get("Name", ""),
@@ -1960,14 +2031,15 @@ async def agent_stream(websocket: WebSocket):
                 "cost":       snap["cost"],
                 "live_seconds": snap.get("live_seconds", 0.0),
                 "live_usage_source": snap.get("live_usage_source", "none"),
-                "recording": getattr(handler, "recording_file", None),
+                "recording": recording_file,
+                "recording_source": "twilio_dual_channel" if recording_file and str(recording_file).endswith("_twilio.wav") else "local_stream",
                 "followup_note": getattr(handler, "followup_note", ""),
             })
             asyncio.create_task(_store_twilio_actual_price(handler.call_sid))
             await _autodial_finish_call(
                 handler.call_sid,
                 outcome=handler.outcome,
-                recording=getattr(handler, "recording_file", None) or "",
+                recording=recording_file or "",
                 notes_extra=getattr(handler, "followup_note", ""),
             )
         except Exception as e:
