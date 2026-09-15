@@ -61,9 +61,10 @@ IVR_MARKERS = [
 ]
 
 AGENT_END_MARKERS = [
-    "thanks for your help", "thank you for your help", "appreciate your help",
-    "i appreciate it", "appreciate it", "that's everything", "that is everything",
-    "no problem at all", "no worries", "i'll let you go", "i will let you go",
+    "thanks for your help, have a good day", "thank you for your help, have a good day",
+    "thanks for your time, have a good day", "thank you for your time, have a good day",
+    "appreciate your help, have a good day", "that's everything, have a good day",
+    "that is everything, have a good day", "i'll let you go", "i will let you go",
     "i'll try another time", "i will try another time", "try another time",
     "thanks for your time", "thank you for your time", "have a good day",
     "have a great day", "have a good one", "have a great one", "take care",
@@ -196,6 +197,8 @@ class GPTLiveCallHandler:
             "- Do not repeat a previous line or restart the call.\n"
             "- Do not pitch until a decision maker has allowed the 30-second pitch.\n"
             "- Never invent phone numbers, emails, prices, company details, or names. Use only the callback number above.\n"
+            "- Receptionist/staff contact capture: if they offer an email address, direct number, direct contact, callback time, or say you can send an email, accept it. Ask for the missing contact detail, confirm spelling/digits/time, then thank them and end.\n"
+            "- Message-taking is different: if they only offer to take your message or ask for your details, ask once for the best email, direct number, or callback time instead. Only end without collecting info if they refuse or cannot provide it.\n"
             "- If leaving a message, give your name, Lynkflow, the callback number above, and a brief reason.\n"
             "- If they decline, want to end, or ask to be removed, politely end.\n"
             "- Never speak bracketed control tokens aloud."
