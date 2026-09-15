@@ -1487,6 +1487,8 @@ async function fetchRealTwilioPrice(callSid, attempt = 0) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 let analyticsRange = 30;
+let activeAnalystChat = null;
+let analystRecordingResults = [];
 
 async function loadAnalytics() {
   const area = document.getElementById('contentArea');
@@ -1667,6 +1669,9 @@ function renderAnalytics(d) {
       <td>${x.recording
         ? renderAutoDialRecording(x.recording)
         : '<span class="an-td-time">—</span>'}</td>
+      <td>${x.recording
+        ? `<button class="an-ai-btn" data-recording="${encodeURIComponent(x.recording)}" data-business="${encodeURIComponent(x.business || '')}">Ask AI</button>`
+        : '<span class="an-td-time">—</span>'}</td>
     </tr>`).join('');
 
   return `
@@ -1702,16 +1707,6 @@ function renderAnalytics(d) {
     </div>
   </div>
 
-  <div class="an-section">
-    <div class="an-section-title">Measured latency</div>
-    <div class="an-kpis an-kpis--5">
-      ${kpi('Median total', l.total + 'ms')}
-      ${kpi('p95 total',    l.p95 + 'ms')}
-      ${kpi('Transcriber',  l.stt + 'ms')}
-      ${kpi('Model',        l.llm + 'ms')}
-      ${kpi('Voice',        l.tts + 'ms')}
-    </div>
-  </div>
 
   <div class="an-section">
     <div class="an-section-title">Outcomes</div>
@@ -1736,11 +1731,12 @@ function renderAnalytics(d) {
         <thead><tr>
           <th>When</th><th>Business</th><th>Outcome</th>
           <th class="an-th-num">Duration</th><th class="an-th-num">Turns</th>
-          <th class="an-th-num">Latency</th><th class="an-th-num">Cost</th><th>Recording</th>
+          <th class="an-th-num">Latency</th><th class="an-th-num">Cost</th><th>Recording</th><th>AI</th>
         </tr></thead>
         <tbody>${recentRows}</tbody>
       </table>
     </div>
+    <div id="analyticsAiPanel" class="an-ai-panel" style="display:none"></div>
   </div>`;
 }
 
@@ -1753,4 +1749,460 @@ function wirePresetButtons() {
       loadAnalytics();
     });
   });
+  document.querySelectorAll('.an-ai-btn').forEach(btn => {
+    btn.addEventListener('click', () => openAnalyticsAiPanel(
+      decodeURIComponent(btn.dataset.recording || ''),
+      decodeURIComponent(btn.dataset.business || '')
+    ));
+  });
+}
+
+async function openAnalyticsAiPanel(recording, business) {
+  const panel = document.getElementById('analyticsAiPanel');
+  if (!panel || !recording) return;
+  panel.style.display = 'block';
+  panel.dataset.recording = recording;
+  panel.innerHTML = `
+    <div class="an-ai-head">
+      <div>
+        <div class="an-section-title">Transcribe & Ask</div>
+        <div class="an-ai-sub">${escapeHtml(business || recording)}</div>
+      </div>
+      <button class="an-ai-close" id="anAiClose">Close</button>
+    </div>
+    <div class="an-ai-actions">
+      <button class="an-ai-chip" data-q="Extract any email addresses, phone numbers, names, and callback details mentioned in this call.">Find contacts</button>
+      <button class="an-ai-chip" data-q="Summarize the call and tell me what follow-up action I should take.">Summarize</button>
+      <button class="an-ai-chip" data-q="Write a short professional follow-up message I can copy and send based only on this call.">Draft message</button>
+      <button class="an-ai-chip" data-q="Did this call sound interested, not interested, callback, gatekeeper, voicemail, or wrong number? Explain briefly.">Classify outcome</button>
+    </div>
+    <div class="an-ai-status" id="anAiStatus">Preparing transcript...</div>
+    <pre class="an-ai-transcript" id="anAiTranscript"></pre>
+    <div class="an-ai-ask-row">
+      <textarea id="anAiQuestion" class="an-ai-question" placeholder="Ask about this call: email, phone number, callback time, what happened, draft a message..."></textarea>
+      <button id="anAiAskBtn" class="an-ai-btn an-ai-btn--primary">Ask</button>
+    </div>
+    <div class="an-ai-answer-wrap">
+      <div class="an-ai-answer-head">
+        <span>Answer</span>
+        <button id="anAiCopyBtn" class="an-ai-copy" style="display:none">Copy</button>
+      </div>
+      <pre class="an-ai-answer" id="anAiAnswer"></pre>
+    </div>
+  `;
+
+  document.getElementById('anAiClose')?.addEventListener('click', () => { panel.style.display = 'none'; });
+  panel.querySelectorAll('.an-ai-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      document.getElementById('anAiQuestion').value = chip.dataset.q || '';
+      askAnalyticsAi();
+    });
+  });
+  document.getElementById('anAiAskBtn')?.addEventListener('click', askAnalyticsAi);
+  document.getElementById('anAiCopyBtn')?.addEventListener('click', async () => {
+    const text = document.getElementById('anAiAnswer')?.textContent || '';
+    if (text) await navigator.clipboard.writeText(text);
+  });
+
+  try {
+    const res = await fetch('/api/analytics/transcribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recording }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Transcription failed');
+    document.getElementById('anAiStatus').textContent = data.cached ? 'Transcript loaded from cache.' : 'Transcript created.';
+    document.getElementById('anAiTranscript').textContent = data.transcript || '(No transcript text found.)';
+    const contacts = data.contacts || {};
+    const found = [...(contacts.emails || []), ...(contacts.phones || [])];
+    if (found.length) {
+      document.getElementById('anAiAnswer').textContent = `Detected contacts:\n${found.join('\n')}`;
+      document.getElementById('anAiCopyBtn').style.display = '';
+    }
+  } catch (e) {
+    document.getElementById('anAiStatus').textContent = `Error: ${e.message}`;
+  }
+}
+
+async function askAnalyticsAi() {
+  const panel = document.getElementById('analyticsAiPanel');
+  const recording = panel?.dataset.recording;
+  const question = document.getElementById('anAiQuestion')?.value.trim();
+  if (!recording || !question) return;
+  const status = document.getElementById('anAiStatus');
+  const answer = document.getElementById('anAiAnswer');
+  const copyBtn = document.getElementById('anAiCopyBtn');
+  status.textContent = 'Asking GPT-4.1...';
+  answer.textContent = '';
+  if (copyBtn) copyBtn.style.display = 'none';
+  try {
+    const res = await fetch('/api/analytics/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recording, question }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Ask failed');
+    status.textContent = 'Answered from transcript.';
+    answer.textContent = data.answer || '';
+    if (copyBtn && data.answer) copyBtn.style.display = '';
+  } catch (e) {
+    status.textContent = `Error: ${e.message}`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AI ANALYST PAGE — persistent ChatGPT-style call analyst
+// ═══════════════════════════════════════════════════════════════════════════
+
+let analystChats = [];
+let activeAnalystChatId = null;
+let analystDays = 30;
+
+async function loadAnalystPage() {
+  if (typeof setActiveNav === 'function') setActiveNav('analyst');
+  const area = document.getElementById('contentArea');
+  if (!area) return;
+  area.innerHTML = `
+    <div class="analyst-layout">
+      <aside class="analyst-sidebar">
+        <div class="analyst-side-head">
+          <div>
+            <div class="an-eyebrow">Call Intelligence</div>
+            <div class="analyst-title">AI Analyst</div>
+          </div>
+          <button class="analyst-new" id="analystNewBtn">New</button>
+        </div>
+        <div class="analyst-range-row">
+          <span>Context</span>
+          <select id="analystDays">
+            ${[7, 30, 90, 365].map(d => `<option value="${d}" ${d === analystDays ? 'selected' : ''}>${d} days</option>`).join('')}
+          </select>
+        </div>
+        <div class="analyst-chat-list" id="analystChatList"><div class="an-loading">Loading chats...</div></div>
+      </aside>
+      <main class="analyst-main">
+        <div class="analyst-main-head">
+          <div>
+            <div class="analyst-chat-title" id="analystChatTitle">AI Analyst</div>
+            <div class="analyst-sub">Ask across call history, cached transcripts, emails, numbers, outcomes, and follow-up messages.</div>
+          </div>
+          <div class="analyst-title-actions">
+            <button class="analyst-lite-btn analyst-add-audio" id="analystAddAudioBtn">Add Audio</button>
+            <button class="analyst-lite-btn" id="analystRenameBtn">Rename</button>
+            <button class="analyst-lite-btn danger" id="analystDeleteBtn">Delete</button>
+          </div>
+        </div>
+        <div class="analyst-attachments" id="analystAttachments"></div>
+        <div class="analyst-suggestions" id="analystSuggestions">
+          <button data-q="Is there anyone at least interested here? List who and why.">Interested?</button>
+          <button data-q="Which calls provided useful info like emails, phone numbers, names, or callback times?">Provided info?</button>
+          <button data-q="Tell me more about what happened in the latest calls. I'm too lazy to listen.">Latest summary</button>
+          <button data-q="Create a short follow-up message for the most promising lead I can copy and send.">Draft best follow-up</button>
+        </div>
+        <div class="analyst-messages" id="analystMessages">
+          <div class="analyst-empty">Create or select a chat, then ask about your calls.</div>
+        </div>
+        <div class="analyst-input-wrap">
+          <textarea id="analystInput" class="analyst-input" placeholder="Ask: tell me more about {business}, who gave an email, who sounded interested, draft a message..."></textarea>
+          <button id="analystSendBtn" class="analyst-send">Send</button>
+        </div>
+      </main>
+    </div>
+    <div class="analyst-modal" id="analystAudioModal" style="display:none">
+      <div class="analyst-modal-card">
+        <div class="analyst-modal-head">
+          <div>
+            <div class="analyst-chat-title">Add Audio Context</div>
+            <div class="analyst-sub">Search recordings by business, phone, outcome, date, or filename.</div>
+          </div>
+          <button class="analyst-lite-btn" id="analystAudioClose">Close</button>
+        </div>
+        <div class="analyst-search-row">
+          <input id="analystAudioSearch" class="analyst-search" placeholder="Search business, email source, phone, outcome..." />
+          <button id="analystAudioSearchBtn" class="analyst-send">Search</button>
+        </div>
+        <div class="analyst-audio-results" id="analystAudioResults"><div class="analyst-empty small">Search or show recent recordings.</div></div>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('analystNewBtn')?.addEventListener('click', createAnalystChat);
+  document.getElementById('analystAddAudioBtn')?.addEventListener('click', openAnalystAudioModal);
+  document.getElementById('analystAudioClose')?.addEventListener('click', closeAnalystAudioModal);
+  document.getElementById('analystAudioSearchBtn')?.addEventListener('click', searchAnalystAudio);
+  document.getElementById('analystAudioSearch')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') searchAnalystAudio();
+  });
+  document.getElementById('analystRenameBtn')?.addEventListener('click', renameAnalystChat);
+  document.getElementById('analystDeleteBtn')?.addEventListener('click', deleteAnalystChat);
+  document.getElementById('analystSendBtn')?.addEventListener('click', sendAnalystMessage);
+  document.getElementById('analystInput')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAnalystMessage(); }
+  });
+  document.getElementById('analystDays')?.addEventListener('change', e => {
+    analystDays = parseInt(e.target.value || '30');
+  });
+  document.querySelectorAll('#analystSuggestions button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.getElementById('analystInput').value = btn.dataset.q || '';
+      sendAnalystMessage();
+    });
+  });
+
+  await refreshAnalystChats();
+  if (!activeAnalystChatId && analystChats.length) await openAnalystChat(analystChats[0].id);
+}
+
+async function refreshAnalystChats() {
+  try {
+    const res = await fetch('/api/analyst/chats');
+    const data = await res.json();
+    analystChats = data.chats || [];
+    renderAnalystChatList();
+  } catch (e) {
+    document.getElementById('analystChatList').innerHTML = '<div class="an-loading">Failed to load chats.</div>';
+  }
+}
+
+function renderAnalystChatList() {
+  const list = document.getElementById('analystChatList');
+  if (!list) return;
+  if (!analystChats.length) {
+    list.innerHTML = '<div class="analyst-empty small">No chats yet.</div>';
+    return;
+  }
+  list.innerHTML = analystChats.map(chat => `
+    <button class="analyst-chat-item ${chat.id === activeAnalystChatId ? 'active' : ''}" data-id="${chat.id}">
+      <span>${escapeHtml(chat.title || 'New chat')}</span>
+      <em>${chat.message_count || 0}${chat.attachment_count ? ' · ' + chat.attachment_count + ' audio' : ''}</em>
+    </button>
+  `).join('');
+  list.querySelectorAll('.analyst-chat-item').forEach(btn => {
+    btn.addEventListener('click', () => openAnalystChat(btn.dataset.id));
+  });
+}
+
+async function createAnalystChat() {
+  const res = await fetch('/api/analyst/chats', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: 'New chat' }),
+  });
+  const chat = await res.json();
+  activeAnalystChatId = chat.id;
+  await refreshAnalystChats();
+  renderAnalystChat(chat);
+}
+
+async function openAnalystChat(chatId) {
+  if (!chatId) return;
+  const res = await fetch(`/api/analyst/chats/${chatId}`);
+  const chat = await res.json();
+  activeAnalystChatId = chat.id;
+  renderAnalystChatList();
+  renderAnalystChat(chat);
+}
+
+function renderAnalystChat(chat) {
+  activeAnalystChat = chat;
+  document.getElementById('analystChatTitle').textContent = chat.title || 'New chat';
+  renderAnalystAttachments(chat.attachments || []);
+  const wrap = document.getElementById('analystMessages');
+  if (!wrap) return;
+  const messages = chat.messages || [];
+  if (!messages.length) {
+    wrap.innerHTML = '<div class="analyst-empty">Ask something like “which calls provided info?” or “tell me what happened in R.E. Michel.”</div>';
+    return;
+  }
+  wrap.innerHTML = messages.map(m => `
+    <div class="analyst-msg analyst-msg--${m.role}">
+      <div class="analyst-msg-role">${m.role === 'user' ? 'You' : 'AI Analyst'}</div>
+      <div class="analyst-msg-text markdown-body">${renderAnalystMarkdown(m.content || '')}</div>
+      ${m.context ? `<div class="analyst-msg-context">Used ${m.context.calls || 0} calls / ${m.context.transcripts || 0} transcripts${m.context.attachments ? ' / ' + m.context.attachments + ' attached audio' : ''}</div>` : ''}
+    </div>
+  `).join('');
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+async function sendAnalystMessage() {
+  const input = document.getElementById('analystInput');
+  const text = input?.value.trim();
+  if (!text) return;
+  if (!activeAnalystChatId) await createAnalystChat();
+  input.value = '';
+  const wrap = document.getElementById('analystMessages');
+  if (wrap) {
+    wrap.insertAdjacentHTML('beforeend', `
+      <div class="analyst-msg analyst-msg--user"><div class="analyst-msg-role">You</div><div class="analyst-msg-text markdown-body">${renderAnalystMarkdown(text)}</div></div>
+      <div class="analyst-msg analyst-msg--assistant analyst-msg--loading" id="analystLoading"><div class="analyst-msg-role">AI Analyst</div><div class="analyst-msg-text">Thinking across call history and transcripts...</div></div>
+    `);
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+  try {
+    const res = await fetch(`/api/analyst/chats/${activeAnalystChatId}/message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, days: analystDays }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Analyst failed');
+    await refreshAnalystChats();
+    renderAnalystChat(data.chat);
+  } catch (e) {
+    const loading = document.getElementById('analystLoading');
+    if (loading) loading.querySelector('.analyst-msg-text').textContent = `Error: ${e.message}`;
+  }
+}
+
+async function renameAnalystChat() {
+  if (!activeAnalystChatId) return;
+  const current = document.getElementById('analystChatTitle')?.textContent || '';
+  const title = prompt('Rename chat', current);
+  if (!title) return;
+  const res = await fetch(`/api/analyst/chats/${activeAnalystChatId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  const chat = await res.json();
+  await refreshAnalystChats();
+  renderAnalystChat(chat);
+}
+
+async function deleteAnalystChat() {
+  if (!activeAnalystChatId || !confirm('Delete this chat?')) return;
+  await fetch(`/api/analyst/chats/${activeAnalystChatId}`, { method: 'DELETE' });
+  activeAnalystChatId = null;
+  await refreshAnalystChats();
+  if (analystChats.length) await openAnalystChat(analystChats[0].id);
+  else document.getElementById('analystMessages').innerHTML = '<div class="analyst-empty">No chats yet.</div>';
+}
+
+function renderAnalystAttachments(attachments) {
+  const wrap = document.getElementById('analystAttachments');
+  if (!wrap) return;
+  if (!attachments.length) {
+    wrap.innerHTML = '<div class="analyst-attach-empty">No audio attached. Use Add Audio to focus the analyst on specific calls.</div>';
+    return;
+  }
+  wrap.innerHTML = attachments.map(a => `
+    <div class="analyst-attach-chip" title="${escapeHtml(a.recording || '')}">
+      <span>${escapeHtml(a.business || a.recording || 'Recording')}</span>
+      <em>${escapeHtml(a.outcome || '')}</em>
+      <button data-recording="${encodeURIComponent(a.recording || '')}">×</button>
+    </div>
+  `).join('');
+  wrap.querySelectorAll('button[data-recording]').forEach(btn => {
+    btn.addEventListener('click', () => removeAnalystAttachment(decodeURIComponent(btn.dataset.recording || '')));
+  });
+}
+
+async function openAnalystAudioModal() {
+  if (!activeAnalystChatId) await createAnalystChat();
+  const modal = document.getElementById('analystAudioModal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  await searchAnalystAudio();
+}
+
+function closeAnalystAudioModal() {
+  const modal = document.getElementById('analystAudioModal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function searchAnalystAudio() {
+  const q = document.getElementById('analystAudioSearch')?.value.trim() || '';
+  const results = document.getElementById('analystAudioResults');
+  if (results) results.innerHTML = '<div class="analyst-empty small">Searching...</div>';
+  try {
+    const res = await fetch(`/api/analyst/recordings?days=${analystDays || 365}&q=${encodeURIComponent(q)}`);
+    const data = await res.json();
+    analystRecordingResults = data.recordings || [];
+    renderAnalystAudioResults();
+  } catch (e) {
+    if (results) results.innerHTML = `<div class="analyst-empty small">Search failed: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderAnalystAudioResults() {
+  const wrap = document.getElementById('analystAudioResults');
+  if (!wrap) return;
+  if (!analystRecordingResults.length) {
+    wrap.innerHTML = '<div class="analyst-empty small">No matching recordings.</div>';
+    return;
+  }
+  const attached = new Set((activeAnalystChat?.attachments || []).map(a => a.recording));
+  wrap.innerHTML = analystRecordingResults.map((r, idx) => `
+    <div class="analyst-audio-row">
+      <div class="analyst-audio-main">
+        <b>${escapeHtml(r.business || 'Unknown business')}</b>
+        <span>${escapeHtml([r.phone, r.outcome, r.date].filter(Boolean).join(' · '))}</span>
+        <small>${escapeHtml(r.recording || '')}</small>
+      </div>
+      <button class="analyst-lite-btn ${attached.has(r.recording) ? 'attached' : ''}" data-idx="${idx}">${attached.has(r.recording) ? 'Added' : 'Add'}</button>
+    </div>
+  `).join('');
+  wrap.querySelectorAll('button[data-idx]').forEach(btn => {
+    btn.addEventListener('click', () => addAnalystAttachment(analystRecordingResults[parseInt(btn.dataset.idx)]));
+  });
+}
+
+async function addAnalystAttachment(item) {
+  if (!activeAnalystChatId || !item) return;
+  const res = await fetch(`/api/analyst/chats/${activeAnalystChatId}/attachments`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(item),
+  });
+  const chat = await res.json();
+  activeAnalystChat = chat;
+  await refreshAnalystChats();
+  renderAnalystAttachments(chat.attachments || []);
+  renderAnalystAudioResults();
+}
+
+async function removeAnalystAttachment(recording) {
+  if (!activeAnalystChatId || !recording) return;
+  const res = await fetch(`/api/analyst/chats/${activeAnalystChatId}/attachments/${encodeURIComponent(recording)}`, { method: 'DELETE' });
+  const chat = await res.json();
+  activeAnalystChat = chat;
+  await refreshAnalystChats();
+  renderAnalystAttachments(chat.attachments || []);
+}
+
+function renderAnalystMarkdown(text) {
+  const src = String(text || '').replace(/\r\n/g, '\n');
+  const lines = src.split('\n');
+  let html = '';
+  let inUl = false, inOl = false, inCode = false, code = [];
+  const inline = s => escapeHtml(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  const closeLists = () => {
+    if (inUl) { html += '</ul>'; inUl = false; }
+    if (inOl) { html += '</ol>'; inOl = false; }
+  };
+  for (const line of lines) {
+    if (line.trim().startsWith('```')) {
+      if (inCode) { html += `<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`; code = []; inCode = false; }
+      else { closeLists(); inCode = true; }
+      continue;
+    }
+    if (inCode) { code.push(line); continue; }
+    const t = line.trim();
+    if (!t) { closeLists(); html += '<br>'; continue; }
+    if (/^###\s+/.test(t)) { closeLists(); html += `<h3>${inline(t.replace(/^###\s+/, ''))}</h3>`; continue; }
+    if (/^##\s+/.test(t)) { closeLists(); html += `<h2>${inline(t.replace(/^##\s+/, ''))}</h2>`; continue; }
+    if (/^#\s+/.test(t)) { closeLists(); html += `<h1>${inline(t.replace(/^#\s+/, ''))}</h1>`; continue; }
+    if (/^[-*]\s+/.test(t)) { if (!inUl) { closeLists(); html += '<ul>'; inUl = true; } html += `<li>${inline(t.replace(/^[-*]\s+/, ''))}</li>`; continue; }
+    if (/^\d+\.\s+/.test(t)) { if (!inOl) { closeLists(); html += '<ol>'; inOl = true; } html += `<li>${inline(t.replace(/^\d+\.\s+/, ''))}</li>`; continue; }
+    closeLists();
+    html += `<p>${inline(t)}</p>`;
+  }
+  closeLists();
+  if (inCode) html += `<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`;
+  return html;
 }

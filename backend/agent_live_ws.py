@@ -83,6 +83,7 @@ class GPTLiveCallHandler:
         self._out_audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._out_audio_task = None
         self._stop = False
+        self._ending = False
         self._cleaned = False
 
         self.metrics = CallMetrics(model="gpt-live-1")
@@ -354,7 +355,8 @@ class GPTLiveCallHandler:
                     await self._push_partial("agent", text)
                 low = self._output_text.lower()
                 if "[hangup]" in low or any(p in low for p in self.end_phrases):
-                    asyncio.create_task(self._delayed_hangup())
+                    print(f"[GPT-LIVE END PHRASE] {text[:120]}")
+                    await self._hangup("end phrase")
             return
 
         if typ == "session.usage.updated":
@@ -423,9 +425,9 @@ class GPTLiveCallHandler:
             if not buf and self._out_audio_queue.empty():
                 self._agent_turn_open = False
 
-    async def _clear_twilio_output(self, reason: str):
+    async def _clear_twilio_output(self, reason: str, force: bool = False):
         now = time.time()
-        if now - self._last_clear_at < 0.7:
+        if not force and now - self._last_clear_at < 0.7:
             return
         self._last_clear_at = now
         self._audio_clear_seq += 1
@@ -454,8 +456,8 @@ class GPTLiveCallHandler:
         self.outcome = "ivr"
         await self._push_partial("prospect", text)
         await self._push_status("ended", "Phone tree / IVR detected")
-        await self._clear_twilio_output("ivr")
-        await self._hangup()
+        await self._clear_twilio_output("ivr", force=True)
+        await self._hangup("ivr")
 
     async def _send_twilio_audio(self, payload_b64: str):
         if not self.stream_sid:
@@ -484,9 +486,22 @@ class GPTLiveCallHandler:
     async def _delayed_hangup(self):
         await asyncio.sleep(1.2)
         if not self._stop:
-            await self._hangup()
+            await self._hangup("delayed")
 
-    async def _hangup(self):
+    async def _hangup(self, reason: str = ""):
+        if self._ending:
+            return
+        self._ending = True
+        if reason:
+            print(f"[GPT-LIVE HANGUP] {reason}")
+        try:
+            await self._push_status("ended", f"Ending call{': ' + reason if reason else ''}")
+        except Exception:
+            pass
+        try:
+            await self._clear_twilio_output(reason or "hangup", force=True)
+        except Exception:
+            pass
         self._stop = True
         await self._close_live()
         if not self.call_sid or not TWILIO_ACCOUNT_SID:

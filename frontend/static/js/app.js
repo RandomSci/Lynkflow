@@ -98,6 +98,16 @@ function renderNav() {
     closeSidebar();
   });
   nav.appendChild(analyticsItem);
+
+  const analystItem = document.createElement('div');
+  analystItem.className = 'nav-item';
+  analystItem.dataset.id = 'analyst';
+  analystItem.innerHTML = `<span class="nav-icon">🤖</span><span>AI Analyst</span>`;
+  analystItem.addEventListener('click', () => {
+    if (typeof loadAnalystPage === 'function') loadAnalystPage();
+    closeSidebar();
+  });
+  nav.appendChild(analystItem);
 }
 
 function setActiveNav(id) {

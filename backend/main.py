@@ -56,6 +56,9 @@ _call_leads: dict[str, dict] = {}  # call_sid -> lead metadata for late Twilio c
 _pending_recordings: dict[str, str] = {}  # call_sid -> Twilio recording saved before history write
 _REC_DIR = Path(__file__).parent / "recordings"
 _REC_DIR.mkdir(exist_ok=True)
+_TRANSCRIPT_DIR = _REC_DIR / "transcripts"
+_TRANSCRIPT_DIR.mkdir(exist_ok=True)
+_ANALYST_CHAT_FILE = Path(__file__).parent / "analytics_chats.json"
 app.mount("/recordings", StaticFiles(directory=_REC_DIR), name="recordings")
 
 # ── Auto dialer state (in-memory per server process) ─────────────────────────
@@ -345,6 +348,327 @@ async def _download_twilio_recording(call_sid: str, recording_sid: str, recordin
     filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}_{suffix}_twilio.wav"
     (_REC_DIR / filename).write_bytes(resp.content)
     return filename
+
+
+def _safe_recording_path(recording: str) -> Path:
+    name = Path(str(recording or "")).name
+    if not name:
+        raise HTTPException(400, "recording required")
+    path = (_REC_DIR / name).resolve()
+    rec_root = _REC_DIR.resolve()
+    if rec_root not in path.parents or not path.exists() or not path.is_file():
+        raise HTTPException(404, "recording not found")
+    if path.suffix.lower() not in {".wav", ".mp3", ".m4a", ".txt"}:
+        raise HTTPException(400, "unsupported recording type")
+    return path
+
+
+def _transcript_cache_path(recording: str) -> Path:
+    name = Path(str(recording or "")).name
+    digest = hashlib.md5(name.encode()).hexdigest()[:10]
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(name).stem)[:80]
+    return _TRANSCRIPT_DIR / f"{stem}_{digest}.json"
+
+
+def _extract_contact_candidates(text: str) -> dict:
+    email_pattern = r"[A-Za-z0-9._%+-]+\s*(?:@|\bat\b)\s*[A-Za-z0-9.-]+\s*(?:\.|\bdot\b)\s*[A-Za-z]{2,}"
+    raw_emails = re.findall(email_pattern, text, flags=re.IGNORECASE)
+    emails = []
+    for e in raw_emails:
+        cleaned = e.lower().strip()
+        cleaned = re.sub(r"\s+at\s+", "@", cleaned)
+        cleaned = re.sub(r"\s+dot\s+", ".", cleaned)
+        cleaned = re.sub(r"\s+", "", cleaned)
+        if "@" in cleaned and "." in cleaned:
+            emails.append(cleaned)
+
+    spoken_pattern = r"\b([A-Za-z][A-Za-z0-9._-]*(?:\s+[A-Za-z][A-Za-z0-9._-]*){0,2})\s+at\s+([A-Za-z0-9][A-Za-z0-9-]*(?:\s+[A-Za-z0-9][A-Za-z0-9-]*){0,4})\s+dot\s+([A-Za-z]{2,})\b"
+    for local, domain, tld in re.findall(spoken_pattern, text, flags=re.IGNORECASE):
+        local_clean = re.sub(r"[^a-z0-9._%+-]+", "", local.lower())
+        local_clean = re.sub(r"^(itis|its|is|emailis)", "", local_clean)
+        domain_clean = re.sub(r"[^a-z0-9-]+", "", domain.lower())
+        if local_clean and domain_clean:
+            emails.append(f"{local_clean}@{domain_clean}.{tld.lower()}")
+
+    phone_pattern = r"(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}"
+    phones = re.findall(phone_pattern, text)
+    return {
+        "emails": sorted(set(emails)),
+        "phones": sorted(set(p.strip() for p in phones if p.strip())),
+    }
+
+
+async def _transcribe_recording(recording: str) -> dict:
+    path = _safe_recording_path(recording)
+    cache = _transcript_cache_path(recording)
+    if cache.exists():
+        try:
+            return json.loads(cache.read_text())
+        except Exception:
+            pass
+
+    if path.suffix.lower() == ".txt":
+        text = path.read_text(errors="ignore")
+    else:
+        if not OPENAI_API_KEY:
+            raise HTTPException(500, "OPENAI_API_KEY not set")
+        async with httpx.AsyncClient(timeout=180) as client:
+            with path.open("rb") as f:
+                resp = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    data={"model": "whisper-1", "response_format": "json"},
+                    files={"file": (path.name, f, "audio/wav")},
+                )
+        if resp.status_code != 200:
+            raise HTTPException(502, f"Transcription failed: {resp.text}")
+        text = resp.json().get("text", "").strip()
+
+    data = {
+        "recording": Path(recording).name,
+        "transcript": text,
+        "contacts": _extract_contact_candidates(text),
+        "cached": False,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    cache.write_text(json.dumps(data, indent=2))
+    return data
+
+
+async def _ask_transcript_agent(recording: str, question: str) -> dict:
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OPENAI_API_KEY not set")
+    transcript = await _transcribe_recording(recording)
+    q = (question or "").strip()
+    if not q:
+        q = "Summarize this call, extract any emails or phone numbers, and draft a short follow-up message I can copy."
+
+    prompt = (
+        "You are a call QA assistant for Lynkflow. Answer only from the transcript. "
+        "If a detail is uncertain, say it is uncertain. Extract emails, phone numbers, names, callback times, and useful follow-up context. "
+        "When drafting a message, make it concise and copy-ready. Do not invent facts."
+    )
+    async with httpx.AsyncClient(timeout=45) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-4.1",
+                "temperature": 0.2,
+                "max_tokens": 700,
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": f"Transcript:\n{transcript['transcript']}\n\nQuestion:\n{q}"},
+                ],
+            },
+        )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Transcript agent failed: {resp.text}")
+    answer = resp.json()["choices"][0]["message"].get("content", "").strip()
+    return {"recording": Path(recording).name, "question": q, "answer": answer, "transcript": transcript}
+
+
+def _load_analyst_chats() -> dict:
+    if not _ANALYST_CHAT_FILE.exists():
+        return {"chats": []}
+    try:
+        data = json.loads(_ANALYST_CHAT_FILE.read_text())
+        if isinstance(data.get("chats"), list):
+            return data
+    except Exception:
+        pass
+    return {"chats": []}
+
+
+def _save_analyst_chats(data: dict) -> None:
+    _ANALYST_CHAT_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _find_analyst_chat(data: dict, chat_id: str) -> dict:
+    for chat in data.get("chats", []):
+        if chat.get("id") == chat_id:
+            return chat
+    raise HTTPException(404, "chat not found")
+
+
+def _new_analyst_chat(title: str = "New chat") -> dict:
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "id": uuid.uuid4().hex,
+        "title": title or "New chat",
+        "created_at": now,
+        "updated_at": now,
+        "messages": [],
+        "attachments": [],
+    }
+
+
+def _recording_catalog(days: int = 365, q: str = "") -> list[dict]:
+    from call_history import load_calls
+    query = (q or "").strip().lower()
+    calls = sorted(load_calls(days), key=lambda c: c.get("ts", 0), reverse=True)
+    out = []
+    seen = set()
+    for c in calls:
+        recording = c.get("recording") or ""
+        if not recording or recording in seen:
+            continue
+        seen.add(recording)
+        item = {
+            "recording": recording,
+            "business": c.get("business", ""),
+            "phone": c.get("phone", ""),
+            "outcome": c.get("outcome", ""),
+            "duration_s": c.get("duration_s", 0),
+            "date": c.get("date", ""),
+            "ts": c.get("ts", 0),
+        }
+        haystack = " ".join(str(v) for v in item.values()).lower()
+        if query and query not in haystack:
+            continue
+        out.append(item)
+    return out[:200]
+
+
+def _call_matches_question(call: dict, question: str) -> bool:
+    q = question.lower()
+    business = str(call.get("business") or "").lower()
+    if business and business in q:
+        return True
+    tokens = [t for t in re.split(r"\W+", business) if len(t) >= 4]
+    return bool(tokens and sum(1 for t in tokens if t in q) >= min(2, len(tokens)))
+
+
+def _is_broad_analytics_question(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in (
+        "which", "anyone", "all", "these", "provided", "email", "number",
+        "phone", "info", "information", "interested", "callback", "summary",
+        "summarize", "tell me about", "what happened",
+    ))
+
+
+async def _build_analyst_context(question: str, days: int = 30, attachments: list[dict] | None = None) -> dict:
+    from call_history import load_calls
+    calls = sorted(load_calls(days), key=lambda c: c.get("ts", 0), reverse=True)
+    recent = calls[:80]
+    matched = [c for c in recent if _call_matches_question(c, question)]
+    broad = _is_broad_analytics_question(question)
+
+    attachments = attachments or []
+    attached_recordings = {a.get("recording") for a in attachments if a.get("recording")}
+    attached_calls = [c for c in calls if c.get("recording") in attached_recordings]
+    for a in attachments:
+        if not any(c.get("recording") == a.get("recording") for c in attached_calls):
+            attached_calls.append({
+                "business": a.get("business", ""),
+                "phone": a.get("phone", ""),
+                "outcome": a.get("outcome", ""),
+                "duration_s": a.get("duration_s", 0),
+                "recording": a.get("recording", ""),
+                "date": a.get("date", ""),
+            })
+
+    selected = attached_calls + (matched or (recent[:16] if broad else recent[:8]))
+    deduped = []
+    seen_keys = set()
+    for call in selected:
+        key = call.get("recording") or call.get("call_sid") or call.get("business")
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(call)
+    selected = deduped[:24]
+    transcripts = []
+    auto_transcribed = []
+
+    for call in selected:
+        recording = call.get("recording")
+        if not recording:
+            continue
+        cache = _transcript_cache_path(recording)
+        should_auto = recording in attached_recordings or bool(matched) or broad
+        if not cache.exists() and not should_auto:
+            continue
+        try:
+            was_cached = cache.exists()
+            t = await _transcribe_recording(recording)
+            transcripts.append({
+                "business": call.get("business", ""),
+                "phone": call.get("phone", ""),
+                "outcome": call.get("outcome", ""),
+                "recording": recording,
+                "transcript": t.get("transcript", ""),
+                "contacts": t.get("contacts", {}),
+            })
+            if not was_cached:
+                auto_transcribed.append(recording)
+        except Exception as e:
+            transcripts.append({
+                "business": call.get("business", ""),
+                "phone": call.get("phone", ""),
+                "outcome": call.get("outcome", ""),
+                "recording": recording,
+                "error": str(e),
+            })
+
+    summary_rows = []
+    for c in recent:
+        summary_rows.append({
+            "business": c.get("business", ""),
+            "phone": c.get("phone", ""),
+            "outcome": c.get("outcome", ""),
+            "duration_s": c.get("duration_s", 0),
+            "recording": c.get("recording", ""),
+            "followup_note": c.get("followup_note", ""),
+            "date": c.get("date", ""),
+        })
+
+    return {
+        "days": days,
+        "calls": summary_rows,
+        "attachments": attachments,
+        "transcripts": transcripts,
+        "auto_transcribed": auto_transcribed,
+    }
+
+
+async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict:
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OPENAI_API_KEY not set")
+    context = await _build_analyst_context(question, days, chat.get("attachments", []))
+    prior = [m for m in chat.get("messages", [])[-10:] if m.get("role") in {"user", "assistant"}]
+    system = (
+        "You are Lynkflow's internal call analyst. You have access to call history and available transcripts. "
+        "Attached recordings are selected by the operator and are the highest-priority context. "
+        "Answer the operator's question directly. If they ask about a specific business, focus on that business. "
+        "If they ask which calls provided information, list business, info found, and why it matters. "
+        "If asked to draft a message, create concise copy-ready text. "
+        "Never invent emails, phone numbers, callback times, or interest. If transcript evidence is missing, say so."
+    )
+    messages = [{"role": "system", "content": system}]
+    for m in prior:
+        messages.append({"role": m["role"], "content": m.get("content", "")})
+    messages.append({
+        "role": "user",
+        "content": f"Call context JSON:\n{json.dumps(context, ensure_ascii=False)[:60000]}\n\nQuestion:\n{question}",
+    })
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "gpt-4.1", "temperature": 0.2, "max_tokens": 1000, "messages": messages},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Analyst failed: {resp.text}")
+    return {
+        "answer": resp.json()["choices"][0]["message"].get("content", "").strip(),
+        "context": {
+            "calls": len(context["calls"]),
+            "transcripts": len(context["transcripts"]),
+            "attachments": len(context.get("attachments", [])),
+        },
+    }
 
 
 async def _start_agent_call(phone: str, lead: dict, base_url: str) -> str:
@@ -2201,6 +2525,157 @@ async def agent_call_price(call_sid: str):
 async def get_analytics(days: int = 30):
     from call_history import summarise
     return JSONResponse(summarise(days))
+
+
+@app.post("/api/analytics/transcribe")
+async def analytics_transcribe(request: Request):
+    data = await request.json()
+    recording = data.get("recording", "")
+    was_cached = _transcript_cache_path(recording).exists()
+    result = await _transcribe_recording(recording)
+    result["cached"] = was_cached
+    return JSONResponse(result)
+
+
+@app.post("/api/analytics/ask")
+async def analytics_ask(request: Request):
+    data = await request.json()
+    recording = data.get("recording", "")
+    question = data.get("question", "")
+    return JSONResponse(await _ask_transcript_agent(recording, question))
+
+
+@app.get("/api/analyst/chats")
+async def analyst_chats():
+    data = _load_analyst_chats()
+    chats = [
+        {k: chat.get(k) for k in ("id", "title", "created_at", "updated_at")}
+        | {"message_count": len(chat.get("messages", [])), "attachment_count": len(chat.get("attachments", []))}
+        for chat in sorted(data.get("chats", []), key=lambda c: c.get("updated_at", ""), reverse=True)
+    ]
+    return JSONResponse({"chats": chats})
+
+
+@app.get("/api/analyst/recordings")
+async def analyst_recordings(days: int = 365, q: str = ""):
+    return JSONResponse({"recordings": _recording_catalog(days=days, q=q)})
+
+
+@app.post("/api/analyst/chats")
+async def analyst_create_chat(request: Request):
+    payload = await request.json()
+    data = _load_analyst_chats()
+    chat = _new_analyst_chat(payload.get("title") or "New chat")
+    data.setdefault("chats", []).append(chat)
+    _save_analyst_chats(data)
+    return JSONResponse(chat)
+
+
+@app.get("/api/analyst/chats/{chat_id}")
+async def analyst_get_chat(chat_id: str):
+    data = _load_analyst_chats()
+    return JSONResponse(_find_analyst_chat(data, chat_id))
+
+
+@app.patch("/api/analyst/chats/{chat_id}")
+async def analyst_update_chat(chat_id: str, request: Request):
+    payload = await request.json()
+    data = _load_analyst_chats()
+    chat = _find_analyst_chat(data, chat_id)
+    title = str(payload.get("title") or "").strip()
+    if title:
+        chat["title"] = title[:80]
+        chat["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    if "attachments" in payload and isinstance(payload["attachments"], list):
+        clean = []
+        seen = set()
+        for a in payload["attachments"][:30]:
+            rec = Path(str(a.get("recording", ""))).name
+            if not rec or rec in seen:
+                continue
+            seen.add(rec)
+            clean.append({
+                "recording": rec,
+                "business": str(a.get("business", ""))[:120],
+                "phone": str(a.get("phone", ""))[:40],
+                "outcome": str(a.get("outcome", ""))[:40],
+                "duration_s": a.get("duration_s", 0),
+                "date": str(a.get("date", ""))[:40],
+            })
+        chat["attachments"] = clean
+        chat["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _save_analyst_chats(data)
+    return JSONResponse(chat)
+
+
+@app.post("/api/analyst/chats/{chat_id}/attachments")
+async def analyst_add_attachment(chat_id: str, request: Request):
+    payload = await request.json()
+    data = _load_analyst_chats()
+    chat = _find_analyst_chat(data, chat_id)
+    existing = chat.setdefault("attachments", [])
+    existing_recs = {a.get("recording") for a in existing}
+    attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else [payload]
+    for a in attachments:
+        rec = Path(str(a.get("recording", ""))).name
+        if not rec or rec in existing_recs:
+            continue
+        _safe_recording_path(rec)
+        existing.append({
+            "recording": rec,
+            "business": str(a.get("business", ""))[:120],
+            "phone": str(a.get("phone", ""))[:40],
+            "outcome": str(a.get("outcome", ""))[:40],
+            "duration_s": a.get("duration_s", 0),
+            "date": str(a.get("date", ""))[:40],
+        })
+        existing_recs.add(rec)
+    chat["attachments"] = existing[:30]
+    chat["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _save_analyst_chats(data)
+    return JSONResponse(chat)
+
+
+@app.delete("/api/analyst/chats/{chat_id}/attachments/{recording}")
+async def analyst_remove_attachment(chat_id: str, recording: str):
+    data = _load_analyst_chats()
+    chat = _find_analyst_chat(data, chat_id)
+    rec = Path(urllib.parse.unquote(recording)).name
+    chat["attachments"] = [a for a in chat.get("attachments", []) if a.get("recording") != rec]
+    chat["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _save_analyst_chats(data)
+    return JSONResponse(chat)
+
+
+@app.delete("/api/analyst/chats/{chat_id}")
+async def analyst_delete_chat(chat_id: str):
+    data = _load_analyst_chats()
+    before = len(data.get("chats", []))
+    data["chats"] = [c for c in data.get("chats", []) if c.get("id") != chat_id]
+    if len(data["chats"]) == before:
+        raise HTTPException(404, "chat not found")
+    _save_analyst_chats(data)
+    return JSONResponse({"success": True})
+
+
+@app.post("/api/analyst/chats/{chat_id}/message")
+async def analyst_message(chat_id: str, request: Request):
+    payload = await request.json()
+    question = str(payload.get("message") or "").strip()
+    if not question:
+        raise HTTPException(400, "message required")
+    days = max(1, min(365, int(payload.get("days") or 30)))
+    data = _load_analyst_chats()
+    chat = _find_analyst_chat(data, chat_id)
+    now = datetime.now().isoformat(timespec="seconds")
+    chat.setdefault("messages", []).append({"role": "user", "content": question, "ts": now})
+    result = await _ask_global_analyst(chat, question, days)
+    chat["messages"].append({"role": "assistant", "content": result["answer"], "ts": datetime.now().isoformat(timespec="seconds"), "context": result["context"]})
+    if chat.get("title") == "New chat":
+        chat["title"] = question[:60]
+    chat["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _save_analyst_chats(data)
+    return JSONResponse({"chat": chat, "answer": result["answer"], "context": result["context"]})
 
 @app.get("/api/recordings")
 async def list_recordings():
