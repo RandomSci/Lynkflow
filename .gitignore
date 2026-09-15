@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 backend/recordings/
+backend/call_history.jsonl
