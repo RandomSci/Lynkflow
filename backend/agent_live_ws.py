@@ -60,6 +60,16 @@ IVR_MARKERS = [
     "local text section", "local tech",
 ]
 
+AGENT_END_MARKERS = [
+    "thanks for your help", "thank you for your help", "appreciate your help",
+    "i appreciate it", "appreciate it", "that's everything", "that is everything",
+    "no problem at all", "no worries", "i'll let you go", "i will let you go",
+    "i'll try another time", "i will try another time", "try another time",
+    "thanks for your time", "thank you for your time", "have a good day",
+    "have a great day", "have a good one", "have a great one", "take care",
+    "goodbye", "bye now", "talk soon", "all set", "we're all set",
+]
+
 
 def _clean_filename(s: str) -> str:
     text = re.sub(r"[^A-Za-z0-9_. -]+", "", str(s or "")).strip()
@@ -107,6 +117,9 @@ class GPTLiveCallHandler:
         self._live_usage_source = "local_duration_fallback"
         self._call_started_at = time.time()
         self._last_input_transcript_at = 0.0
+        self._last_output_transcript_at = 0.0
+        self._last_activity_at = time.time()
+        self._ending_started_at = 0.0
         self._last_clear_at = 0.0
         self._audio_clear_seq = 0
         self._prospect_loud_frames = 0
@@ -135,16 +148,28 @@ class GPTLiveCallHandler:
             await asyncio.sleep(1)
             now = time.time()
             elapsed = now - self._call_started_at
+            silence_timeout = getattr(self.cfg, "silence_timeout_s", 20) or 20
+            if self._ending and self._ending_started_at and (now - self._ending_started_at) > 6:
+                print("[GPT-LIVE WATCHDOG] ending state exceeded 6s; forcing local close")
+                self._stop = True
+                await self._close_live()
+                return
             if self.call_sid and self.outcome == "no_answer" and elapsed > max(25, getattr(self.cfg, "silence_timeout_s", 20)):
                 print("[GPT-LIVE WATCHDOG] no human transcript detected")
                 await self._push_status("ended", "No human detected")
-                await self._hangup()
+                await self._hangup("no human detected")
                 return
+            if self.call_sid and self.outcome != "no_answer" and not self._agent_turn_open:
+                idle = now - max(self._last_activity_at, self._last_input_transcript_at, self._last_output_transcript_at)
+                if idle > max(12, silence_timeout):
+                    print(f"[GPT-LIVE WATCHDOG] idle after conversation ({idle:.1f}s)")
+                    await self._hangup("idle after conversation")
+                    return
             max_duration = getattr(self.cfg, "max_duration_s", 300) or 300
             if elapsed > max_duration and self.outcome not in {"conversation", "interested", "callback"}:
                 print("[GPT-LIVE WATCHDOG] max duration without useful conversation")
                 await self._push_status("ended", "Max duration reached")
-                await self._hangup()
+                await self._hangup("max duration")
                 return
 
     def _instructions(self) -> str:
@@ -323,6 +348,7 @@ class GPTLiveCallHandler:
                 text = self._input_text.strip()
                 if text:
                     self._last_input_transcript_at = time.time()
+                    self._last_activity_at = self._last_input_transcript_at
                     if self._is_ivr_text(text):
                         await self._handle_ivr_detected(text)
                         return
@@ -352,9 +378,11 @@ class GPTLiveCallHandler:
                 self._output_text += delta
                 text = self._output_text.replace("[HANGUP]", "").strip()
                 if text:
+                    self._last_output_transcript_at = time.time()
+                    self._last_activity_at = self._last_output_transcript_at
                     await self._push_partial("agent", text)
                 low = self._output_text.lower()
-                if "[hangup]" in low or any(p in low for p in self.end_phrases):
+                if "[hangup]" in low or self._is_agent_end_text(low):
                     print(f"[GPT-LIVE END PHRASE] {text[:120]}")
                     await self._hangup("end phrase")
             return
@@ -451,6 +479,10 @@ class GPTLiveCallHandler:
         low = text.lower()
         return any(marker in low for marker in IVR_MARKERS)
 
+    def _is_agent_end_text(self, text: str) -> bool:
+        low = text.lower()
+        return any(p in low for p in self.end_phrases) or any(marker in low for marker in AGENT_END_MARKERS)
+
     async def _handle_ivr_detected(self, text: str):
         print(f"[GPT-LIVE IVR] {text[:120]}")
         self.outcome = "ivr"
@@ -492,6 +524,7 @@ class GPTLiveCallHandler:
         if self._ending:
             return
         self._ending = True
+        self._ending_started_at = time.time()
         if reason:
             print(f"[GPT-LIVE HANGUP] {reason}")
         try:
@@ -502,19 +535,23 @@ class GPTLiveCallHandler:
             await self._clear_twilio_output(reason or "hangup", force=True)
         except Exception:
             pass
+        if self.call_sid and TWILIO_ACCOUNT_SID:
+            try:
+                async with httpx.AsyncClient(timeout=4) as client:
+                    resp = await client.post(
+                        f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{self.call_sid}.json",
+                        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                        data={"Status": "completed"},
+                    )
+                    print(f"[GPT-LIVE TWILIO COMPLETE] {self.call_sid} status={resp.status_code}")
+            except Exception as e:
+                print(f"[GPT-LIVE HANGUP ERROR] {e}")
         self._stop = True
         await self._close_live()
-        if not self.call_sid or not TWILIO_ACCOUNT_SID:
-            return
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(
-                    f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{self.call_sid}.json",
-                    auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-                    data={"Status": "completed"},
-                )
-        except Exception as e:
-            print(f"[GPT-LIVE HANGUP ERROR] {e}")
+            await self.twilio_ws.close()
+        except Exception:
+            pass
 
     async def _close_live(self):
         try:

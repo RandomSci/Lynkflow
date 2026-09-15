@@ -61,6 +61,14 @@ _TRANSCRIPT_DIR.mkdir(exist_ok=True)
 _ANALYST_CHAT_FILE = Path(__file__).parent / "analytics_chats.json"
 app.mount("/recordings", StaticFiles(directory=_REC_DIR), name="recordings")
 
+ANALYST_ABOUT = (
+    "Lynkflow builds AI voice agents for local service businesses. "
+    "The core offer is simple: help businesses never miss customer calls when they are busy, after hours, or already on another call. "
+    "The outbound AI agent Anna may have reached out to a business, spoken with a receptionist, owner, or staff member, and gathered useful info such as email, phone number, owner availability, interest level, or callback timing. "
+    "Follow-up emails should be short, professional, copy-ready, and mention that Anna from Lynkflow reached out about helping them handle customer calls so they do not miss leads. "
+    "Do not overpromise, do not invent facts, do not claim they were interested unless the transcript supports it, and do not use em dashes or long dashes."
+)
+
 # ── Auto dialer state (in-memory per server process) ─────────────────────────
 _autodial_state = {
     "running": False,
@@ -398,6 +406,10 @@ def _extract_contact_candidates(text: str) -> dict:
     }
 
 
+def _sanitize_analyst_answer(text: str) -> str:
+    return re.sub(r"[—–]", "-", str(text or "")).strip()
+
+
 async def _transcribe_recording(recording: str) -> dict:
     path = _safe_recording_path(recording)
     cache = _transcript_cache_path(recording)
@@ -464,7 +476,8 @@ async def _ask_transcript_agent(recording: str, question: str) -> dict:
         )
     if resp.status_code != 200:
         raise HTTPException(502, f"Transcript agent failed: {resp.text}")
-    answer = resp.json()["choices"][0]["message"].get("content", "").strip()
+    answer = resp.json()["choices"][0]["message"].get("content", "")
+    answer = _sanitize_analyst_answer(answer)
     return {"recording": Path(recording).name, "question": q, "answer": answer, "transcript": transcript}
 
 
@@ -550,6 +563,7 @@ def _is_broad_analytics_question(question: str) -> bool:
 
 async def _build_analyst_context(question: str, days: int = 30, attachments: list[dict] | None = None) -> dict:
     from call_history import load_calls
+    cfg = load_agent_config()
     calls = sorted(load_calls(days), key=lambda c: c.get("ts", 0), reverse=True)
     recent = calls[:80]
     matched = [c for c in recent if _call_matches_question(c, question)]
@@ -626,6 +640,10 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
 
     return {
         "days": days,
+        "about_lynkflow": ANALYST_ABOUT,
+        "current_agent_system_prompt": getattr(cfg, "system_prompt", ""),
+        "current_first_message": getattr(cfg, "first_message", ""),
+        "current_price": "$350 setup and $100/month unless your system prompt says otherwise",
         "calls": summary_rows,
         "attachments": attachments,
         "transcripts": transcripts,
@@ -639,12 +657,16 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
     context = await _build_analyst_context(question, days, chat.get("attachments", []))
     prior = [m for m in chat.get("messages", [])[-10:] if m.get("role") in {"user", "assistant"}]
     system = (
-        "You are Lynkflow's internal call analyst. You have access to call history and available transcripts. "
+        "You are Lynkflow's internal call analyst. You know Lynkflow's offer and you have access to call history and available transcripts. "
         "Attached recordings are selected by the operator and are the highest-priority context. "
         "Answer the operator's question directly. If they ask about a specific business, focus on that business. "
-        "If they ask which calls provided information, list business, info found, and why it matters. "
-        "If asked to draft a message, create concise copy-ready text. "
-        "Never invent emails, phone numbers, callback times, or interest. If transcript evidence is missing, say so."
+        "If they ask which calls provided information, use a compact markdown table with business, info found, evidence, and next action when that is clearer than prose. "
+        "If asked to draft an email/message, create concise copy-ready text under a heading named 'Copy-ready email' or 'Copy-ready message'. "
+        "The draft should mention Anna from Lynkflow reached out about helping them handle customer calls so they do not miss leads. "
+        "If a receptionist gave an email, write the message as a professional follow-up to the owner or office manager without pretending the owner was interested. "
+        "If you include subject/body, keep both inside the same copy-ready section. "
+        "Never invent emails, phone numbers, callback times, or interest. If transcript evidence is missing, say so. "
+        "Do not use em dashes or long dashes. Use commas, periods, colons, or simple hyphens only."
     )
     messages = [{"role": "system", "content": system}]
     for m in prior:
@@ -661,8 +683,10 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
         )
     if resp.status_code != 200:
         raise HTTPException(502, f"Analyst failed: {resp.text}")
+    answer = resp.json()["choices"][0]["message"].get("content", "")
+    answer = _sanitize_analyst_answer(answer)
     return {
-        "answer": resp.json()["choices"][0]["message"].get("content", "").strip(),
+        "answer": answer,
         "context": {
             "calls": len(context["calls"]),
             "transcripts": len(context["transcripts"]),

@@ -1801,7 +1801,7 @@ async function openAnalyticsAiPanel(recording, business) {
   document.getElementById('anAiAskBtn')?.addEventListener('click', askAnalyticsAi);
   document.getElementById('anAiCopyBtn')?.addEventListener('click', async () => {
     const text = document.getElementById('anAiAnswer')?.textContent || '';
-    if (text) await navigator.clipboard.writeText(text);
+    if (text) await copyTextToClipboard(text);
   });
 
   try {
@@ -2016,14 +2016,70 @@ function renderAnalystChat(chat) {
     wrap.innerHTML = '<div class="analyst-empty">Ask something like “which calls provided info?” or “tell me what happened in R.E. Michel.”</div>';
     return;
   }
-  wrap.innerHTML = messages.map(m => `
-    <div class="analyst-msg analyst-msg--${m.role}">
-      <div class="analyst-msg-role">${m.role === 'user' ? 'You' : 'AI Analyst'}</div>
-      <div class="analyst-msg-text markdown-body">${renderAnalystMarkdown(m.content || '')}</div>
-      ${m.context ? `<div class="analyst-msg-context">Used ${m.context.calls || 0} calls / ${m.context.transcripts || 0} transcripts${m.context.attachments ? ' / ' + m.context.attachments + ' attached audio' : ''}</div>` : ''}
-    </div>
-  `).join('');
+  wrap.innerHTML = messages.map((m, idx) => renderAnalystMessage(m, idx)).join('');
+  wireAnalystCopyButtons(wrap, messages);
   wrap.scrollTop = wrap.scrollHeight;
+}
+
+function renderAnalystMessage(m, idx) {
+  const role = m.role === 'user' ? 'user' : 'assistant';
+  const label = role === 'user' ? 'You' : 'AI Analyst';
+  const copyAction = role === 'assistant'
+    ? `<div class="analyst-msg-actions"><button class="analyst-copy-btn" data-copy-message="${idx}">Copy answer</button></div>`
+    : '';
+  const context = m.context
+    ? `<div class="analyst-msg-context">Used ${m.context.calls || 0} calls / ${m.context.transcripts || 0} transcripts${m.context.attachments ? ' / ' + m.context.attachments + ' attached audio' : ''}</div>`
+    : '';
+  return `
+    <div class="analyst-msg analyst-msg--${role}" data-message-index="${idx}">
+      <div class="analyst-msg-role">${label}</div>
+      ${copyAction}
+      <div class="analyst-msg-text markdown-body">${renderAnalystMarkdown(m.content || '')}</div>
+      ${context}
+    </div>
+  `;
+}
+
+function wireAnalystCopyButtons(scope, messages = []) {
+  if (!scope) return;
+  scope.querySelectorAll('.analyst-copy-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      let text = '';
+      if (btn.dataset.copyMessage !== undefined) {
+        const msg = messages[parseInt(btn.dataset.copyMessage, 10)];
+        text = msg?.content || '';
+      } else {
+        const card = btn.closest('.analyst-copy-card');
+        text = card?.querySelector('.analyst-copy-body')?.innerText || '';
+      }
+      text = text.trim();
+      if (!text) return;
+      await copyTextToClipboard(text);
+      const original = btn.textContent;
+      btn.textContent = 'Copied';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = original;
+        btn.classList.remove('copied');
+      }, 1200);
+    });
+  });
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  ta.remove();
 }
 
 async function sendAnalystMessage() {
@@ -2172,33 +2228,166 @@ async function removeAnalystAttachment(recording) {
   renderAnalystAttachments(chat.attachments || []);
 }
 
-function renderAnalystMarkdown(text) {
+function renderAnalystMarkdown(text, options = {}) {
+  const allowCopyCards = options.allowCopyCards !== false;
   const src = String(text || '').replace(/\r\n/g, '\n');
   const lines = src.split('\n');
   let html = '';
-  let inUl = false, inOl = false, inCode = false, code = [];
+  let inUl = false, inOl = false, inCode = false, code = [], codeLang = '';
+
   const inline = s => escapeHtml(s)
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    .replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>')
+    .replace(/\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b/gi, '<a href="mailto:$1">$1</a>');
   const closeLists = () => {
     if (inUl) { html += '</ul>'; inUl = false; }
     if (inOl) { html += '</ol>'; inOl = false; }
   };
-  for (const line of lines) {
-    if (line.trim().startsWith('```')) {
-      if (inCode) { html += `<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`; code = []; inCode = false; }
-      else { closeLists(); inCode = true; }
+  const splitTableRow = line => {
+    let body = line.trim();
+    if (body.startsWith('|')) body = body.slice(1);
+    if (body.endsWith('|')) body = body.slice(0, -1);
+    const cells = [];
+    let cell = '', escaped = false;
+    for (const ch of body) {
+      if (ch === '|' && !escaped) {
+        cells.push(cell.trim());
+        cell = '';
+      } else {
+        cell += ch;
+      }
+      const isEscape = ch.charCodeAt(0) === 92;
+      escaped = isEscape && !escaped;
+      if (!isEscape) escaped = false;
+    }
+    cells.push(cell.trim());
+    return cells;
+  };
+  const isTableRow = line => /\|/.test(line) && splitTableRow(line).length > 1;
+  const isTableSeparator = line => {
+    const cells = splitTableRow(line);
+    return cells.length > 1 && cells.every(c => /^:?-{3,}:?$/.test(c.replace(/\s/g, '')));
+  };
+  const tableAlign = marker => {
+    const c = marker.replace(/\s/g, '');
+    if (c.startsWith(':') && c.endsWith(':')) return 'center';
+    if (c.endsWith(':')) return 'right';
+    return 'left';
+  };
+  const headingParts = t => {
+    const m = t.match(/^(#{1,6})\s+(.+)$/);
+    return m ? { level: Math.min(m[1].length, 6), text: m[2].trim() } : null;
+  };
+  const isCopyHeading = t => {
+    const h = headingParts(t);
+    return h && /(copy[-\s]?ready|draft|follow[-\s]?up|email|message|sms|text to send|send this)/i.test(h.text);
+  };
+  const renderCopyCard = (label, bodyText) => `
+    <div class="analyst-copy-card">
+      <div class="analyst-copy-head"><span>${escapeHtml(label || 'Copy-ready text')}</span><button class="analyst-copy-btn" type="button">Copy</button></div>
+      <div class="analyst-copy-body">${renderAnalystMarkdown(bodyText, { allowCopyCards: false })}</div>
+    </div>
+  `;
+  const renderTable = (headers, markers, rows) => {
+    const aligns = markers.map(tableAlign);
+    const cellStyle = idx => ` style="text-align:${aligns[idx] || 'left'}"`;
+    const head = headers.map((h, idx) => `<th${cellStyle(idx)}>${inline(h)}</th>`).join('');
+    const body = rows.map(row => `<tr>${headers.map((_, idx) => `<td${cellStyle(idx)}>${inline(row[idx] || '')}</td>`).join('')}</tr>`).join('');
+    return `<div class="markdown-table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const t = line.trim();
+
+    if (t.startsWith('```')) {
+      if (inCode) {
+        const copyableCode = allowCopyCards && /^(email|message|sms|text|followup|follow-up)$/i.test(codeLang);
+        closeLists();
+        html += copyableCode
+          ? renderCopyCard('Copy-ready message', code.join('\n'))
+          : `<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`;
+        code = [];
+        codeLang = '';
+        inCode = false;
+      } else {
+        closeLists();
+        inCode = true;
+        codeLang = t.replace(/^```/, '').trim().toLowerCase();
+      }
       continue;
     }
     if (inCode) { code.push(line); continue; }
-    const t = line.trim();
+
     if (!t) { closeLists(); html += '<br>'; continue; }
-    if (/^###\s+/.test(t)) { closeLists(); html += `<h3>${inline(t.replace(/^###\s+/, ''))}</h3>`; continue; }
-    if (/^##\s+/.test(t)) { closeLists(); html += `<h2>${inline(t.replace(/^##\s+/, ''))}</h2>`; continue; }
-    if (/^#\s+/.test(t)) { closeLists(); html += `<h1>${inline(t.replace(/^#\s+/, ''))}</h1>`; continue; }
+
+    if (allowCopyCards && isCopyHeading(t)) {
+      closeLists();
+      const h = headingParts(t);
+      const body = [];
+      i += 1;
+      while (i < lines.length) {
+        const next = lines[i].trim();
+        const nextHeading = headingParts(next);
+        if (nextHeading && nextHeading.level <= h.level) {
+          i -= 1;
+          break;
+        }
+        body.push(lines[i]);
+        i += 1;
+      }
+      const bodyText = body.join('\n').trim();
+      html += bodyText ? renderCopyCard(h.text, bodyText) : `<h${h.level}>${inline(h.text)}</h${h.level}>`;
+      continue;
+    }
+
+    if (allowCopyCards && /^Subject:\s+/i.test(t)) {
+      closeLists();
+      const body = [line];
+      i += 1;
+      while (i < lines.length && !headingParts(lines[i].trim())) {
+        body.push(lines[i]);
+        i += 1;
+      }
+      if (i < lines.length) i -= 1;
+      html += renderCopyCard('Copy-ready message', body.join('\n').trim());
+      continue;
+    }
+
+    if (isTableRow(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+      closeLists();
+      const headers = splitTableRow(line);
+      const markers = splitTableRow(lines[i + 1]);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && isTableRow(lines[i]) && !isTableSeparator(lines[i])) {
+        rows.push(splitTableRow(lines[i]));
+        i += 1;
+      }
+      i -= 1;
+      html += renderTable(headers, markers, rows);
+      continue;
+    }
+
+    if (/^---+$|^\*\*\*+$|^___+$/.test(t)) { closeLists(); html += '<hr>'; continue; }
+    if (/^>\s?/.test(t)) { closeLists(); html += `<blockquote>${inline(t.replace(/^>\s?/, ''))}</blockquote>`; continue; }
+
+    const h = headingParts(t);
+    if (h) { closeLists(); html += `<h${h.level}>${inline(h.text)}</h${h.level}>`; continue; }
+
+    const task = t.match(/^[-*]\s+\[([ x])\]\s+(.+)$/i);
+    if (task) {
+      if (!inUl) { closeLists(); html += '<ul>'; inUl = true; }
+      html += `<li class="markdown-task"><input type="checkbox" disabled ${task[1].toLowerCase() === 'x' ? 'checked' : ''}> ${inline(task[2])}</li>`;
+      continue;
+    }
     if (/^[-*]\s+/.test(t)) { if (!inUl) { closeLists(); html += '<ul>'; inUl = true; } html += `<li>${inline(t.replace(/^[-*]\s+/, ''))}</li>`; continue; }
     if (/^\d+\.\s+/.test(t)) { if (!inOl) { closeLists(); html += '<ol>'; inOl = true; } html += `<li>${inline(t.replace(/^\d+\.\s+/, ''))}</li>`; continue; }
+
     closeLists();
     html += `<p>${inline(t)}</p>`;
   }
