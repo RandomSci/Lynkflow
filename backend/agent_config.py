@@ -8,6 +8,10 @@ from pydantic import BaseModel
 
 _CONFIG_FILE = Path(__file__).parent / "agent_config.json"
 
+PUBLIC_CONTACT_EMAIL = "lynkflowagent@gmail.com"
+PUBLIC_WEBSITE_URL = "https://randomsci.github.io/Lynkflow_Website/"
+PUBLIC_WEBSITE_LABEL = "LynkflowAgent.com"
+
 
 DEFAULT_FIRST_MESSAGE = (
     "Hi there, this is Anna. Am I speaking with the owner or office manager?"
@@ -36,6 +40,11 @@ If the answer is unclear, ask a quick clarifying question instead of pitching.
 If a receptionist, assistant, dispatcher, office staff member, answering service, or non-decision-maker answers, do not explain the product.
 Do not mention AI, automation, missed calls, lost jobs, pricing, replacing staff, demos, or how the product works.
 Your only goal is to reach the owner/office manager or get the best direct contact info or callback time.
+
+# APPROVED CONTACT INFO
+If someone asks for your email, give exactly: lynkflowagent@gmail.com.
+Never invent a different email. Never say Anna at Lynkflow dot com, info at Lynkflow dot com, or any other address.
+Do not give the website verbally on calls because the URL is too long. If someone asks for a website or link, say you can send more info by email and ask for the best email address.
 
 Useful gatekeeper lines, adapted naturally:
 - "No problem. Is the owner or office manager available?"
@@ -72,7 +81,7 @@ AI/robot: be honest that you are an AI caller from Lynkflow.
 Rude/DNC/remove me: apologize briefly, say you will remove them, and end with [HANGUP].
 
 # HARD RULES
-Never leave voicemail messages or have staff take a message for you. If voicemail or message-taking comes up, end the call politely with [HANGUP].
+Never leave voicemail messages. Never have staff take only your message without first asking for direct contact info or a callback time.
 Never pitch IVR systems, voicemail greetings, answering services, receptionists, dispatchers, staff, or anyone who has not confirmed decision-making authority.
 Never press buttons or respond to "press any key" prompts.
 Never say [HANGUP] out loud.
@@ -110,7 +119,7 @@ class AgentConfig(BaseModel):
     # ── Call behaviour ──────────────────────────────────────────────────────
     endpointing_ms: int = 600          # silence before agent responds
     utterance_end_ms: int = 1500       # silence marking end of a turn
-    silence_timeout_s: int = 20        # hang up after this much dead air
+    silence_timeout_s: int = 10        # hang up after this much dead air
     max_duration_s: int = 300          # hard cap on call length
     allow_interruption: bool = True    # barge-in
 

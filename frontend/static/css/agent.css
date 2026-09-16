@@ -1022,6 +1022,26 @@ i.an-day-conv { background: #10b981; }
   font-size: 11px; font-weight: 750; text-transform: uppercase; letter-spacing: 0.06em;
 }
 .analyst-copy-body { padding: 11px 12px 7px; color: #e2e8f0; }
+.analyst-copy-card--code { border-color: rgba(56,189,248,0.28); background: linear-gradient(145deg, rgba(8,47,73,0.34), rgba(15,23,42,0.68)); }
+.analyst-copy-card--code .analyst-copy-head { color: #bae6fd; background: rgba(14,116,144,0.22); border-bottom-color: rgba(56,189,248,0.2); }
+.analyst-copy-code { padding: 0; }
+.analyst-copy-code pre { margin: 0; border: 0; border-radius: 0; max-height: 340px; white-space: pre; }
+.analyst-copy-code code { background: transparent; color: #d1fae5; padding: 0; }
+.analyst-email-send-row {
+  display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 8px; align-items: center;
+  padding: 10px; border-top: 1px solid rgba(56,189,248,0.18); background: rgba(2,6,23,0.28);
+}
+.analyst-email-to {
+  min-width: 0; background: rgba(15,23,42,0.86); color: var(--text);
+  border: 1px solid rgba(148,163,184,0.24); border-radius: 9px; padding: 8px 10px;
+  font: inherit; font-size: 12px;
+}
+.analyst-send-email-btn, .analyst-email-connect {
+  background: linear-gradient(135deg, #0891b2, #2563eb); color: #fff; border: 0; border-radius: 999px;
+  padding: 8px 11px; cursor: pointer; font: inherit; font-size: 11.5px; font-weight: 700;
+}
+.analyst-send-email-btn:disabled { opacity: 0.62; cursor: wait; }
+.analyst-email-status { grid-column: 1 / -1; color: #93c5fd; font-size: 11px; min-height: 14px; }
 .analyst-msg-context { margin-top: 9px; color: #94a3b8; font-size: 11px; }
 .analyst-input-wrap { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 14px 18px; border-top: 1px solid rgba(148,163,184,0.16); flex-shrink: 0; }
 .analyst-input {
@@ -1074,6 +1094,7 @@ i.an-day-conv { background: #10b981; }
   .analyst-main { min-height: 680px; }
   .analyst-msg { max-width: 96%; }
   .analyst-msg-actions, .analyst-copy-head { justify-content: flex-start; }
+  .analyst-email-send-row { grid-template-columns: 1fr; }
   .markdown-table-wrap table { min-width: 460px; }
   .analyst-input-wrap, .analyst-search-row { grid-template-columns: 1fr; }
   .analyst-main-head, .analyst-modal-head { flex-direction: column; }

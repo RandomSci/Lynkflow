@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 backend/recordings/
 backend/call_history.jsonl
+backend/email_token.json

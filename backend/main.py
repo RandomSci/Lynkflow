@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import hashlib
+import secrets
 import urllib.parse
 import time
 import uuid
@@ -12,6 +13,9 @@ import re
 import wave
 import audioop
 from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -23,7 +27,14 @@ import websockets
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse, Dial
-from agent_config import AgentConfig, load_agent_config, save_agent_config as _save_agent_config
+from agent_config import (
+    AgentConfig,
+    PUBLIC_CONTACT_EMAIL,
+    PUBLIC_WEBSITE_LABEL,
+    PUBLIC_WEBSITE_URL,
+    load_agent_config,
+    save_agent_config as _save_agent_config,
+)
 from agent_ws import AgentCallHandler
 from agent_live_ws import GPTLiveCallHandler
 
@@ -43,6 +54,8 @@ TWILIO_API_KEY_SID = os.getenv("TWILIO_API_KEY_SID")
 TWILIO_API_KEY_SECRET = os.getenv("TWILIO_API_KEY_SECRET")
 GOOGLE_SHEETS_API_KEY = os.getenv("GOOGLE_SHEETS_API_KEY")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+LYNKFLOW_CONSOLE_ID = os.getenv("LynkFlow_Console_ID") or os.getenv("LYNKFLOW_CONSOLE_ID")
+LYNKFLOW_CONSOLE_SECRET = os.getenv("LynkFlow_Console_Secret") or os.getenv("LYNKFLOW_CONSOLE_SECRET")
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -59,13 +72,18 @@ _REC_DIR.mkdir(exist_ok=True)
 _TRANSCRIPT_DIR = _REC_DIR / "transcripts"
 _TRANSCRIPT_DIR.mkdir(exist_ok=True)
 _ANALYST_CHAT_FILE = Path(__file__).parent / "analytics_chats.json"
+_EMAIL_TOKEN_FILE = Path(__file__).parent / "email_token.json"
+_EMAIL_OAUTH_STATES: dict[str, dict] = {}
 app.mount("/recordings", StaticFiles(directory=_REC_DIR), name="recordings")
+
+_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 ANALYST_ABOUT = (
     "Lynkflow builds AI voice agents for local service businesses. "
     "The core offer is simple: help businesses never miss customer calls when they are busy, after hours, or already on another call. "
     "The outbound AI agent Anna may have reached out to a business, spoken with a receptionist, owner, or staff member, and gathered useful info such as email, phone number, owner availability, interest level, or callback timing. "
     "Follow-up emails should be short, professional, copy-ready, and mention that Anna from Lynkflow reached out about helping them handle customer calls so they do not miss leads. "
+    f"Use {PUBLIC_CONTACT_EMAIL} as Lynkflow's email. In HTML email drafts, link to {PUBLIC_WEBSITE_URL} with the visible text {PUBLIC_WEBSITE_LABEL}. "
     "Do not overpromise, do not invent facts, do not claim they were interested unless the transcript supports it, and do not use em dashes or long dashes."
 )
 
@@ -79,6 +97,9 @@ _autodial_state = {
     "completed": 0,
     "failed": 0,
     "skipped": 0,
+    "call_limit": 0,
+    "eligible_total": 0,
+    "target_total": 0,
     "started_at": None,
     "task": None,
     "events": [],
@@ -123,11 +144,18 @@ def _is_autodial_eligible(lead: dict) -> bool:
 
 def _autodial_snapshot() -> dict:
     active = _autodial_state["active"]
+    target_total = int(_autodial_state.get("target_total") or 0)
+    attempted = _autodial_state["completed"] + _autodial_state["failed"] + len(active)
     return {
         "running": _autodial_state["running"],
         "concurrency": _autodial_state["concurrency"],
         "test_mode": _autodial_state.get("test_mode", False),
         "sim_scenario": _autodial_state.get("sim_scenario", "mixed"),
+        "call_limit": _autodial_state.get("call_limit", 0),
+        "eligible_total": _autodial_state.get("eligible_total", 0),
+        "target_total": target_total,
+        "attempted": attempted,
+        "remaining": max(0, target_total - attempted) if target_total else len(_autodial_state["queue"]),
         "queued": len(_autodial_state["queue"]),
         "active": len(active),
         "completed": _autodial_state["completed"],
@@ -410,6 +438,133 @@ def _sanitize_analyst_answer(text: str) -> str:
     return re.sub(r"[—–]", "-", str(text or "")).strip()
 
 
+def _email_oauth_configured() -> bool:
+    return bool(LYNKFLOW_CONSOLE_ID and LYNKFLOW_CONSOLE_SECRET)
+
+
+def _load_email_token() -> dict:
+    if not _EMAIL_TOKEN_FILE.exists():
+        return {}
+    try:
+        data = json.loads(_EMAIL_TOKEN_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_email_token(data: dict) -> None:
+    _EMAIL_TOKEN_FILE.write_text(json.dumps(data, indent=2))
+    try:
+        _EMAIL_TOKEN_FILE.chmod(0o600)
+    except Exception:
+        pass
+
+
+def _email_redirect_uri(request: Request) -> str:
+    explicit = os.getenv("LYNKFLOW_EMAIL_REDIRECT_URI") or os.getenv("EMAIL_REDIRECT_URI")
+    if explicit:
+        return explicit.rstrip("/")
+    try:
+        cfg_base_url = (load_agent_config().base_url or "").strip()
+    except Exception:
+        cfg_base_url = ""
+    base = (
+        os.getenv("LynkFlow_Console_URI")
+        or os.getenv("LYNKFLOW_CONSOLE_URI")
+        or cfg_base_url
+        or os.getenv("LYNKFLOW_PUBLIC_URL")
+        or os.getenv("PUBLIC_URL")
+        or str(request.base_url).rstrip("/")
+    ).rstrip("/")
+    if base.endswith("/api/email/oauth/callback"):
+        return base
+    return f"{base}/api/email/oauth/callback"
+
+
+async def _get_gmail_access_token() -> str | None:
+    token = _load_email_token()
+    access_token = token.get("access_token")
+    expires_at = float(token.get("expires_at") or 0)
+    if access_token and expires_at > time.time() + 60:
+        return access_token
+
+    refresh_token = token.get("refresh_token")
+    if not refresh_token or not _email_oauth_configured():
+        return None
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": LYNKFLOW_CONSOLE_ID,
+                "client_secret": LYNKFLOW_CONSOLE_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+    if resp.status_code != 200:
+        print(f"[EMAIL] refresh failed: {resp.status_code} {resp.text[:300]}")
+        return None
+    fresh = resp.json()
+    token.update({
+        "access_token": fresh.get("access_token"),
+        "expires_at": time.time() + int(fresh.get("expires_in") or 3600),
+        "scope": fresh.get("scope", token.get("scope", _GMAIL_SEND_SCOPE)),
+        "token_type": fresh.get("token_type", token.get("token_type", "Bearer")),
+    })
+    _save_email_token(token)
+    return token.get("access_token")
+
+
+def _plain_text_from_html(html: str) -> str:
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", html or "")
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\s*>", "\n\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _validate_recipient_email(addr: str) -> str:
+    addr = str(addr or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", addr):
+        raise HTTPException(400, "valid recipient email required")
+    return addr
+
+
+async def _send_gmail_message(to_email: str, subject: str, html: str, text: str = "") -> dict:
+    access_token = await _get_gmail_access_token()
+    if not access_token:
+        raise HTTPException(401, "Gmail is not connected")
+
+    to_email = _validate_recipient_email(to_email)
+    subject = str(subject or "").strip()
+    html = str(html or "").strip()
+    if not subject:
+        raise HTTPException(400, "subject required")
+    if not html:
+        raise HTTPException(400, "html body required")
+
+    msg = MIMEMultipart("alternative")
+    msg["To"] = to_email
+    msg["From"] = formataddr(("Anna from Lynkflow", PUBLIC_CONTACT_EMAIL))
+    msg["Subject"] = subject[:200]
+    msg.attach(MIMEText(text or _plain_text_from_html(html), "plain", "utf-8"))
+    msg.attach(MIMEText(html, "html", "utf-8"))
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"raw": raw},
+        )
+    if resp.status_code not in (200, 201):
+        raise HTTPException(502, f"Gmail send failed: {resp.text}")
+    data = resp.json()
+    return {"success": True, "id": data.get("id"), "thread_id": data.get("threadId")}
+
+
 async def _transcribe_recording(recording: str) -> dict:
     path = _safe_recording_path(recording)
     cache = _transcript_cache_path(recording)
@@ -458,7 +613,11 @@ async def _ask_transcript_agent(recording: str, question: str) -> dict:
     prompt = (
         "You are a call QA assistant for Lynkflow. Answer only from the transcript. "
         "If a detail is uncertain, say it is uncertain. Extract emails, phone numbers, names, callback times, and useful follow-up context. "
-        "When drafting a message, make it concise and copy-ready. Do not invent facts."
+        f"When drafting an email, use {PUBLIC_CONTACT_EMAIL} as Lynkflow's email and include a website link as "
+        f"<a href=\"{PUBLIC_WEBSITE_URL}\">{PUBLIC_WEBSITE_LABEL}</a>. "
+        "Return the draft with separate sections named 'Email subject' and 'HTML body'. "
+        "Put the subject in a fenced code block tagged subject and the HTML email in a fenced code block tagged html. "
+        "Make the HTML responsive with inline CSS, a clean dark/blue Lynkflow style, mobile-safe width, and no external images unless they are fluid. Do not invent facts."
     )
     async with httpx.AsyncClient(timeout=45) as client:
         resp = await client.post(
@@ -661,10 +820,14 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
         "Attached recordings are selected by the operator and are the highest-priority context. "
         "Answer the operator's question directly. If they ask about a specific business, focus on that business. "
         "If they ask which calls provided information, use a compact markdown table with business, info found, evidence, and next action when that is clearer than prose. "
-        "If asked to draft an email/message, create concise copy-ready text under a heading named 'Copy-ready email' or 'Copy-ready message'. "
+        "If asked to draft an email/message, create a polished copy-ready HTML email, not plain text unless the operator specifically asks for plain text. "
+        "Separate the output into two sections named exactly 'Email subject' and 'HTML body'. Put the subject in a fenced code block tagged subject and the email body in a fenced code block tagged html. "
+        "The HTML body should look like Lynkflow's website: clean dark navy background, blue/cyan accent, rounded white/dark content card, strong headline, concise paragraphs, and clear CTA. Use inline CSS suitable for email clients. "
+        "Make the HTML responsive for phones, laptops, and desktops: max-width around 640px, width 100%, mobile-safe padding, and any image/banner must use width:100%; max-width:100%; height:auto. "
+        f"Include Lynkflow's website only inside the HTML email as <a href=\"{PUBLIC_WEBSITE_URL}\">{PUBLIC_WEBSITE_LABEL}</a>. Do not show the raw long URL as visible text. "
+        f"Use {PUBLIC_CONTACT_EMAIL} as the sender/contact email when needed. "
         "The draft should mention Anna from Lynkflow reached out about helping them handle customer calls so they do not miss leads. "
         "If a receptionist gave an email, write the message as a professional follow-up to the owner or office manager without pretending the owner was interested. "
-        "If you include subject/body, keep both inside the same copy-ready section. "
         "Never invent emails, phone numbers, callback times, or interest. If transcript evidence is missing, say so. "
         "Do not use em dashes or long dashes. Use commas, periods, colons, or simple hyphens only."
     )
@@ -952,8 +1115,8 @@ async def get_modules():
                     "id": "obj_scam",
                     "label": "Is This a Scam / Legit?",
                     "trigger": "How do I know this is real? / Sounds like a scam / I don't know you",
-                    "script": "That's a completely valid concern — you should be skeptical of random calls, honestly. My name is Odelyn, I'm with Lynkflow. We're a small agency that builds AI phone systems specifically for trade businesses like plumbers. I'm not asking for any payment or information right now — I just want to show you what the system does. You can look us up at lynkflow.com. Would it help if I sent you something in writing first so you can check us out before deciding anything?",
-                    "second_objection": "Completely fair. No pressure at all — take your time to look us up. If you want to connect after, I'm happy to walk you through a demo with no commitment.",
+                    "script": "That's a completely valid concern — you should be skeptical of random calls, honestly. My name is Odelyn, I'm with Lynkflow. We're a small agency that builds AI phone systems specifically for trade businesses like plumbers. I'm not asking for any payment or information right now — I can send more information by email from lynkflowagent@gmail.com so you can review it before deciding anything.",
+                    "second_objection": "Completely fair. No pressure at all — if you want, I can send a short email with the details so you can review it and connect later with no commitment.",
                     "third_objection": "Understood. Thanks for being upfront. Have a good day.",
                 },
                 {
@@ -1495,10 +1658,12 @@ def _status_from_outcome(outcome: str, call_status: str = "") -> str:
         return "Interested"
     if outcome == "callback":
         return "Callback"
-    if outcome in ("voicemail", "voicemail_left"):
-        return "Voicemail"
+    if outcome == "voicemail_left":
+        return "Voicemail Left"
+    if outcome == "voicemail":
+        return "VM No Message"
     if outcome == "ivr":
-        return "Phone Tree"
+        return "IVR"
     if outcome == "not_interested":
         return "Not Interested"
     if outcome == "no_answer" or call_status == "no-answer":
@@ -1513,6 +1678,8 @@ def _status_from_outcome(outcome: str, call_status: str = "") -> str:
 def _sim_initial_utterances(lead: dict, scenario: str) -> list[str]:
     business = lead.get("Name") or "the business"
     scenario = (scenario or "mixed").lower()
+    if scenario == "owner_interested":
+        return ["Hello, this is the owner."]
     if scenario == "owner_skeptical":
         return ["Hello, this is the owner."]
     if scenario == "owner_busy":
@@ -1566,6 +1733,7 @@ def _sim_lead_prompt(lead: dict, scenario: str) -> str:
     timezone = _lead_timezone(lead) or "local time"
     scenario_notes = {
         "mixed": "Act as a realistic receptionist first. Ask who is calling or what it is about. Do not be overly helpful.",
+        "owner_interested": "Act as an owner who has been losing missed calls and becomes genuinely interested if the caller explains Lynkflow clearly. Ask how it works, ask the price, then agree to a demo or ask for info by email.",
         "owner_skeptical": "Act as a skeptical owner. Ask if this is AI or a recorded message, then decide if the caller earns 30 seconds.",
         "owner_busy": "Act as a busy owner. If the caller is respectful, offer a better callback time.",
         "recorded_message": "Act as a receptionist who is suspicious that the caller is a recording or AI.",
@@ -1583,7 +1751,7 @@ Rules:
 - Reply as the lead only. Do not explain your reasoning.
 - Keep replies short and natural for a phone call: usually 3-15 words.
 - You may interrupt, be confused, ask who is calling, ask whether this is AI, ask whether it is recorded, say the owner is unavailable, ask for a callback, or say no.
-- Do not be too cooperative. Behave like a real business phone answerer.
+- Behave like a real business phone answerer. Do not be too cooperative unless this is the interested-owner scenario and the caller earns your interest.
 - If the caller says goodbye or clearly ends the call, return done=true.
 
 Return strict JSON only: {{"text":"lead reply", "done":false, "outcome":"conversation"}}
@@ -1801,7 +1969,7 @@ async def _finish_sim_call(call_sid: str, outcome: str, message: str = "", recor
         "call_sid": call_sid,
         "name": lead.get("Name", ""),
         "phone": item.get("phone", ""),
-        "status": "Tested",
+        "status": f"Test: {_status_from_outcome(outcome)}",
         "outcome": outcome,
         "recording": recording,
         "message": message or "GPT lead simulation finished; no real call placed and sheet not updated",
@@ -1945,7 +2113,10 @@ async def _autodial_loop():
             if done:
                 async with _autodial_lock:
                     _autodial_state["running"] = False
-                await _autodial_broadcast({"type": "completed", "message": "Auto dialer finished all eligible leads"})
+                    target_total = _autodial_state.get("target_total", 0)
+                    eligible_total = _autodial_state.get("eligible_total", 0)
+                msg = "Auto dialer finished requested call limit" if target_total and eligible_total > target_total else "Auto dialer finished all eligible leads"
+                await _autodial_broadcast({"type": "completed", "message": msg})
                 break
 
             launched = 0
@@ -2057,10 +2228,10 @@ async def autodial_start(request: Request):
     test_mode = bool(data.get("test_mode", False))
     sim_scenario = str(data.get("sim_scenario") or "mixed").strip() or "mixed"
     sim_endpoint = str(data.get("sim_endpoint") or "").strip()
-    test_limit = max(1, min(25, int(data.get("test_limit") or 5)))
+    call_limit = max(1, min(1000, int(data.get("call_limit") or data.get("test_limit") or 5)))
 
     if test_mode:
-        leads = _default_sim_leads(test_limit)
+        leads = _default_sim_leads(call_limit)
         eligible = leads
         skipped = 0
     else:
@@ -2076,10 +2247,14 @@ async def autodial_start(request: Request):
     if test_mode:
         if not OPENAI_API_KEY:
             raise HTTPException(500, "OPENAI_API_KEY not set for GPT lead test mode")
-        eligible = eligible[:test_limit]
+        eligible_total = len(eligible)
+        eligible = eligible[:call_limit]
         skipped = max(0, len(leads) - len(eligible)) if leads else 0
     elif not base_url:
         raise HTTPException(400, "base_url required")
+    else:
+        eligible_total = len(eligible)
+        eligible = eligible[:call_limit]
     if not eligible:
         raise HTTPException(400, "no eligible leads found (only blank/New/Retry/Queued statuses are called)")
 
@@ -2096,6 +2271,9 @@ async def autodial_start(request: Request):
             "completed": 0,
             "failed": 0,
             "skipped": skipped,
+            "call_limit": call_limit,
+            "eligible_total": eligible_total,
+            "target_total": len(eligible),
             "started_at": time.time(),
             "events": [],
             "test_mode": test_mode,
@@ -2567,6 +2745,106 @@ async def analytics_ask(request: Request):
     recording = data.get("recording", "")
     question = data.get("question", "")
     return JSONResponse(await _ask_transcript_agent(recording, question))
+
+
+@app.get("/api/email/status")
+async def email_status(request: Request):
+    token = _load_email_token()
+    return JSONResponse({
+        "configured": _email_oauth_configured(),
+        "authorized": bool(token.get("refresh_token") or token.get("access_token")),
+        "from_email": PUBLIC_CONTACT_EMAIL,
+        "scope": _GMAIL_SEND_SCOPE,
+        "redirect_uri": _email_redirect_uri(request),
+    })
+
+
+@app.get("/api/email/auth-url")
+async def email_auth_url(request: Request):
+    if not _email_oauth_configured():
+        raise HTTPException(500, "LynkFlow_Console_ID and LynkFlow_Console_Secret are not set")
+
+    now = time.time()
+    for state, item in list(_EMAIL_OAUTH_STATES.items()):
+        if float(item.get("expires_at") or 0) < now:
+            _EMAIL_OAUTH_STATES.pop(state, None)
+
+    state = secrets.token_urlsafe(24)
+    redirect_uri = _email_redirect_uri(request)
+    _EMAIL_OAUTH_STATES[state] = {"expires_at": now + 600, "redirect_uri": redirect_uri}
+    params = {
+        "client_id": LYNKFLOW_CONSOLE_ID,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": _GMAIL_SEND_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "state": state,
+    }
+    return JSONResponse({
+        "auth_url": "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params),
+        "redirect_uri": redirect_uri,
+    })
+
+
+@app.get("/api/email/oauth/callback")
+async def email_oauth_callback(request: Request):
+    if not _email_oauth_configured():
+        raise HTTPException(500, "Email OAuth is not configured")
+    params = request.query_params
+    if params.get("error"):
+        return Response(
+            content=f"<h2>Gmail connection failed</h2><p>{params.get('error')}</p>",
+            media_type="text/html",
+        )
+    code = params.get("code")
+    state = params.get("state")
+    state_item = _EMAIL_OAUTH_STATES.pop(state or "", None)
+    if not code or not state_item:
+        raise HTTPException(400, "invalid OAuth callback")
+    redirect_uri = state_item.get("redirect_uri") or _email_redirect_uri(request)
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": LYNKFLOW_CONSOLE_ID,
+                "client_secret": LYNKFLOW_CONSOLE_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": redirect_uri,
+            },
+        )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"OAuth token exchange failed: {resp.text}")
+
+    token = resp.json()
+    existing = _load_email_token()
+    if not token.get("refresh_token") and existing.get("refresh_token"):
+        token["refresh_token"] = existing["refresh_token"]
+    token["expires_at"] = time.time() + int(token.get("expires_in") or 3600)
+    token["connected_at"] = datetime.now().isoformat(timespec="seconds")
+    _save_email_token(token)
+    return Response(
+        content=(
+            "<h2>Gmail connected</h2>"
+            "<p>You can close this tab and return to Lynkflow.</p>"
+            "<script>setTimeout(function(){ window.close(); }, 1200);</script>"
+        ),
+        media_type="text/html",
+    )
+
+
+@app.post("/api/email/send")
+async def email_send(request: Request):
+    data = await request.json()
+    return JSONResponse(await _send_gmail_message(
+        to_email=data.get("to", ""),
+        subject=data.get("subject", ""),
+        html=data.get("html", ""),
+        text=data.get("text", ""),
+    ))
 
 
 @app.get("/api/analyst/chats")

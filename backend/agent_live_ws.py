@@ -24,6 +24,7 @@ import httpx
 import websockets
 from dotenv import load_dotenv
 from fastapi import WebSocket, WebSocketDisconnect
+from agent_config import PUBLIC_CONTACT_EMAIL
 from metrics import CallMetrics
 
 load_dotenv()
@@ -149,20 +150,20 @@ class GPTLiveCallHandler:
             await asyncio.sleep(1)
             now = time.time()
             elapsed = now - self._call_started_at
-            silence_timeout = getattr(self.cfg, "silence_timeout_s", 20) or 20
+            silence_timeout = max(5, getattr(self.cfg, "silence_timeout_s", 10) or 10)
             if self._ending and self._ending_started_at and (now - self._ending_started_at) > 6:
                 print("[GPT-LIVE WATCHDOG] ending state exceeded 6s; forcing local close")
                 self._stop = True
                 await self._close_live()
                 return
-            if self.call_sid and self.outcome == "no_answer" and elapsed > max(25, getattr(self.cfg, "silence_timeout_s", 20)):
+            if self.call_sid and self.outcome == "no_answer" and elapsed > silence_timeout:
                 print("[GPT-LIVE WATCHDOG] no human transcript detected")
                 await self._push_status("ended", "No human detected")
                 await self._hangup("no human detected")
                 return
             if self.call_sid and self.outcome != "no_answer" and not self._agent_turn_open:
                 idle = now - max(self._last_activity_at, self._last_input_transcript_at, self._last_output_transcript_at)
-                if idle > max(12, silence_timeout):
+                if idle > silence_timeout:
                     print(f"[GPT-LIVE WATCHDOG] idle after conversation ({idle:.1f}s)")
                     await self._hangup("idle after conversation")
                     return
@@ -189,6 +190,7 @@ class GPTLiveCallHandler:
             f"{getattr(self.cfg, 'system_prompt', '')}\n\n"
             f"{context}.\n"
             f"Your callback number: {callback}.\n"
+            f"Your approved email address: {PUBLIC_CONTACT_EMAIL}.\n"
             f"Tone: {tone}\n\n"
             "Live voice behavior:\n"
             "- You are on a phone call. Keep replies short and natural.\n"
@@ -196,10 +198,12 @@ class GPTLiveCallHandler:
             "- Answer the exact question first, then continue naturally.\n"
             "- Do not repeat a previous line or restart the call.\n"
             "- Do not pitch until a decision maker has allowed the 30-second pitch.\n"
-            "- Never invent phone numbers, emails, prices, company details, or names. Use only the callback number above.\n"
+            "- Never invent phone numbers, emails, prices, company details, or names. Use only the callback number and approved email above.\n"
+            f"- If asked for your email, give exactly {PUBLIC_CONTACT_EMAIL}. Do not say Anna at Lynkflow dot com, info at Lynkflow dot com, or any other address.\n"
+            "- Do not give a website verbally on calls. If they ask for a website or link, say you can send more information by email and ask for the best email address.\n"
             "- Receptionist/staff contact capture: if they offer an email address, direct number, direct contact, callback time, or say you can send an email, accept it. Ask for the missing contact detail, confirm spelling/digits/time, then thank them and end.\n"
             "- Message-taking is different: if they only offer to take your message or ask for your details, ask once for the best email, direct number, or callback time instead. Only end without collecting info if they refuse or cannot provide it.\n"
-            "- If leaving a message, give your name, Lynkflow, the callback number above, and a brief reason.\n"
+            "- Do not leave voicemail. If staff insists on taking your details after you asked for direct contact, provide only your name, Lynkflow, the callback number above, and the approved email above.\n"
             "- If they decline, want to end, or ask to be removed, politely end.\n"
             "- Never speak bracketed control tokens aloud."
         )

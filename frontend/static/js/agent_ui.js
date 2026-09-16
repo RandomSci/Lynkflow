@@ -26,6 +26,7 @@ const AUTODIAL_CONCURRENCY_KEY = 'lynkflow_autodial_concurrency';
 const AUTODIAL_TEST_MODE_KEY = 'lynkflow_autodial_test_mode';
 const AUTODIAL_TEST_SCENARIO_KEY = 'lynkflow_autodial_test_scenario';
 const AUTODIAL_TEST_LIMIT_KEY = 'lynkflow_autodial_test_limit';
+const AUTODIAL_CALL_LIMIT_KEY = 'lynkflow_autodial_call_limit';
 const AUTODIAL_SIM_ENDPOINT_KEY = 'lynkflow_autodial_sim_endpoint';
 
 const VOICES = [
@@ -938,13 +939,14 @@ function setStoredAutoDialTestScenario(value) {
   return safe;
 }
 
-function getStoredAutoDialTestLimit() {
-  return Math.max(1, Math.min(25, parseInt(localStorage.getItem(AUTODIAL_TEST_LIMIT_KEY) || '5')));
+function getStoredAutoDialCallLimit() {
+  const saved = localStorage.getItem(AUTODIAL_CALL_LIMIT_KEY) || localStorage.getItem(AUTODIAL_TEST_LIMIT_KEY) || '10';
+  return Math.max(1, Math.min(1000, parseInt(saved)));
 }
 
-function setStoredAutoDialTestLimit(value) {
-  const safe = Math.max(1, Math.min(25, parseInt(value || '5')));
-  localStorage.setItem(AUTODIAL_TEST_LIMIT_KEY, String(safe));
+function setStoredAutoDialCallLimit(value) {
+  const safe = Math.max(1, Math.min(1000, parseInt(value || '10')));
+  localStorage.setItem(AUTODIAL_CALL_LIMIT_KEY, String(safe));
   return safe;
 }
 
@@ -996,6 +998,7 @@ async function loadAutoDialMonitorPage() {
           <span>Lead scenario</span>
           <select id="autoDialTestScenario">
             <option value="mixed" ${getStoredAutoDialTestScenario() === 'mixed' ? 'selected' : ''}>Mixed receptionist</option>
+            <option value="owner_interested" ${getStoredAutoDialTestScenario() === 'owner_interested' ? 'selected' : ''}>Interested owner</option>
             <option value="recorded_message" ${getStoredAutoDialTestScenario() === 'recorded_message' ? 'selected' : ''}>Recorded/AI question</option>
             <option value="owner_skeptical" ${getStoredAutoDialTestScenario() === 'owner_skeptical' ? 'selected' : ''}>Skeptical owner</option>
             <option value="owner_busy" ${getStoredAutoDialTestScenario() === 'owner_busy' ? 'selected' : ''}>Busy owner</option>
@@ -1004,8 +1007,8 @@ async function loadAutoDialMonitorPage() {
           </select>
         </label>
         <label class="autodial-control-field">
-          <span>Test calls</span>
-          <input type="number" id="autoDialTestLimit" min="1" max="25" value="${getStoredAutoDialTestLimit()}" />
+          <span>Call limit</span>
+          <input type="number" id="autoDialCallLimit" min="1" max="1000" value="${getStoredAutoDialCallLimit()}" />
         </label>
         <label class="autodial-control-field autodial-control-field--url">
           <span>Custom lead endpoint</span>
@@ -1014,7 +1017,7 @@ async function loadAutoDialMonitorPage() {
         <button class="autodial-btn" id="autoDialBtn">Start Auto</button>
         <span class="autodial-status" id="autoDialStatus">Idle</span>
       </div>
-      <div class="autodial-help-text" id="autoDialHelpText">Calls only blank, New, Retry, or Queued leads. In GPT Lead Test Mode, no Twilio calls are placed and the spreadsheet is not updated.</div>
+      <div class="autodial-help-text" id="autoDialHelpText">Set a call limit, then start. Auto Dial stops by itself once that many eligible leads have been attempted. In GPT Lead Test Mode, no Twilio calls are placed and the spreadsheet is not updated.</div>
     </div>
     <div class="card autodial-monitor-panel" id="autoDialMonitorPanel">
       <div class="card-label">Auto Dial Monitor</div>
@@ -1044,8 +1047,8 @@ async function loadAutoDialMonitorPage() {
   document.getElementById('autoDialTestScenario')?.addEventListener('change', (e) => {
     setStoredAutoDialTestScenario(e.target.value);
   });
-  document.getElementById('autoDialTestLimit')?.addEventListener('change', (e) => {
-    e.target.value = setStoredAutoDialTestLimit(e.target.value);
+  document.getElementById('autoDialCallLimit')?.addEventListener('change', (e) => {
+    e.target.value = setStoredAutoDialCallLimit(e.target.value);
   });
   document.getElementById('autoDialSimEndpoint')?.addEventListener('change', (e) => {
     e.target.value = setStoredAutoDialSimEndpoint(e.target.value);
@@ -1067,7 +1070,7 @@ async function startAutoDial() {
   const concurrencyInput = document.getElementById('autoDialConcurrency');
   const testMode = document.getElementById('autoDialTestMode')?.checked || false;
   const scenario = document.getElementById('autoDialTestScenario')?.value || getStoredAutoDialTestScenario();
-  const testLimit = setStoredAutoDialTestLimit(document.getElementById('autoDialTestLimit')?.value || getStoredAutoDialTestLimit());
+  const callLimit = setStoredAutoDialCallLimit(document.getElementById('autoDialCallLimit')?.value || getStoredAutoDialCallLimit());
   const simEndpoint = setStoredAutoDialSimEndpoint(document.getElementById('autoDialSimEndpoint')?.value || '');
   setStoredAutoDialTestMode(testMode);
   setStoredAutoDialTestScenario(scenario);
@@ -1092,7 +1095,8 @@ async function startAutoDial() {
         test_mode: testMode,
         sim_scenario: scenario,
         sim_endpoint: simEndpoint,
-        test_limit: testLimit,
+        call_limit: callLimit,
+        test_limit: callLimit,
       }),
     });
     const data = await res.json();
@@ -1149,7 +1153,7 @@ function updateAutoDialUi(snapshot) {
   const baseInput = document.getElementById('autoDialBaseUrl');
   const testToggle = document.getElementById('autoDialTestMode');
   const scenarioInput = document.getElementById('autoDialTestScenario');
-  const testLimitInput = document.getElementById('autoDialTestLimit');
+  const callLimitInput = document.getElementById('autoDialCallLimit');
   const simEndpointInput = document.getElementById('autoDialSimEndpoint');
   const help = document.getElementById('autoDialHelpText');
   const status = autoDialSnapshot || {};
@@ -1162,12 +1166,14 @@ function updateAutoDialUi(snapshot) {
   if (baseInput) baseInput.disabled = autoDialRunning || testMode;
   if (testToggle) testToggle.disabled = autoDialRunning;
   if (scenarioInput) scenarioInput.disabled = autoDialRunning || !testMode;
-  if (testLimitInput) testLimitInput.disabled = autoDialRunning || !testMode;
+  if (callLimitInput) callLimitInput.disabled = autoDialRunning;
   if (simEndpointInput) simEndpointInput.disabled = autoDialRunning || !testMode;
   if (help) help.textContent = testMode
-    ? 'GPT Lead Test Mode is ON: no Twilio calls are placed and the spreadsheet is not updated. Blank endpoint uses the built-in GPT lead simulator.'
-    : 'Calls only blank, New, Retry, or Queued leads. Already-called, DNC, Interested, and Not Interested leads are skipped.';
-  setAutoDialText(`${testMode ? 'TEST · ' : ''}Active ${status.active || 0}/${status.concurrency || getStoredAutoDialConcurrency()} · Queued ${status.queued || 0} · Done ${status.completed || 0}`);
+    ? 'GPT Lead Test Mode is ON: no Twilio calls are placed and the spreadsheet is not updated. Use Interested owner to test successful lead behavior.'
+    : 'Live mode calls only blank, New, Retry, or Queued leads. It stops automatically at the call limit.';
+  const target = status.target_total || status.call_limit || getStoredAutoDialCallLimit();
+  const attempted = status.attempted ?? ((status.completed || 0) + (status.failed || 0) + (status.active || 0));
+  setAutoDialText(`${testMode ? 'TEST · ' : ''}Active ${status.active || 0}/${status.concurrency || getStoredAutoDialConcurrency()} · Attempted ${attempted}/${target} · Remaining ${status.remaining ?? status.queued ?? 0}`);
   renderAutoDialMonitor();
 }
 
@@ -1209,12 +1215,16 @@ function renderAutoDialMonitor() {
   `).join('') : '<div class="autodial-monitor-empty small">No active calls.</div>';
 
   const eventsHtml = autoDialEvents.slice(0, 25).map(renderAutoDialEvent).join('') || '<div class="autodial-monitor-empty small">No events yet.</div>';
+  const attempted = snap.attempted ?? ((snap.completed || 0) + (snap.failed || 0) + (snap.active || 0));
   wrap.innerHTML = `
     <div class="autodial-summary-row">
       <span>Running: <b>${autoDialRunning ? 'Yes' : 'No'}</b></span>
+      <span>Target: <b>${snap.target_total || snap.call_limit || getStoredAutoDialCallLimit()}</b></span>
+      <span>Attempted: <b>${attempted}</b></span>
+      <span>Remaining: <b>${snap.remaining ?? snap.queued ?? 0}</b></span>
       <span>Active: <b>${snap.active || 0}</b></span>
       <span>Queued: <b>${snap.queued || 0}</b></span>
-      <span>Done: <b>${snap.completed || 0}</b></span>
+      <span>Finished: <b>${snap.completed || 0}</b></span>
       <span>Skipped: <b>${snap.skipped || 0}</b></span>
       <span>Failed: <b>${snap.failed || 0}</b></span>
     </div>
@@ -1773,7 +1783,7 @@ async function openAnalyticsAiPanel(recording, business) {
     <div class="an-ai-actions">
       <button class="an-ai-chip" data-q="Extract any email addresses, phone numbers, names, and callback details mentioned in this call.">Find contacts</button>
       <button class="an-ai-chip" data-q="Summarize the call and tell me what follow-up action I should take.">Summarize</button>
-      <button class="an-ai-chip" data-q="Write a short professional follow-up message I can copy and send based only on this call.">Draft message</button>
+      <button class="an-ai-chip" data-q="Write a professional follow-up email based only on this call. Separate the subject and a responsive HTML body I can copy.">Draft email</button>
       <button class="an-ai-chip" data-q="Did this call sound interested, not interested, callback, gatekeeper, voicemail, or wrong number? Explain briefly.">Classify outcome</button>
     </div>
     <div class="an-ai-status" id="anAiStatus">Preparing transcript...</div>
@@ -1787,7 +1797,7 @@ async function openAnalyticsAiPanel(recording, business) {
         <span>Answer</span>
         <button id="anAiCopyBtn" class="an-ai-copy" style="display:none">Copy</button>
       </div>
-      <pre class="an-ai-answer" id="anAiAnswer"></pre>
+      <div class="an-ai-answer markdown-body" id="anAiAnswer"></div>
     </div>
   `;
 
@@ -1845,7 +1855,8 @@ async function askAnalyticsAi() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Ask failed');
     status.textContent = 'Answered from transcript.';
-    answer.textContent = data.answer || '';
+    answer.innerHTML = renderAnalystMarkdown(data.answer || '');
+    wireAnalystCopyButtons(answer);
     if (copyBtn && data.answer) copyBtn.style.display = '';
   } catch (e) {
     status.textContent = `Error: ${e.message}`;
@@ -1889,6 +1900,7 @@ async function loadAnalystPage() {
             <div class="analyst-sub">Ask across call history, cached transcripts, emails, numbers, outcomes, and follow-up messages.</div>
           </div>
           <div class="analyst-title-actions">
+            <button class="analyst-lite-btn analyst-email-connect" id="analystEmailConnectBtn">Connect Email</button>
             <button class="analyst-lite-btn analyst-add-audio" id="analystAddAudioBtn">Add Audio</button>
             <button class="analyst-lite-btn" id="analystRenameBtn">Rename</button>
             <button class="analyst-lite-btn danger" id="analystDeleteBtn">Delete</button>
@@ -1899,7 +1911,7 @@ async function loadAnalystPage() {
           <button data-q="Is there anyone at least interested here? List who and why.">Interested?</button>
           <button data-q="Which calls provided useful info like emails, phone numbers, names, or callback times?">Provided info?</button>
           <button data-q="Tell me more about what happened in the latest calls. I'm too lazy to listen.">Latest summary</button>
-          <button data-q="Create a short follow-up message for the most promising lead I can copy and send.">Draft best follow-up</button>
+          <button data-q="Create a professional follow-up email for the most promising lead. Separate the subject and a responsive HTML body I can copy.">Draft best email</button>
         </div>
         <div class="analyst-messages" id="analystMessages">
           <div class="analyst-empty">Create or select a chat, then ask about your calls.</div>
@@ -1929,6 +1941,7 @@ async function loadAnalystPage() {
   `;
 
   document.getElementById('analystNewBtn')?.addEventListener('click', createAnalystChat);
+  document.getElementById('analystEmailConnectBtn')?.addEventListener('click', connectAnalystEmail);
   document.getElementById('analystAddAudioBtn')?.addEventListener('click', openAnalystAudioModal);
   document.getElementById('analystAudioClose')?.addEventListener('click', closeAnalystAudioModal);
   document.getElementById('analystAudioSearchBtn')?.addEventListener('click', searchAnalystAudio);
@@ -2043,6 +2056,8 @@ function renderAnalystMessage(m, idx) {
 function wireAnalystCopyButtons(scope, messages = []) {
   if (!scope) return;
   scope.querySelectorAll('.analyst-copy-btn').forEach(btn => {
+    if (btn.dataset.copyWired === '1') return;
+    btn.dataset.copyWired = '1';
     btn.addEventListener('click', async () => {
       let text = '';
       if (btn.dataset.copyMessage !== undefined) {
@@ -2064,6 +2079,89 @@ function wireAnalystCopyButtons(scope, messages = []) {
       }, 1200);
     });
   });
+  wireAnalystEmailButtons(scope);
+}
+
+function wireAnalystEmailButtons(scope) {
+  if (!scope) return;
+  scope.querySelectorAll('.analyst-send-email-btn').forEach(btn => {
+    if (btn.dataset.emailWired === '1') return;
+    btn.dataset.emailWired = '1';
+    const card = btn.closest('.analyst-copy-card');
+    const input = card?.querySelector('.analyst-email-to');
+    if (input && !input.value) input.value = findLikelyRecipientEmail(card || scope) || '';
+    btn.addEventListener('click', () => sendAnalystEmail(btn));
+  });
+}
+
+function findLikelyRecipientEmail(scope) {
+  const root = scope?.closest?.('.analyst-msg, .an-ai-panel') || scope;
+  const text = root?.textContent || '';
+  const emails = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
+  return emails.find(e => e.toLowerCase() !== 'lynkflowagent@gmail.com') || '';
+}
+
+function findEmailSubjectForCard(card) {
+  let node = card?.previousElementSibling;
+  while (node) {
+    if (node.classList?.contains('analyst-copy-card')) {
+      const label = node.querySelector('.analyst-copy-head span')?.textContent || '';
+      if (/subject/i.test(label)) return (node.querySelector('.analyst-copy-body')?.innerText || '').trim();
+    }
+    node = node.previousElementSibling;
+  }
+  const root = card?.closest?.('.analyst-msg, .an-ai-panel') || document;
+  const subjectCard = [...root.querySelectorAll('.analyst-copy-card')].find(c => /subject/i.test(c.querySelector('.analyst-copy-head span')?.textContent || ''));
+  return (subjectCard?.querySelector('.analyst-copy-body')?.innerText || '').trim();
+}
+
+async function connectAnalystEmail() {
+  try {
+    const res = await fetch('/api/email/auth-url');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Email auth failed');
+    window.open(data.auth_url, 'lynkflowEmailAuth', 'width=560,height=760');
+  } catch (e) {
+    alert(`Email connection failed: ${e.message}`);
+  }
+}
+
+async function sendAnalystEmail(btn) {
+  const card = btn.closest('.analyst-copy-card');
+  const to = card?.querySelector('.analyst-email-to')?.value.trim() || '';
+  const status = card?.querySelector('.analyst-email-status');
+  const subject = findEmailSubjectForCard(card);
+  const html = (card?.querySelector('.analyst-copy-body')?.innerText || '').trim();
+  if (!to) return alert('Enter the recipient email first.');
+  if (!subject) return alert('No email subject found. Ask the analyst to draft the email again.');
+  if (!html) return alert('No HTML body found. Ask the analyst to draft the email again.');
+  if (!confirm(`Send this email to ${to}?`)) return;
+
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Sending...';
+  if (status) status.textContent = '';
+  try {
+    const res = await fetch('/api/email/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to, subject, html }),
+    });
+    const data = await res.json();
+    if (res.status === 401) {
+      await connectAnalystEmail();
+      throw new Error('Connect Gmail, then click Send email again.');
+    }
+    if (!res.ok) throw new Error(data.detail || 'Send failed');
+    btn.textContent = 'Sent';
+    if (status) status.textContent = data.id ? `Sent: ${data.id}` : 'Sent';
+    setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 1600);
+  } catch (e) {
+    btn.textContent = original;
+    btn.disabled = false;
+    if (status) status.textContent = e.message;
+    else alert(e.message);
+  }
 }
 
 async function copyTextToClipboard(text) {
@@ -2286,10 +2384,28 @@ function renderAnalystMarkdown(text, options = {}) {
     const h = headingParts(t);
     return h && /(copy[-\s]?ready|draft|follow[-\s]?up|email|message|sms|text to send|send this)/i.test(h.text);
   };
+  const isEmailCopyPartHeading = h => h && /^(email\s+subject|subject|html\s+body|body\s+html):?$/i.test(h.text.trim());
+  const extractSingleCodeBlock = bodyText => {
+    const m = bodyText.match(/^\s*```[a-z0-9_-]*\s*\n([\s\S]*?)\n```\s*$/i);
+    return m ? m[1] : bodyText;
+  };
   const renderCopyCard = (label, bodyText) => `
     <div class="analyst-copy-card">
       <div class="analyst-copy-head"><span>${escapeHtml(label || 'Copy-ready text')}</span><button class="analyst-copy-btn" type="button">Copy</button></div>
       <div class="analyst-copy-body">${renderAnalystMarkdown(bodyText, { allowCopyCards: false })}</div>
+    </div>
+  `;
+  const renderCodeCopyCard = (label, codeText) => `
+    <div class="analyst-copy-card analyst-copy-card--code">
+      <div class="analyst-copy-head"><span>${escapeHtml(label || 'Copy code')}</span><button class="analyst-copy-btn" type="button">Copy</button></div>
+      <div class="analyst-copy-body analyst-copy-code"><pre><code>${escapeHtml(codeText || '')}</code></pre></div>
+      ${/html body/i.test(label || '') ? `
+        <div class="analyst-email-send-row">
+          <input class="analyst-email-to" type="email" placeholder="recipient@email.com" />
+          <button class="analyst-send-email-btn" type="button">Send email</button>
+          <span class="analyst-email-status"></span>
+        </div>
+      ` : ''}
     </div>
   `;
   const renderTable = (headers, markers, rows) => {
@@ -2306,10 +2422,11 @@ function renderAnalystMarkdown(text, options = {}) {
 
     if (t.startsWith('```')) {
       if (inCode) {
-        const copyableCode = allowCopyCards && /^(email|message|sms|text|followup|follow-up)$/i.test(codeLang);
+        const copyableCode = allowCopyCards && /^(email|message|sms|text|followup|follow-up|html|subject)$/i.test(codeLang);
+        const codeLabel = codeLang === 'html' ? 'Copy HTML body' : codeLang === 'subject' ? 'Copy subject' : 'Copy-ready message';
         closeLists();
         html += copyableCode
-          ? renderCopyCard('Copy-ready message', code.join('\n'))
+          ? renderCodeCopyCard(codeLabel, code.join('\n'))
           : `<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`;
         code = [];
         codeLang = '';
@@ -2324,6 +2441,25 @@ function renderAnalystMarkdown(text, options = {}) {
     if (inCode) { code.push(line); continue; }
 
     if (!t) { closeLists(); html += '<br>'; continue; }
+
+    const h = headingParts(t);
+    if (allowCopyCards && isEmailCopyPartHeading(h)) {
+      closeLists();
+      const body = [];
+      i += 1;
+      while (i < lines.length) {
+        const nextHeading = headingParts(lines[i].trim());
+        if (nextHeading && nextHeading.level <= h.level) {
+          i -= 1;
+          break;
+        }
+        body.push(lines[i]);
+        i += 1;
+      }
+      const label = /html/i.test(h.text) ? 'Copy HTML body' : 'Copy subject';
+      html += renderCodeCopyCard(label, extractSingleCodeBlock(body.join('\n').trim()));
+      continue;
+    }
 
     if (allowCopyCards && isCopyHeading(t)) {
       closeLists();
@@ -2376,7 +2512,6 @@ function renderAnalystMarkdown(text, options = {}) {
     if (/^---+$|^\*\*\*+$|^___+$/.test(t)) { closeLists(); html += '<hr>'; continue; }
     if (/^>\s?/.test(t)) { closeLists(); html += `<blockquote>${inline(t.replace(/^>\s?/, ''))}</blockquote>`; continue; }
 
-    const h = headingParts(t);
     if (h) { closeLists(); html += `<h${h.level}>${inline(h.text)}</h${h.level}>`; continue; }
 
     const task = t.match(/^[-*]\s+\[([ x])\]\s+(.+)$/i);
