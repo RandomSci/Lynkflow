@@ -88,6 +88,16 @@ function renderNav() {
   });
   nav.appendChild(autoMonitorItem);
 
+  const followUpsItem = document.createElement('div');
+  followUpsItem.className = 'nav-item';
+  followUpsItem.dataset.id = 'followups';
+  followUpsItem.innerHTML = `<span class="nav-icon">↗</span><span>Follow-Ups</span>`;
+  followUpsItem.addEventListener('click', () => {
+    if (typeof loadFollowUpsPage === 'function') loadFollowUpsPage();
+    closeSidebar();
+  });
+  nav.appendChild(followUpsItem);
+
   const analyticsItem = document.createElement('div');
   analyticsItem.className = 'nav-item';
   analyticsItem.dataset.id = 'analytics';

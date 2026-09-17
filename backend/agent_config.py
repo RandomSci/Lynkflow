@@ -89,6 +89,40 @@ Use [HANGUP] only as a silent control token when the call should end.
 """
 
 
+DEFAULT_FOLLOWUP_FIRST_MESSAGE = (
+    "Hi, am I speaking with {contact}? This is Anna from Lynkflow following up on our earlier conversation with {business}."
+)
+
+
+DEFAULT_FOLLOWUP_SYSTEM_PROMPT = """# ROLE
+You are Anna, Lynkflow's AI follow-up caller.
+
+This is not a cold call. You are continuing a prior conversation using the structured follow-up context provided by Lynkflow.
+
+# PRIMARY OBJECTIVE
+Reconnect naturally, reference the prior conversation briefly, and move toward the stored follow-up goal.
+
+# FOLLOW-UP RULES
+- Do not start the cold-call flow.
+- Do not ask whether the owner or office manager is available as a default opener.
+- If a contact name is known, ask for that person by name.
+- If only a contact role is known, ask whether you are speaking with that role.
+- If no name or role is known, say you are following up from Lynkflow about the previous conversation.
+- Do not invent previous conversation details.
+- Do not claim an email was sent unless email_delivery_status is exactly email_sent.
+- Do not claim the prospect received an email unless email_received is true.
+- If prospect_reported_not_received is true, do not say the email failed unless email_delivery_status is email_failed.
+- If the prospect says they did not receive an email, ask whether they checked spam/junk and, if still missing, ask for another preferred email. Do not automatically resend unless explicitly authorized.
+- If the prospect does not remember, briefly summarize only the stored agent_summary or context_summary.
+- If they want a demo, callback, or more information, handle it naturally and collect the needed details.
+- If they are not interested or ask not to be contacted, respect it and end professionally.
+- Keep responses short, calm, and conversational.
+- Never pressure the prospect.
+- Never speak bracketed control tokens aloud.
+- Use [HANGUP] only as a silent control token when the call should end.
+"""
+
+
 class AgentConfig(BaseModel):
     # ── Core ────────────────────────────────────────────────────────────────
     enabled: bool = False
@@ -107,14 +141,8 @@ class AgentConfig(BaseModel):
     live_model: str = "gpt-live-1"
     live_voice: str = "gleam"
 
-    # ── Voice ───────────────────────────────────────────────────────────────
-    voice_id: str = "EXAVITQu4vr4xnSDxMaL"
-    voice_name: str = "Sarah"
+    # ── Voice tone ──────────────────────────────────────────────────────────
     tone: str = "professional"
-    stability: float = 0.55
-    similarity_boost: float = 0.75
-    style: float = 0.05
-    speaking_rate: float = 1.0
 
     # ── Call behaviour ──────────────────────────────────────────────────────
     endpointing_ms: int = 600          # silence before agent responds
@@ -128,17 +156,54 @@ class AgentConfig(BaseModel):
     voicemail_message: str = ""
     callback_number: str = ""    
 
+    # ── Follow-ups ───────────────────────────────────────────────────────────
+    auto_followups_enabled: bool = False
+
+    # ── Follow-up agent: messages ────────────────────────────────────────────
+    followup_first_message: str = DEFAULT_FOLLOWUP_FIRST_MESSAGE
+    followup_system_prompt: str = DEFAULT_FOLLOWUP_SYSTEM_PROMPT
+    followup_end_call_phrases: str = "goodbye,have a good day,take care,talk soon"
+
+    # ── Follow-up agent: model ───────────────────────────────────────────────
+    followup_voice_engine: str = "gpt_live"
+    followup_model: str = "gpt-4.1"
+    followup_temperature: float = 0.25
+    followup_max_tokens: int = 120
+    followup_live_model: str = "gpt-live-1"
+    followup_live_voice: str = "gleam"
+
+    # ── Follow-up agent: voice tone ──────────────────────────────────────────
+    followup_tone: str = "professional"
+
+    # ── Follow-up agent: behavior ────────────────────────────────────────────
+    followup_endpointing_ms: int = 450
+    followup_utterance_end_ms: int = 1200
+    followup_silence_timeout_s: int = 45
+    followup_max_duration_s: int = 300
+    followup_allow_interruption: bool = True
+
+    # ── Follow-up agent: voicemail/test ──────────────────────────────────────
+    followup_voicemail_enabled: bool = False
+    followup_voicemail_message: str = ""
+    followup_callback_number: str = ""
+    followup_test_scenario: str = "remembers_context"
+
 
 def load_agent_config() -> AgentConfig:
     if _CONFIG_FILE.exists():
         try:
-            return AgentConfig(**json.loads(_CONFIG_FILE.read_text()))
+            cfg = AgentConfig(**json.loads(_CONFIG_FILE.read_text()))
+            cfg.voice_engine = "gpt_live"
+            cfg.followup_voice_engine = "gpt_live"
+            return cfg
         except Exception:
             pass
     return AgentConfig()
 
 
 def save_agent_config(cfg: AgentConfig) -> None:
+    cfg.voice_engine = "gpt_live"
+    cfg.followup_voice_engine = "gpt_live"
     _CONFIG_FILE.write_text(cfg.model_dump_json(indent=2))
 
 def apply_preset(cfg: AgentConfig, preset_key: str) -> AgentConfig:

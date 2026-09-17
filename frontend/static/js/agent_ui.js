@@ -29,14 +29,7 @@ const AUTODIAL_TEST_LIMIT_KEY = 'lynkflow_autodial_test_limit';
 const AUTODIAL_CALL_LIMIT_KEY = 'lynkflow_autodial_call_limit';
 const AUTODIAL_SIM_ENDPOINT_KEY = 'lynkflow_autodial_sim_endpoint';
 
-const VOICES = [
-  { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah',   desc: 'Warm, professional female' },
-  { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel',  desc: 'Calm, clear female' },
-  { id: 'AZnzlk1XvdvUeBnXmlld', name: 'Domi',    desc: 'Confident, direct female' },
-  { id: 'ThT5KcBeYPX3keUQqHPh', name: 'Dorothy', desc: 'Friendly British female' },
-  { id: 'pNInz6obpgDQGcFmaJgB', name: 'Adam',    desc: 'Deep, professional male' },
-  { id: 'TxGEqnHWrfWFTfGW9XjX', name: 'Josh',    desc: 'Casual, natural male' },
-];
+const LIVE_VOICES = ['gleam', 'meridian', 'quartz', 'ripple', 'willow', 'vesper', 'delta', 'cinder'];
 
 const TONES = [
   { id: 'professional', label: 'Professional', desc: 'Confident, businesslike' },
@@ -141,41 +134,14 @@ function buildAgentOptions() {
     <!-- VOICE -->
     <div class="agent-opt-pane" data-pane="voice">
       <div class="agent-opt-group">
-        <div class="agent-opt-label">Voice</div>
+        <div class="agent-opt-label">GPT-Live Voice</div>
         <div class="agent-voice-grid" id="voiceGrid"></div>
-      </div>
-
-      <div class="agent-opt-group">
-        <div class="agent-opt-label">
-          Custom Voice ID
-          <span class="agent-opt-hint">Paste any ElevenLabs voice ID to override the picks above</span>
-        </div>
-        <div class="agent-custom-voice">
-          <input type="text" id="optCustomVoice" class="agent-select"
-                 placeholder="Paste a voice ID, then press Apply"
-                 value="${VOICES.some(v => v.id === agentConfig.voice_id) ? '' : escAttr(agentConfig.voice_id || '')}" />
-          <button class="agent-apply-btn" id="applyCustomVoice">Apply</button>
-        </div>
-        <div class="agent-current-voice">
-          Active: <strong id="activeVoiceLabel">${escAttr(agentConfig.voice_name || 'Custom')}</strong>
-          <span class="agent-voice-id-mono">${escAttr(agentConfig.voice_id || '')}</span>
-        </div>
+        <div class="agent-opt-hint">This is the real call voice for cold calls. Follow-ups have their own GPT-Live voice setting below.</div>
       </div>
 
       <div class="agent-opt-group">
         <div class="agent-opt-label">Tone</div>
         <div class="agent-tone-row" id="toneRow"></div>
-      </div>
-
-      <div class="agent-opt-group">
-        ${slider('optStability', 'Stability', agentConfig.stability, 0, 1, 0.05,
-                 'Lower = more expressive, higher = more consistent')}
-        ${slider('optSimilarity', 'Similarity Boost', agentConfig.similarity_boost, 0, 1, 0.05,
-                 'How closely it matches the original voice')}
-        ${slider('optStyle', 'Style Exaggeration', agentConfig.style, 0, 1, 0.05,
-                 'Adds emotion — higher values increase latency')}
-        ${slider('optRate', 'Speaking Rate', agentConfig.speaking_rate, 0.7, 1.2, 0.05,
-                 'Playback speed')}
       </div>
     </div>
 
@@ -183,18 +149,15 @@ function buildAgentOptions() {
     <div class="agent-opt-pane" data-pane="model">
       <div class="agent-opt-group">
         <div class="agent-opt-label">
-          Production Voice Engine
-          <span class="agent-opt-hint">Live calls use GPT-Live for speech, reasoning, and interruption handling</span>
+          Voice Engine
+          <span class="agent-opt-hint">All real calls are locked to GPT-Live for speech, reasoning, and interruption handling</span>
         </div>
-        <select id="optVoiceEngine" class="agent-select">
-          <option value="gpt_live" ${(agentConfig.voice_engine || 'gpt_live') === 'gpt_live' ? 'selected' : ''}>GPT-Live — production</option>
-          <option value="chained" ${agentConfig.voice_engine === 'chained' ? 'selected' : ''}>Legacy chain — Deepgram + GPT + ElevenLabs</option>
-        </select>
+        <div class="followup-engine-locked">GPT-Live only</div>
       </div>
       <div class="agent-opt-group">
         <div class="agent-opt-label">GPT-Live Voice</div>
         <select id="optLiveVoice" class="agent-select">
-          ${['gleam', 'meridian', 'quartz', 'ripple', 'willow', 'vesper', 'delta', 'cinder'].map(v =>
+          ${LIVE_VOICES.map(v =>
             `<option value="${v}" ${(agentConfig.live_voice || 'gleam') === v ? 'selected' : ''}>${v}</option>`
           ).join('')}
         </select>
@@ -233,6 +196,13 @@ function buildAgentOptions() {
           <span>
             <span class="agent-checkbox-label">Allow interruption (barge-in)</span>
             <span class="agent-opt-hint">Agent stops talking the moment the prospect speaks</span>
+          </span>
+        </label>
+        <label class="agent-checkbox-row">
+          <input type="checkbox" id="optAutoFollowups" ${agentConfig.auto_followups_enabled ? 'checked' : ''} />
+          <span>
+            <span class="agent-checkbox-label">Auto follow-up execution</span>
+            <span class="agent-opt-hint">Default off. Analyst can create follow-ups; calls still require manual trigger unless explicitly enabled later.</span>
           </span>
         </label>
       </div>
@@ -291,42 +261,28 @@ function buildAgentOptions() {
     });
   });
 
-  // Voice cards
+  // GPT-Live voice cards
   const vGrid = p.querySelector('#voiceGrid');
-  VOICES.forEach(v => {
-    const el = document.createElement('div');
-    el.className = 'agent-voice-card' + (agentConfig.voice_id === v.id ? ' selected' : '');
-    el.innerHTML = `<div class="agent-voice-name">${v.name}</div><div class="agent-voice-desc">${v.desc}</div>`;
+  LIVE_VOICES.forEach(v => {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'agent-voice-card' + ((agentConfig.live_voice || 'gleam') === v ? ' selected' : '');
+    el.innerHTML = `<div class="agent-voice-name">${v}</div><div class="agent-voice-desc">GPT-Live</div>`;
     el.addEventListener('click', () => {
       vGrid.querySelectorAll('.agent-voice-card').forEach(c => c.classList.remove('selected'));
       el.classList.add('selected');
-      agentConfig.voice_id = v.id;
-      agentConfig.voice_name = v.name;
-      const inp = p.querySelector('#optCustomVoice');
-      if (inp) inp.value = v.id;
-      updateActiveVoiceLabel(p);
+      agentConfig.live_voice = v;
+      const select = p.querySelector('#optLiveVoice');
+      if (select) select.value = v;
     });
     vGrid.appendChild(el);
   });
-
-  // Custom voice ID
-  const applyBtn = p.querySelector('#applyCustomVoice');
-  if (applyBtn) {
-    applyBtn.addEventListener('click', () => {
-      const id = p.querySelector('#optCustomVoice').value.trim();
-      if (!id) return;
-      agentConfig.voice_id = id;
-      const known = VOICES.find(v => v.id === id);
-      agentConfig.voice_name = known ? known.name : 'Custom';
-      vGrid.querySelectorAll('.agent-voice-card').forEach(c => c.classList.remove('selected'));
-      if (known) {
-        [...vGrid.children].find(c =>
-          c.querySelector('.agent-voice-name').textContent === known.name
-        )?.classList.add('selected');
-      }
-      updateActiveVoiceLabel(p);
+  p.querySelector('#optLiveVoice')?.addEventListener('change', (e) => {
+    agentConfig.live_voice = e.target.value || 'gleam';
+    vGrid.querySelectorAll('.agent-voice-card').forEach(c => {
+      c.classList.toggle('selected', c.querySelector('.agent-voice-name')?.textContent === agentConfig.live_voice);
     });
-  }
+  });
 
   // Tone buttons
   const tRow = p.querySelector('#toneRow');
@@ -355,29 +311,18 @@ function buildAgentOptions() {
     agentConfig.first_message     = p.querySelector('#optFirstMessage').value;
     agentConfig.system_prompt     = p.querySelector('#optSystemPrompt').value;
     agentConfig.end_call_phrases  = p.querySelector('#optEndPhrases').value;
-    agentConfig.voice_engine      = p.querySelector('#optVoiceEngine')?.value || 'gpt_live';
+    agentConfig.voice_engine      = 'gpt_live';
     agentConfig.live_model        = 'gpt-live-1';
     agentConfig.live_voice        = p.querySelector('#optLiveVoice')?.value || 'gleam';
     agentConfig.model             = p.querySelector('#optModel').value;
     agentConfig.temperature       = parseFloat(p.querySelector('#optTemperature').value);
     agentConfig.max_tokens        = parseInt(p.querySelector('#optMaxTokens').value);
-    agentConfig.stability         = parseFloat(p.querySelector('#optStability').value);
-    agentConfig.similarity_boost  = parseFloat(p.querySelector('#optSimilarity').value);
-    agentConfig.style             = parseFloat(p.querySelector('#optStyle').value);
-    agentConfig.speaking_rate     = parseFloat(p.querySelector('#optRate').value);
-    // Only override from the text field if it differs from the active voice.
-    // Prevents a stale field value from clobbering a card selection.
-    const customId = p.querySelector('#optCustomVoice')?.value.trim();
-    if (customId && customId !== agentConfig.voice_id) {
-      agentConfig.voice_id = customId;
-      const known = VOICES.find(v => v.id === customId);
-      agentConfig.voice_name = known ? known.name : 'Custom';
-    }
     agentConfig.endpointing_ms    = parseInt(p.querySelector('#optEndpointing').value);
     agentConfig.utterance_end_ms  = parseInt(p.querySelector('#optUtteranceEnd').value);
     agentConfig.silence_timeout_s = parseInt(p.querySelector('#optSilenceTimeout').value);
     agentConfig.max_duration_s    = parseInt(p.querySelector('#optMaxDuration').value);
     agentConfig.allow_interruption = p.querySelector('#optInterruption').checked;
+    agentConfig.auto_followups_enabled = p.querySelector('#optAutoFollowups')?.checked || false;
     agentConfig.base_url          = p.querySelector('#optBaseUrl').value.trim();
     agentConfig.voicemail_enabled = p.querySelector('#optVmEnabled').checked;
     agentConfig.voicemail_message = p.querySelector('#optVmMessage').value;
@@ -599,13 +544,6 @@ function toggleAgentOptions() {
   if (p) p.style.display = p.style.display === 'none' ? 'block' : 'none';
 }
 
-function updateActiveVoiceLabel(panel) {
-  const lbl = panel.querySelector('#activeVoiceLabel');
-  const mono = panel.querySelector('.agent-voice-id-mono');
-  if (lbl)  lbl.textContent = agentConfig.voice_name || 'Custom';
-  if (mono) mono.textContent = agentConfig.voice_id || '';
-}
-
 // ── Mode switching ──────────────────────────────────────────────────────────
 
 function applyAgentMode() {
@@ -656,7 +594,7 @@ async function handleAgentCallBtn() {
   console.log('[AGENT] matched lead:', lead);
 
   clearTranscript();
-  updateDialerStatus('Starting agent call…', 'calling');
+  updateDialerStatus('Starting GPT-Live agent call…', 'calling');
   updateAgentCallBtn(true);
 
   try {
@@ -669,6 +607,7 @@ async function handleAgentCallBtn() {
     if (!res.ok || !data.success) throw new Error(data.detail || 'Failed to start');
 
     agentCallSid = data.call_sid;
+    updateDialerStatus('Agent call started via GPT-Live', 'calling');
     connectAgentEvents(agentCallSid);
 
     agentCallTimeout = setTimeout(() => {
@@ -1207,7 +1146,7 @@ function renderAutoDialMonitor() {
         <span class="autodial-call-name">${escapeHtml(call.name || 'Unknown')}</span>
         <span class="autodial-call-state">${call.mode === 'test' ? 'TEST · ' : ''}${escapeHtml(call.state || 'dialing')}</span>
       </div>
-      <div class="autodial-call-phone">${escapeHtml(call.phone || '')}</div>
+      <div class="autodial-call-phone">${escapeHtml(call.phone || '')}${call.engine ? ' · ' + escapeHtml(call.engine) : ''}</div>
       <div class="autodial-call-line ${call.last_speaker ? 'has-line' : ''}">
         ${call.last_speaker ? `<b>${call.last_speaker === 'agent' ? 'Agent' : 'Lead'}:</b> ${escapeHtml(call.last_text || '')}` : 'Waiting for transcript...'}
       </div>
@@ -1246,7 +1185,7 @@ function renderAutoDialEvent(event) {
   return `
     <div class="autodial-event">
       <div class="autodial-event-head"><span>${escapeHtml(label)}</span><em>${escapeHtml(event.ts || '')}</em></div>
-      <div class="autodial-event-meta">${escapeHtml(event.name ? event.name + ' · ' : '')}${escapeHtml(event.phone || '')}</div>
+      <div class="autodial-event-meta">${escapeHtml([event.name, event.phone, event.engine].filter(Boolean).join(' · '))}</div>
       <div class="autodial-event-body">${escapeHtml(body)}</div>
       ${recording}
     </div>
@@ -1259,6 +1198,625 @@ function renderAutoDialRecording(recording) {
     return `<a href="${src}" target="_blank" rel="noopener" class="autodial-event-transcript">Open test transcript</a>`;
   }
   return `<audio controls preload="none" src="${src}" class="autodial-event-audio"></audio>`;
+}
+
+// ── Follow-Ups ──────────────────────────────────────────────────────────────
+
+let followUps = [];
+let followUpCounts = {};
+let followUpEventSource = null;
+let followUpPollTimer = null;
+let followUpCallEventSource = null;
+let followUpLive = { callSid: null, followUpId: null, status: '', lines: [], active: false };
+let followUpActiveSection = 'approved';
+let followUpExpandedIds = new Set();
+
+async function loadFollowUpsPage() {
+  if (typeof setActiveNav === 'function') setActiveNav('followups');
+  await loadAgentConfig();
+
+  const area = document.getElementById('contentArea');
+  if (!area) return;
+  area.innerHTML = `
+    <div class="an-header">
+      <div>
+        <div class="an-eyebrow">Call Intelligence</div>
+        <h1 class="an-title">Follow-Ups</h1>
+      </div>
+      <div class="followup-head-actions">
+        <button class="analyst-lite-btn" id="followUpsToggleAllBtn">Expand All</button>
+        <button class="analyst-lite-btn" id="followUpsRefreshBtn">Refresh</button>
+      </div>
+    </div>
+    <div class="followup-page-switch">
+      <button class="followup-section-btn active" data-followup-section="approved">Approved Leads</button>
+      <button class="followup-section-btn" data-followup-section="options">Options</button>
+    </div>
+    <section id="followUpApprovedSection" class="followup-section active">
+      <div class="followup-summary" id="followUpSummary"></div>
+      <div id="followUpLivePanel"></div>
+      <div class="followup-list" id="followUpList"><div class="an-loading">Loading follow-ups...</div></div>
+    </section>
+    <section id="followUpOptionsSection" class="followup-section">
+      <div id="followUpSettings"></div>
+    </section>
+  `;
+
+  document.getElementById('followUpsRefreshBtn')?.addEventListener('click', refreshFollowUps);
+  document.getElementById('followUpsToggleAllBtn')?.addEventListener('click', toggleAllFollowUpsExpanded);
+  document.querySelectorAll('.followup-section-btn').forEach(btn => {
+    btn.addEventListener('click', () => setFollowUpSection(btn.dataset.followupSection || 'approved'));
+  });
+  renderFollowUpSettings();
+  setFollowUpSection(followUpActiveSection);
+  connectFollowUpEvents();
+  await refreshFollowUps();
+  if (followUpPollTimer) clearInterval(followUpPollTimer);
+  followUpPollTimer = setInterval(() => {
+    if (document.querySelector('.nav-item[data-id="followups"]')?.classList.contains('active')) refreshFollowUps();
+  }, 15000);
+}
+
+function setFollowUpSection(section) {
+  followUpActiveSection = section === 'options' ? 'options' : 'approved';
+  document.querySelectorAll('.followup-section-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.followupSection === followUpActiveSection);
+  });
+  const approved = document.getElementById('followUpApprovedSection');
+  const options = document.getElementById('followUpOptionsSection');
+  if (approved) approved.classList.toggle('active', followUpActiveSection === 'approved');
+  if (options) options.classList.toggle('active', followUpActiveSection === 'options');
+}
+
+async function refreshFollowUps() {
+  try {
+    const res = await fetch('/api/follow-ups');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Failed to load follow-ups');
+    followUps = data.follow_ups || [];
+    followUpCounts = data.counts || {};
+    renderFollowUps();
+    reconnectFollowUpLiveIfNeeded();
+  } catch (e) {
+    const list = document.getElementById('followUpList');
+    if (list) list.innerHTML = `<div class="an-loading">Failed to load follow-ups: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function connectFollowUpEvents() {
+  if (followUpEventSource) return;
+  followUpEventSource = new EventSource('/api/follow-ups/events');
+  followUpEventSource.onmessage = (e) => {
+    let data;
+    try { data = JSON.parse(e.data); } catch { return; }
+    if (data.type === 'ping') return;
+    if (data.type === 'snapshot') {
+      followUps = data.follow_ups || followUps;
+      followUpCounts = data.counts || followUpCounts;
+      renderFollowUps();
+      return;
+    }
+    refreshFollowUps();
+  };
+  followUpEventSource.onerror = () => {
+    followUpEventSource?.close();
+    followUpEventSource = null;
+    setTimeout(connectFollowUpEvents, 3000);
+  };
+}
+
+function renderFollowUps() {
+  renderFollowUpSummary();
+  renderFollowUpLivePanel();
+  updateFollowUpsToggleAllBtn();
+  const list = document.getElementById('followUpList');
+  if (!list) return;
+  if (!followUps.length) {
+    list.innerHTML = '<div class="followup-empty">No follow-ups yet. When the AI analyst finds a real commercial reason to call back, it will appear here.</div>';
+    return;
+  }
+  list.innerHTML = followUps.map(renderFollowUpCard).join('');
+  list.querySelectorAll('.followup-call-btn').forEach(btn => {
+    btn.addEventListener('click', () => callFollowUp(btn.dataset.id, btn));
+  });
+  list.querySelectorAll('.followup-expand-btn').forEach(btn => {
+    btn.addEventListener('click', () => toggleFollowUpExpanded(btn.dataset.id));
+  });
+  list.querySelectorAll('.followup-cancel-btn').forEach(btn => {
+    btn.addEventListener('click', () => cancelFollowUp(btn.dataset.id));
+  });
+}
+
+function toggleAllFollowUpsExpanded() {
+  if (followUps.length && followUps.every(f => followUpExpandedIds.has(f.id))) {
+    followUpExpandedIds.clear();
+  } else {
+    followUps.forEach(f => followUpExpandedIds.add(f.id));
+  }
+  renderFollowUps();
+}
+
+function updateFollowUpsToggleAllBtn() {
+  const btn = document.getElementById('followUpsToggleAllBtn');
+  if (!btn) return;
+  btn.textContent = followUps.length && followUps.every(f => followUpExpandedIds.has(f.id)) ? 'Shrink All' : 'Expand All';
+}
+
+function toggleFollowUpExpanded(id) {
+  if (!id) return;
+  if (followUpExpandedIds.has(id)) followUpExpandedIds.delete(id);
+  else followUpExpandedIds.add(id);
+  renderFollowUps();
+}
+
+function renderFollowUpSettings() {
+  const mount = document.getElementById('followUpSettings');
+  if (!mount) return;
+  mount.innerHTML = `
+    <div class="card agent-options-panel followup-settings-panel">
+      <div class="followup-settings-head">
+        <div>
+          <div class="card-label">Follow-Up Agent Settings</div>
+          <div class="followup-settings-sub">Separate from cold calling. Uses existing GPT-Live, Twilio, recordings, and transcript pipeline.</div>
+        </div>
+        <span id="followUpSettingsSaved" class="agent-save-feedback"></span>
+      </div>
+      <div class="agent-opt-tabs">
+        <button class="agent-opt-tab active" data-fu-tab="messages">Messages</button>
+        <button class="agent-opt-tab" data-fu-tab="voice">Voice</button>
+        <button class="agent-opt-tab" data-fu-tab="model">Model</button>
+        <button class="agent-opt-tab" data-fu-tab="behavior">Behavior</button>
+        <button class="agent-opt-tab" data-fu-tab="voicemail">Voicemail</button>
+      </div>
+      <div class="followup-settings-scroll">
+        <div class="agent-opt-pane active" data-fu-pane="messages">
+          <div class="agent-opt-group">
+            <div class="agent-opt-label">First Message <span class="agent-opt-hint">Placeholders: {business}, {contact}, {contact_name}, {contact_role}</span></div>
+            <textarea id="fuFirstMessage" class="agent-textarea" rows="4">${escAttr(agentConfig.followup_first_message || '')}</textarea>
+          </div>
+          <div class="agent-opt-group">
+            <div class="agent-opt-label">System Prompt <span class="agent-opt-hint">Follow-up brain. Do not put cold-call owner-routing rules here.</span></div>
+            <textarea id="fuSystemPrompt" class="agent-textarea agent-textarea--tall" rows="14">${escAttr(agentConfig.followup_system_prompt || '')}</textarea>
+          </div>
+          <div class="agent-opt-group">
+            <div class="agent-opt-label">End Call Phrases</div>
+            <input id="fuEndPhrases" class="agent-select" value="${escAttr(agentConfig.followup_end_call_phrases || '')}" />
+          </div>
+        </div>
+        <div class="agent-opt-pane" data-fu-pane="voice">
+          <div class="agent-opt-group followup-active-voice-box">
+            <div class="agent-opt-label">GPT-Live Voice Used On Real Follow-Up Calls</div>
+            <div class="followup-live-voice-grid" id="fuLiveVoiceGrid"></div>
+            <div class="agent-opt-hint">Follow-Up Agent is GPT-Live only. These are the only voices that affect real follow-up calls.</div>
+          </div>
+          <div class="agent-opt-group"><div class="agent-opt-label">Tone</div><div class="agent-tone-row" id="fuToneRow"></div></div>
+        </div>
+        <div class="agent-opt-pane" data-fu-pane="model">
+          <div class="agent-opt-group">
+            <div class="agent-opt-label">Voice Engine</div>
+            <div class="followup-engine-locked">GPT-Live only</div>
+          </div>
+          <div class="agent-opt-group"><div class="agent-opt-label">GPT-Live Voice</div><select id="fuLiveVoice" class="agent-select">${LIVE_VOICES.map(v => `<option value="${v}" ${(agentConfig.followup_live_voice || 'gleam') === v ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+          <div class="followup-settings-sub">GPT-Live handles both speech and reasoning for real follow-up calls. Legacy text-to-speech settings are not used.</div>
+        </div>
+        <div class="agent-opt-pane" data-fu-pane="behavior">
+          <div class="agent-opt-group">
+            ${slider('fuEndpointing', 'Response Delay (ms)', agentConfig.followup_endpointing_ms, 100, 1500, 50, 'Silence before reply. Lower feels faster.', true)}
+            ${slider('fuUtteranceEnd', 'Turn End Detection (ms)', agentConfig.followup_utterance_end_ms, 500, 3000, 100, 'Silence that marks end of prospect turn', true)}
+            ${slider('fuSilenceTimeout', 'Silence Timeout (sec)', agentConfig.followup_silence_timeout_s, 15, 180, 5, 'Follow-up calls stay open longer before dead-air hangup', true)}
+            ${slider('fuMaxDuration', 'Max Call Duration (sec)', agentConfig.followup_max_duration_s, 60, 900, 30, 'Hard cap', true)}
+          </div>
+          <label class="agent-checkbox-row"><input id="fuInterruption" type="checkbox" ${agentConfig.followup_allow_interruption ? 'checked' : ''} /><span><span class="agent-checkbox-label">Allow interruption</span><span class="agent-opt-hint">Stops talking when the prospect speaks</span></span></label>
+          <label class="agent-checkbox-row"><input id="fuAutoFollowups" type="checkbox" ${agentConfig.auto_followups_enabled ? 'checked' : ''} /><span><span class="agent-checkbox-label">Auto follow-up execution</span><span class="agent-opt-hint">Still off by default. Creation never auto-calls unless enabled later by explicit scheduler/permission.</span></span></label>
+        </div>
+        <div class="agent-opt-pane" data-fu-pane="voicemail">
+          <label class="agent-checkbox-row"><input id="fuVmEnabled" type="checkbox" ${agentConfig.followup_voicemail_enabled ? 'checked' : ''} /><span><span class="agent-checkbox-label">Leave follow-up voicemail</span><span class="agent-opt-hint">Default off</span></span></label>
+          <div class="agent-opt-group"><div class="agent-opt-label">Voicemail Message</div><textarea id="fuVmMessage" class="agent-textarea" rows="7">${escAttr(agentConfig.followup_voicemail_message || '')}</textarea></div>
+          <div class="agent-opt-group"><div class="agent-opt-label">Callback Number</div><input id="fuCallback" class="agent-select" value="${escAttr(agentConfig.followup_callback_number || '')}" /></div>
+        </div>
+      </div>
+      <div class="agent-opt-footer"><button class="agent-save-btn" id="fuSaveSettings">Save follow-up settings</button></div>
+    </div>
+  `;
+  wireFollowUpSettings(mount);
+}
+
+function wireFollowUpSettings(scope) {
+  scope.querySelectorAll('.agent-opt-tab[data-fu-tab]').forEach(tab => {
+    tab.addEventListener('click', () => {
+      scope.querySelectorAll('.agent-opt-tab[data-fu-tab]').forEach(t => t.classList.remove('active'));
+      scope.querySelectorAll('.agent-opt-pane[data-fu-pane]').forEach(p => p.classList.remove('active'));
+      tab.classList.add('active');
+      scope.querySelector(`[data-fu-pane="${tab.dataset.fuTab}"]`)?.classList.add('active');
+    });
+  });
+  scope.querySelectorAll('.agent-slider').forEach(s => s.addEventListener('input', () => { const out = scope.querySelector(`#${s.id}_val`); if (out) out.textContent = s.value; }));
+  const liveVoiceGrid = scope.querySelector('#fuLiveVoiceGrid');
+  LIVE_VOICES.forEach(v => {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'followup-live-voice-btn' + ((agentConfig.followup_live_voice || 'gleam') === v ? ' selected' : '');
+    el.innerHTML = `<span>${v}</span><em>GPT-Live</em>`;
+    el.addEventListener('click', () => {
+      liveVoiceGrid.querySelectorAll('.followup-live-voice-btn').forEach(b => b.classList.remove('selected'));
+      el.classList.add('selected');
+      agentConfig.followup_live_voice = v;
+      const select = scope.querySelector('#fuLiveVoice');
+      if (select) select.value = v;
+    });
+    liveVoiceGrid.appendChild(el);
+  });
+  const toneRow = scope.querySelector('#fuToneRow');
+  TONES.forEach(t => {
+    const el = document.createElement('button');
+    el.className = 'agent-tone-btn' + ((agentConfig.followup_tone || 'professional') === t.id ? ' selected' : '');
+    el.innerHTML = `<span class="agent-tone-label">${t.label}</span><span class="agent-tone-desc">${t.desc}</span>`;
+    el.addEventListener('click', () => {
+      toneRow.querySelectorAll('.agent-tone-btn').forEach(b => b.classList.remove('selected'));
+      el.classList.add('selected');
+      agentConfig.followup_tone = t.id;
+    });
+    toneRow.appendChild(el);
+  });
+  scope.querySelector('#fuLiveVoice')?.addEventListener('change', (e) => {
+    agentConfig.followup_live_voice = e.target.value || 'gleam';
+    liveVoiceGrid.querySelectorAll('.followup-live-voice-btn').forEach(b => {
+      b.classList.toggle('selected', b.querySelector('span')?.textContent === agentConfig.followup_live_voice);
+    });
+  });
+  scope.querySelector('#fuSaveSettings')?.addEventListener('click', () => saveFollowUpSettings(scope));
+}
+
+async function saveFollowUpSettings(scope) {
+  agentConfig.followup_first_message = scope.querySelector('#fuFirstMessage')?.value || '';
+  agentConfig.followup_system_prompt = scope.querySelector('#fuSystemPrompt')?.value || '';
+  agentConfig.followup_end_call_phrases = scope.querySelector('#fuEndPhrases')?.value || '';
+  agentConfig.followup_voice_engine = 'gpt_live';
+  agentConfig.followup_live_voice = scope.querySelector('#fuLiveVoice')?.value || 'gleam';
+  agentConfig.followup_endpointing_ms = parseInt(scope.querySelector('#fuEndpointing')?.value || '450');
+  agentConfig.followup_utterance_end_ms = parseInt(scope.querySelector('#fuUtteranceEnd')?.value || '1200');
+  agentConfig.followup_silence_timeout_s = parseInt(scope.querySelector('#fuSilenceTimeout')?.value || '45');
+  agentConfig.followup_max_duration_s = parseInt(scope.querySelector('#fuMaxDuration')?.value || '300');
+  agentConfig.followup_allow_interruption = !!scope.querySelector('#fuInterruption')?.checked;
+  agentConfig.auto_followups_enabled = !!scope.querySelector('#fuAutoFollowups')?.checked;
+  agentConfig.followup_voicemail_enabled = !!scope.querySelector('#fuVmEnabled')?.checked;
+  agentConfig.followup_voicemail_message = scope.querySelector('#fuVmMessage')?.value || '';
+  agentConfig.followup_callback_number = scope.querySelector('#fuCallback')?.value.trim() || '';
+  await saveAgentConfig();
+  const fb = scope.querySelector('#followUpSettingsSaved');
+  if (fb) { fb.textContent = 'Saved'; fb.classList.add('visible'); setTimeout(() => fb.classList.remove('visible'), 1600); }
+}
+
+function reconnectFollowUpLiveIfNeeded() {
+  if (followUpCallEventSource || followUpLive.callSid) return;
+  const active = followUps.find(f => String(f.status || '').toLowerCase() === 'calling' && f.call_id);
+  if (active) startFollowUpLive(active.call_id, active.id, false);
+}
+
+function renderFollowUpSummary() {
+  const wrap = document.getElementById('followUpSummary');
+  if (!wrap) return;
+  const items = [
+    ['Pending', followUpCounts.pending || 0],
+    ['Attempted', followUpCounts.attempted || 0],
+    ['Calling', followUpCounts.calling || 0],
+    ['Scheduled', followUpCounts.scheduled || 0],
+    ['Completed', followUpCounts.completed || 0],
+    ['Failed', followUpCounts.failed || 0],
+  ];
+  wrap.innerHTML = items.map(([label, value]) => `
+    <div class="followup-kpi"><span>${label}</span><b>${value}</b></div>
+  `).join('');
+}
+
+function renderFollowUpCard(f) {
+  const expanded = followUpExpandedIds.has(f.id);
+  const previousName = f.previous_contact_name || f.contact_name || 'name unknown';
+  const previousRole = f.previous_contact_role || f.contact_role || '';
+  const previousContact = `Previous contact: ${[previousRole, previousName].filter(Boolean).join(' · ')}`;
+  const currentContact = f.current_contact_name ? `Current caller: ${f.current_contact_name}${f.current_contact_role ? ' · ' + f.current_contact_role : ''}` : '';
+  const canCall = !['calling', 'cancelled'].includes(String(f.status || '').toLowerCase());
+  const preferredRecording = preferredFollowUpRecording(f);
+  const recordingHtml = preferredRecording ? renderFollowUpRecordingBlock(preferredRecording) : '';
+  const attemptHistoryHtml = renderFollowUpAttemptHistory(f);
+  const summary = f.next_action || f.result || f.follow_up_goal || f.reason || '';
+  const details = [
+    ['Reason', f.reason],
+    ['Previous contact', [previousRole, previousName].filter(Boolean).join(' · ')],
+    ['Current caller', currentContact.replace('Current caller: ', '')],
+    ['Previous call time', f.previous_call_local_display || f.previous_call_local_date || f.previous_call_date],
+    ['Previous conversation', f.context_summary],
+    ['Details', f.details],
+    ['Pain point', f.pain_point],
+    ['Current solution', f.current_solution],
+    ['Interest signal', f.interest_signal],
+    ['Previous action', formatPreviousAction(f)],
+    ['Email status', formatEmailStatus(f)],
+    ['Next action', f.next_action],
+    ['Goal', f.follow_up_goal],
+    ['Result', f.result],
+  ].filter(([, value]) => value);
+
+  return `
+    <article class="followup-card followup-card--${escapeHtml(f.status || 'pending')} ${expanded ? 'expanded' : 'collapsed'}">
+      <div class="followup-card-head">
+        <div>
+          <div class="followup-business">${escapeHtml(f.business || 'Unknown business')}</div>
+          <div class="followup-meta">${escapeHtml([previousContact, currentContact, f.phone, f.email].filter(Boolean).join(' · '))}</div>
+        </div>
+        <div class="followup-badges">
+          <span class="followup-priority followup-priority--${escapeHtml(f.priority || 'warm')}">${escapeHtml(f.priority || 'warm')}</span>
+          <span class="followup-status">${escapeHtml(f.status || 'pending')}</span>
+        </div>
+      </div>
+      <div class="followup-compact-line">
+        <span>${escapeHtml(summary || 'No next action recorded yet.')}</span>
+        ${preferredRecording ? `<em>${preferredRecording.source === 'twilio' ? 'Twilio recording available' : 'Only local fallback recording available'}</em>` : '<em>No recording yet</em>'}
+      </div>
+      ${expanded ? `
+        <div class="followup-details">
+          ${details.map(([label, value]) => `
+            <div class="followup-detail">
+              <span>${escapeHtml(label)}</span>
+              <p>${escapeHtml(value)}</p>
+            </div>
+          `).join('')}
+        </div>
+      ` : ''}
+      <div class="followup-foot">
+        <div class="followup-timing">
+          <span>Created ${formatFollowUpDate(f.created_at)}</span>
+          <span>Attempts ${f.attempts || 0}</span>
+          ${f.last_attempt_at ? `<span>Last ${formatFollowUpDate(f.last_attempt_at)}</span>` : ''}
+          ${f.call_id ? `<span>Call ${escapeHtml(f.call_id)}</span>` : ''}
+        </div>
+        <div class="followup-actions">
+          <button class="followup-expand-btn" data-id="${escapeHtml(f.id)}">${expanded ? 'Shrink' : 'Expand'}</button>
+          <button class="followup-call-btn" data-id="${escapeHtml(f.id)}" ${canCall ? '' : 'disabled'}>${String(f.status || '').toLowerCase() === 'completed' ? 'Call Again' : 'Call Follow-Up'}</button>
+          ${f.status !== 'cancelled' && f.status !== 'completed' ? `<button class="followup-cancel-btn" data-id="${escapeHtml(f.id)}">Cancel</button>` : ''}
+        </div>
+      </div>
+      ${expanded ? attemptHistoryHtml : ''}
+      ${expanded && recordingHtml ? `<div class="followup-recording">${recordingHtml}</div>` : ''}
+    </article>
+  `;
+}
+
+function isTwilioRecording(name) {
+  return /_twilio\.wav$/i.test(String(name || ''));
+}
+
+function preferredFollowUpRecording(f) {
+  const recordings = [];
+  if (Array.isArray(f.follow_up_recordings)) recordings.push(...f.follow_up_recordings);
+  if (f.follow_up_recording) recordings.push(f.follow_up_recording);
+  const unique = [...new Set(recordings.filter(Boolean))];
+  if (!unique.length) return null;
+  const twilio = unique.filter(isTwilioRecording);
+  const name = (twilio.length ? twilio : unique)[(twilio.length ? twilio : unique).length - 1];
+  return { name, source: isTwilioRecording(name) ? 'twilio' : 'local' };
+}
+
+function renderFollowUpRecordingBlock(rec) {
+  const label = rec.source === 'twilio'
+    ? 'Twilio dual-channel recording'
+    : 'Local stream fallback recording, may be incomplete or choppy';
+  return `
+    <div class="followup-recording-card followup-recording-card--${rec.source}">
+      <div class="followup-recording-label">${escapeHtml(label)}</div>
+      ${renderAutoDialRecording(rec.name)}
+    </div>
+  `;
+}
+
+function renderFollowUpAttemptHistory(f) {
+  let history = Array.isArray(f.attempt_history) ? f.attempt_history.slice() : [];
+  if (!history.length && Array.isArray(f.call_ids) && f.call_ids.length) {
+    history = f.call_ids.map((id, idx) => ({
+      attempt: idx + 1,
+      call_id: id,
+      status: idx === f.call_ids.length - 1 ? (f.status || '') : 'completed',
+      result: idx === f.call_ids.length - 1 ? (f.result || '') : '',
+      recording: Array.isArray(f.follow_up_recordings) ? f.follow_up_recordings[idx] : '',
+      reason: idx === f.call_ids.length - 1 ? (f.next_action || f.follow_up_goal || f.reason || '') : '',
+    }));
+  }
+  if (!history.length) return '';
+  return `
+    <div class="followup-attempts">
+      <div class="followup-attempts-head">Call Attempts</div>
+      ${history.map((a, idx) => `
+        <div class="followup-attempt-row">
+          <div class="followup-attempt-main">
+            <b>#${escapeHtml(a.attempt || idx + 1)} ${escapeHtml(a.status || 'attempt')}</b>
+            <span>${escapeHtml([a.local_started_at || a.local_ended_at || a.started_at || a.ended_at, a.call_id].filter(Boolean).join(' · '))}</span>
+            ${a.reason || a.result ? `<p>${escapeHtml(a.reason || a.result || '')}</p>` : ''}
+          </div>
+          ${a.recording ? `<div class="followup-attempt-recording ${isTwilioRecording(a.recording) ? 'twilio' : 'local'}"><span>${isTwilioRecording(a.recording) ? 'Twilio' : 'Local fallback'}</span>${renderAutoDialRecording(a.recording)}</div>` : ''}
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function formatPreviousAction(f) {
+  const action = f.previous_action || '';
+  const emailState = f.email_delivery_status && f.email_delivery_status !== 'unknown'
+    ? `Email: ${String(f.email_delivery_status).replace(/_/g, ' ')}`
+    : '';
+  return [action, emailState].filter(Boolean).join(' · ');
+}
+
+function formatEmailStatus(f) {
+  const parts = [];
+  if (f.email_delivery_status && f.email_delivery_status !== 'unknown') parts.push(`Delivery: ${String(f.email_delivery_status).replace(/_/g, ' ')}`);
+  if (f.email_received === true) parts.push('Prospect confirmed received');
+  if (f.email_received === false) parts.push('Receipt not confirmed');
+  if (f.prospect_reported_not_received === true) parts.push('Prospect reported not received');
+  if (f.email_status_details) parts.push(f.email_status_details);
+  return parts.join(' · ');
+}
+
+function formatFollowUpDate(value) {
+  if (!value) return 'unknown';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+async function callFollowUp(id, btn) {
+  if (!id) return;
+  if (!agentConfig.base_url) {
+    alert('Set your public URL in AI Agent options before starting a follow-up call.');
+    return;
+  }
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  try {
+    const settings = document.getElementById('followUpSettings');
+    if (settings) await saveFollowUpSettings(settings);
+    const res = await fetch(`/api/follow-ups/${encodeURIComponent(id)}/call`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_url: agentConfig.base_url }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.detail || 'Failed to start follow-up call');
+    if (data.call_sid) startFollowUpLive(data.call_sid, id, true);
+    await refreshFollowUps();
+  } catch (e) {
+    alert(e.message);
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+function startFollowUpLive(callSid, followUpId, reset) {
+  if (!callSid) return;
+  if (followUpCallEventSource && followUpLive.callSid === callSid) return;
+  stopFollowUpLive(false);
+  followUpLive = {
+    callSid,
+    followUpId,
+    status: 'Connecting...',
+    lines: reset === false ? followUpLive.lines || [] : [],
+    active: true,
+  };
+  renderFollowUpLivePanel();
+
+  followUpCallEventSource = new EventSource(`/api/agent/events/${encodeURIComponent(callSid)}`);
+  followUpCallEventSource.onmessage = (e) => {
+    let data;
+    try { data = JSON.parse(e.data); } catch { return; }
+    if (data.type === 'ping') return;
+    handleFollowUpLiveEvent(data);
+  };
+  followUpCallEventSource.onerror = () => {
+    if (!followUpLive.active) return stopFollowUpLive(false);
+    followUpLive.status = 'Live connection interrupted. Reconnecting...';
+    renderFollowUpLivePanel();
+    followUpCallEventSource?.close();
+    followUpCallEventSource = null;
+    setTimeout(() => {
+      if (followUpLive.active && followUpLive.callSid) startFollowUpLive(followUpLive.callSid, followUpLive.followUpId, false);
+    }, 2500);
+  };
+}
+
+function stopFollowUpLive(clear) {
+  if (followUpCallEventSource) {
+    followUpCallEventSource.close();
+    followUpCallEventSource = null;
+  }
+  if (clear) followUpLive = { callSid: null, followUpId: null, status: '', lines: [], active: false };
+}
+
+function handleFollowUpLiveEvent(data) {
+  if (data.type === 'status') {
+    followUpLive.status = data.message || data.state || followUpLive.status;
+    if (data.state === 'ended') {
+      followUpLive.active = false;
+      stopFollowUpLive(false);
+      setTimeout(refreshFollowUps, 1200);
+    }
+  }
+  if (data.type === 'transcript') addFollowUpLiveLine(data.speaker, data.text, data.ts, false);
+  if (data.type === 'transcript_final') addFollowUpLiveLine(data.speaker, data.text, data.ts, false);
+  if (data.type === 'transcript_partial') addFollowUpLiveLine(data.speaker, data.text, data.ts, true);
+  if (data.type === 'metrics') setTimeout(refreshFollowUps, 1200);
+  renderFollowUpLivePanel();
+}
+
+function addFollowUpLiveLine(speaker, text, ts, partial) {
+  text = String(text || '').trim();
+  if (!text) return;
+  const lines = followUpLive.lines || [];
+  const last = lines[lines.length - 1];
+  if (partial && last?.partial && last.speaker === speaker) {
+    last.text = text;
+    last.ts = ts || last.ts;
+  } else if (!partial && last?.partial && last.speaker === speaker) {
+    last.text = text;
+    last.ts = ts || last.ts;
+    last.partial = false;
+  } else {
+    lines.push({ speaker, text, ts: ts || '', partial: !!partial });
+  }
+  followUpLive.lines = lines.slice(-80);
+}
+
+function renderFollowUpLivePanel() {
+  const panel = document.getElementById('followUpLivePanel');
+  if (!panel) return;
+  if (!followUpLive.callSid) {
+    panel.innerHTML = '';
+    return;
+  }
+  const followUp = followUps.find(f => f.id === followUpLive.followUpId) || {};
+  const lines = followUpLive.lines || [];
+  panel.innerHTML = `
+    <div class="card followup-live-card">
+      <div class="followup-live-head">
+        <div>
+          <div class="card-label">Live Follow-Up Call</div>
+          <div class="followup-live-title">${escapeHtml(followUp.business || 'Follow-up call')}</div>
+          <div class="followup-live-sub">${escapeHtml([followUp.phone, followUpLive.callSid].filter(Boolean).join(' · '))}</div>
+        </div>
+        <span class="followup-live-status ${followUpLive.active ? 'active' : ''}">${escapeHtml(followUpLive.status || 'Waiting...')}</span>
+      </div>
+      <div class="followup-live-transcript" id="followUpLiveTranscript">
+        ${lines.length ? lines.map(renderFollowUpLiveLine).join('') : '<div class="agent-transcript-empty">Waiting for live transcript events...</div>'}
+      </div>
+    </div>
+  `;
+  const transcript = panel.querySelector('#followUpLiveTranscript');
+  if (transcript) transcript.scrollTop = transcript.scrollHeight;
+}
+
+function renderFollowUpLiveLine(line) {
+  const speaker = line.speaker === 'agent' ? 'Agent' : 'Prospect';
+  return `
+    <div class="agent-msg agent-msg--${escapeHtml(line.speaker || 'prospect')} ${line.partial ? 'agent-msg--partial' : ''}">
+      <div class="agent-msg-head">
+        <span class="agent-msg-who">${escapeHtml(speaker)}</span>
+        <span class="agent-msg-ts">${escapeHtml(line.ts || '')}</span>
+      </div>
+      <div class="agent-msg-text">${escapeHtml(line.text || '')}</div>
+    </div>
+  `;
+}
+
+async function cancelFollowUp(id) {
+  if (!id || !confirm('Cancel this follow-up?')) return;
+  try {
+    const res = await fetch(`/api/follow-ups/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Cancel failed');
+    await refreshFollowUps();
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
 // ── Injection ───────────────────────────────────────────────────────────────

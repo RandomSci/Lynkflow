@@ -6,7 +6,7 @@
 
 ## 1. What is Lynkflow?
 
-- Lynkflow is a modern AI-powered web system that automates outbound phone calls using large language models and advanced speech-to-text/-from-text technology.
+- Lynkflow is a modern AI-powered web system that automates outbound phone calls using GPT-Live voice sessions.
 - It acts as a virtual agent/caller—initiates calls, interacts with humans (prospects, customers, gatekeepers), handles objections, leaves tailored voicemails, and logs all conversations.
 - Configurable agent “intelligence” logic, with custom scripts and rules, but also uses OpenAI models like GPT-4.1 for conversation generation.
 - Built for high-speed dialing, high-compliance, and easy scripting/testing.
@@ -18,12 +18,8 @@
 
 - **Automated Outbound Calling:**  
   Initiates hundreds/thousands of calls to leads using cloud telephony via Twilio.
-- **AI Conversation:**  
-  Uses OpenAI (GPT-4.1 by default) to generate natural language dialogue, with customizable tightness—never pitching to non-decision makers.
-- **Text-to-Speech (TTS):**  
-  Outbound voice is natural and high-quality, using ElevenLabs’ TTS for nearly human-sounding responses.
-- **Speech Recognition:**  
-  Real-time transcription runs via Deepgram.
+- **AI Conversation And Voice:**  
+  Uses OpenAI GPT-Live for full-duplex speech, reasoning, interruptions, and transcription during real calls.
 - **Lead Management:**  
   Pulls leads from Google Sheets, logs all call histories, and can push results back to a CRM.
 - **Engagement State Machine:**  
@@ -50,13 +46,12 @@
 - **Frontend:** Classic HTML/JavaScript/CSS, minimal client-side JS, direct AJAX and EventSource for monitoring and control.
 - **Voice/Telephony:**  
   - Twilio API for outbound/inbound phone calls.
-  - ElevenLabs for TTS (AI voice rendering).
-  - Deepgram for speech-to-text.
+  - OpenAI GPT-Live for real-time voice, reasoning, and transcription.
 - **Config/Data/Storage:**  
   - `.env`, `agent_config.json` for all key settings.
   - Text log and JSONL for history.
   - CRM sync via webhook/Google Sheets.
-- **Model:** Uses OpenAI’s GPT-4.1 by default, can be swapped for other models (e.g. GPT-4o) with config changes.
+- **Model:** Uses OpenAI GPT-Live for real calls, with text models retained only for non-call QA simulations and analysis tasks.
 
 ---
 

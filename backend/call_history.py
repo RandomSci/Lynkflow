@@ -98,6 +98,70 @@ def update_recording_file(call_sid: str, recording: str) -> bool:
         return False
 
 
+def update_call_details(call_sid: str, details: str) -> bool:
+    """Patch a stored call with analyst details for future follow-up context."""
+    details = " ".join(str(details or "").split()).strip()
+    if not call_sid or not details or not _HISTORY_FILE.exists():
+        return False
+    try:
+        lines = _HISTORY_FILE.read_text().splitlines()
+        changed = False
+        out = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                out.append(line)
+                continue
+            if entry.get("call_sid") == call_sid:
+                entry["details"] = details[:1500]
+                changed = True
+            out.append(json.dumps(entry))
+        if changed:
+            _HISTORY_FILE.write_text("\n".join(out) + "\n")
+        return changed
+    except Exception as e:
+        print(f"[HISTORY] details update failed: {e}")
+        return False
+
+
+def update_call_fields(call_sid: str, fields: dict) -> bool:
+    """Patch selected metadata fields on a stored call."""
+    if not call_sid or not fields or not _HISTORY_FILE.exists():
+        return False
+    allowed = {
+        "details", "lead_timezone", "lead_timezone_iana", "lead_local_date",
+        "lead_local_display", "state", "timezone",
+    }
+    clean_fields = {k: v for k, v in fields.items() if k in allowed and v not in (None, "")}
+    if not clean_fields:
+        return False
+    try:
+        lines = _HISTORY_FILE.read_text().splitlines()
+        changed = False
+        out = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                out.append(line)
+                continue
+            if entry.get("call_sid") == call_sid:
+                entry.update(clean_fields)
+                changed = True
+            out.append(json.dumps(entry))
+        if changed:
+            _HISTORY_FILE.write_text("\n".join(out) + "\n")
+        return changed
+    except Exception as e:
+        print(f"[HISTORY] fields update failed: {e}")
+        return False
+
+
 def load_calls(days: int = 30) -> list:
     if not _HISTORY_FILE.exists():
         return []

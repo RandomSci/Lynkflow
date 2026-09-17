@@ -91,6 +91,7 @@ class GPTLiveCallHandler:
         self.live_ws = None
         self.live_session_id = ""
         self.live_started = False
+        self._stream_started = asyncio.Event()
         self._pending_audio: list[str] = []
         self._out_audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._out_audio_task = None
@@ -126,6 +127,8 @@ class GPTLiveCallHandler:
         self._audio_clear_seq = 0
         self._prospect_loud_frames = 0
         self._barge_vad_threshold = 2600
+        self._followup_no_answer_warned = False
+        self._followup_idle_warned = False
         self.end_phrases = [
             p.strip().lower()
             for p in (getattr(cfg, "end_call_phrases", "") or "").split(",")
@@ -139,10 +142,29 @@ class GPTLiveCallHandler:
             self._stop = True
             return
 
+        tasks = []
         try:
-            await self._connect_live()
-            await asyncio.gather(self._twilio_loop(), self._live_loop(), self._watchdog())
+            twilio_task = asyncio.create_task(self._twilio_loop())
+            watchdog_task = asyncio.create_task(self._watchdog())
+            tasks.extend([twilio_task, watchdog_task])
+
+            try:
+                await asyncio.wait_for(self._stream_started.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                await self._push_status("ended", "Twilio stream did not start")
+                self._stop = True
+                return
+
+            if not self._stop:
+                await self._connect_live()
+                live_task = asyncio.create_task(self._live_loop())
+                tasks.append(live_task)
+
+            await asyncio.gather(*tasks)
         finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
             await self._cleanup()
 
     async def _watchdog(self):
@@ -151,12 +173,21 @@ class GPTLiveCallHandler:
             now = time.time()
             elapsed = now - self._call_started_at
             silence_timeout = max(5, getattr(self.cfg, "silence_timeout_s", 10) or 10)
+            is_followup = self.lead_info.get("call_mode") == "follow_up"
+            if is_followup:
+                silence_timeout = max(45, silence_timeout)
             if self._ending and self._ending_started_at and (now - self._ending_started_at) > 6:
                 print("[GPT-LIVE WATCHDOG] ending state exceeded 6s; forcing local close")
                 self._stop = True
                 await self._close_live()
                 return
             if self.call_sid and self.outcome == "no_answer" and elapsed > silence_timeout:
+                if is_followup and not self._followup_no_answer_warned:
+                    self._followup_no_answer_warned = True
+                    await self._push_status("listening", "No response yet; keeping follow-up call open")
+                    continue
+                if is_followup and elapsed < silence_timeout + 20:
+                    continue
                 print("[GPT-LIVE WATCHDOG] no human transcript detected")
                 await self._push_status("ended", "No human detected")
                 await self._hangup("no human detected")
@@ -164,6 +195,12 @@ class GPTLiveCallHandler:
             if self.call_sid and self.outcome != "no_answer" and not self._agent_turn_open:
                 idle = now - max(self._last_activity_at, self._last_input_transcript_at, self._last_output_transcript_at)
                 if idle > silence_timeout:
+                    if is_followup and not self._followup_idle_warned:
+                        self._followup_idle_warned = True
+                        await self._push_status("listening", "Conversation is quiet; keeping follow-up call open")
+                        continue
+                    if is_followup and idle < silence_timeout + 20:
+                        continue
                     print(f"[GPT-LIVE WATCHDOG] idle after conversation ({idle:.1f}s)")
                     await self._hangup("idle after conversation")
                     return
@@ -174,7 +211,96 @@ class GPTLiveCallHandler:
                 await self._hangup("max duration")
                 return
 
+    def _follow_up_instructions(self) -> str:
+        follow_up = self.lead_info.get("FollowUp") or {}
+        if self.lead_info.get("call_mode") != "follow_up" or not follow_up:
+            return ""
+        previous_name = follow_up.get("previous_contact_name") or follow_up.get("contact_name")
+        if str(previous_name or "").strip().lower() in {"unknown", "name unknown", "name not provided", "not provided", "none", "null"}:
+            previous_name = None
+        previous_role = follow_up.get("previous_contact_role") or follow_up.get("contact_role")
+        context = {
+            "business": follow_up.get("business"),
+            "phone": follow_up.get("phone"),
+            "previous_contact_role": previous_role,
+            "previous_contact_name": previous_name,
+            "current_contact_role": follow_up.get("current_contact_role"),
+            "current_contact_name": follow_up.get("current_contact_name"),
+            "email": follow_up.get("email"),
+            "agent_summary": follow_up.get("agent_summary"),
+            "context_summary": follow_up.get("context_summary"),
+            "details": follow_up.get("details"),
+            "pain_point": follow_up.get("pain_point"),
+            "current_solution": follow_up.get("current_solution"),
+            "interest_signal": follow_up.get("interest_signal"),
+            "previous_action": follow_up.get("previous_action"),
+            "email_delivery_status": follow_up.get("email_delivery_status"),
+            "email_received": follow_up.get("email_received"),
+            "prospect_reported_not_received": follow_up.get("prospect_reported_not_received"),
+            "email_status_details": follow_up.get("email_status_details"),
+            "next_action": follow_up.get("next_action"),
+            "follow_up_goal": follow_up.get("follow_up_goal"),
+            "scheduled_for": follow_up.get("scheduled_for"),
+            "previous_call_date": follow_up.get("previous_call_date"),
+            "previous_call_local_display": follow_up.get("previous_call_local_display"),
+            "lead_timezone": follow_up.get("lead_timezone"),
+        }
+        context = {k: v for k, v in context.items() if v not in (None, "")}
+        safe_context = json.dumps(context, ensure_ascii=False)
+        tone = TONE_NOTES.get(getattr(self.cfg, "tone", "professional"), TONE_NOTES["professional"])
+        callback = (getattr(self.cfg, "callback_number", "") or TWILIO_CALLER_ID or "the number I called from").strip()
+        contact_name = context.get("previous_contact_name")
+        contact_role = context.get("previous_contact_role")
+        contact = contact_name or contact_role or "the person I spoke with earlier"
+        preferred_opening = (getattr(self.cfg, "first_message", "") or "").replace("{business}", context.get("business") or "the business").replace("{contact}", contact).replace("{contact_name}", contact_name or contact).replace("{contact_role}", contact_role or contact)
+        if contact_name:
+            opening_rule = f"Your first response after their greeting should ask for {contact_name} by name, then say you are following up from Lynkflow."
+        elif contact_role:
+            opening_rule = f"Your first response after their greeting should ask whether you are speaking with the {contact_role}, then say you are following up from Lynkflow."
+        else:
+            opening_rule = "Your first response after their greeting should say you are following up from Lynkflow about the prior conversation."
+        system_prompt = str(getattr(self.cfg, "system_prompt", "") or "")
+        system_prompt = system_prompt.replace("professional receptionists", "AI voice receptionists")
+        system_prompt = system_prompt.replace("Professional receptionists", "AI voice receptionists")
+        system_prompt = system_prompt.replace("human receptionists", "AI voice receptionists")
+        system_prompt = system_prompt.replace("Human receptionists", "AI voice receptionists")
+        return (
+            f"{system_prompt}\n\n"
+            "# FOLLOW-UP CONTEXT\n"
+            f"{safe_context}\n\n"
+            "# OBJECTIVE\n"
+            "Naturally reconnect, briefly reference the earlier conversation, and work toward follow_up_goal.\n"
+            "If they remember, continue from there. If they do not remember, give a short reminder from agent_summary or context_summary and ask if now is still okay.\n\n"
+            "# OPENING\n"
+            f"Preferred opening: {preferred_opening}\n"
+            f"{opening_rule}\n"
+            "Never open by asking whether the owner or office manager is available.\n\n"
+            "# RULES\n"
+            "- You are on a live phone call. Listen while the other person speaks and stop when interrupted.\n"
+            "- Previous contact identity comes only from previous_contact_name and previous_contact_role. Never use current_contact_name as the previous contact.\n"
+            "- If the previous contact name is unknown, do not ask for a name. Use previous_contact_role if available.\n"
+            "- Do not ask for the owner or office manager as a default opener. Use previous_contact_name or previous_contact_role if available.\n"
+            "- Do not restart the cold-call permission process or repeat the full cold pitch.\n"
+            "- Do not invent names, emails, promises, demo requests, pain points, or prior actions. Unknown means unknown.\n"
+            "- Lynkflow is an AI voice receptionist / AI call handling system. Do not describe it as a human-staffed receptionist service.\n"
+            "- Do not say an email was sent unless email_delivery_status is exactly email_sent.\n"
+            "- Do not say the prospect received an email unless email_received is true.\n"
+            "- If prospect_reported_not_received is true, preserve email_delivery_status and ask whether they checked spam/junk or prefer another email. Do not say the email failed unless email_delivery_status is email_failed.\n"
+            "- If email was only requested, generated, ready, or unknown, say only that you are following up on the information conversation.\n"
+            "- If they want a demo or callback, handle it naturally and collect the needed details.\n"
+            "- Do not leave voicemail. If you hit voicemail or an automated system, end politely.\n"
+            "- If they are not interested or ask not to be contacted, respect it and end professionally.\n"
+            "- Keep replies short and conversational. Never pressure them.\n"
+            "- Never speak bracketed control tokens aloud. Use [HANGUP] only as a silent control token when ending.\n"
+            f"Your approved email address: {PUBLIC_CONTACT_EMAIL}.\n"
+            f"Your callback number: {callback}.\n"
+            f"Tone: {tone}"
+        )
+
     def _instructions(self) -> str:
+        follow_up_prompt = self._follow_up_instructions()
+        if follow_up_prompt:
+            return follow_up_prompt
         business = self.lead_info.get("Name") or "the business"
         city = self.lead_info.get("City") or ""
         category = self.lead_info.get("Category") or "service business"
@@ -281,14 +407,26 @@ class GPTLiveCallHandler:
             self.metrics.call_sid = self.call_sid or ""
             cp = start.get("customParameters", {}) or {}
             if cp:
+                existing_follow_up = self.lead_info.get("FollowUp")
+                follow_up_id = cp.get("follow_up_id", "")
+                if not existing_follow_up and cp.get("call_mode") == "follow_up" and follow_up_id:
+                    try:
+                        from followups import get_follow_up
+                        existing_follow_up = get_follow_up(follow_up_id)
+                    except Exception as e:
+                        print(f"[GPT-LIVE FOLLOWUP] context load failed: {e}")
                 self.lead_info = {
                     "Name": cp.get("name", ""),
                     "Phone": cp.get("phone", ""),
                     "City": cp.get("city", ""),
                     "Category": cp.get("category", ""),
                     "Timezone": cp.get("timezone", ""),
+                    "call_mode": cp.get("call_mode", ""),
+                    "follow_up_id": follow_up_id,
+                    "FollowUp": existing_follow_up,
                 }
             print(f"[GPT-LIVE STREAM START] {self.call_sid} lead={self.lead_info}")
+            self._stream_started.set()
             await self._push_status("active", "GPT-Live active")
             return
 

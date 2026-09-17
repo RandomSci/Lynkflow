@@ -10,20 +10,18 @@ import urllib.parse
 import time
 import uuid
 import re
-import wave
-import audioop
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
-import websockets
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.twiml.voice_response import VoiceResponse, Dial
@@ -35,14 +33,10 @@ from agent_config import (
     load_agent_config,
     save_agent_config as _save_agent_config,
 )
-from agent_ws import AgentCallHandler
 from agent_live_ws import GPTLiveCallHandler
 
 
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
-SIM_LEAD_VOICE_ID = os.getenv("SIM_LEAD_VOICE_ID", "TxGEqnHWrfWFTfGW9XjX")
 AUDIO_CACHE_DIR = Path(__file__).parent.parent / "frontend" / "static" / "audio"
 AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -64,7 +58,7 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent.parent / "front
 # ── Agent call state (in-memory per server process) ──────────────────────────
 _agent_events: dict[str, list] = {}       # call_sid → buffered events
 _agent_queues: dict[str, asyncio.Queue] = {}  # call_sid → live queue for SSE
-_agent_handlers: dict = {}     # call_sid -> AgentCallHandler
+_agent_handlers: dict = {}     # call_sid -> GPTLiveCallHandler
 _call_leads: dict[str, dict] = {}  # call_sid -> lead metadata for late Twilio callbacks
 _pending_recordings: dict[str, str] = {}  # call_sid -> Twilio recording saved before history write
 _REC_DIR = Path(__file__).parent / "recordings"
@@ -73,6 +67,7 @@ _TRANSCRIPT_DIR = _REC_DIR / "transcripts"
 _TRANSCRIPT_DIR.mkdir(exist_ok=True)
 _ANALYST_CHAT_FILE = Path(__file__).parent / "analytics_chats.json"
 _EMAIL_TOKEN_FILE = Path(__file__).parent / "email_token.json"
+_EMAIL_SEND_LOG_FILE = Path(__file__).parent / "email_send_log.jsonl"
 _EMAIL_OAUTH_STATES: dict[str, dict] = {}
 app.mount("/recordings", StaticFiles(directory=_REC_DIR), name="recordings")
 
@@ -109,8 +104,12 @@ _autodial_state = {
 }
 _autodial_listeners: set[asyncio.Queue] = set()
 _autodial_lock = asyncio.Lock()
+_followup_listeners: set[asyncio.Queue] = set()
 
 _AUTODIAL_ELIGIBLE_STATUSES = {"", "new", "retry", "queued"}
+_ANALYST_ACTION_CREATE_FOLLOW_UP = "CREATE_FOLLOW_UP"
+_ANALYST_ACTION_MARKER_CREATE_FOLLOW_UP = "[ACTION:CREATE_FOLLOW_UP]"
+_ALLOWED_ANALYST_ACTIONS = {_ANALYST_ACTION_CREATE_FOLLOW_UP}
 
 
 def _phone_key(phone: str) -> str:
@@ -132,7 +131,55 @@ def _lead_timezone(lead: dict) -> str:
         val = str((lead or {}).get(key, "")).strip()
         if val:
             return val
+    state = str((lead or {}).get("State") or (lead or {}).get("state") or "").strip()
+    state_map = {
+        "CT":"ET","DE":"ET","FL":"ET","GA":"ET","IN":"ET","KY":"ET","ME":"ET","MD":"ET","MA":"ET","MI":"ET","NH":"ET","NJ":"ET","NY":"ET","NC":"ET","OH":"ET","PA":"ET","RI":"ET","SC":"ET","TN":"ET","VT":"ET","VA":"ET","WV":"ET","DC":"ET",
+        "AL":"CT","AR":"CT","IL":"CT","IA":"CT","LA":"CT","MN":"CT","MS":"CT","MO":"CT","NE":"CT","ND":"CT","OK":"CT","SD":"CT","TX":"CT","WI":"CT","KS":"CT",
+        "AZ":"MT","CO":"MT","ID":"MT","MT":"MT","NM":"MT","UT":"MT","WY":"MT",
+        "CA":"PT","NV":"PT","OR":"PT","WA":"PT",
+    }
+    named = {
+        "connecticut":"ET","delaware":"ET","florida":"ET","georgia":"ET","indiana":"ET","kentucky":"ET","maine":"ET","maryland":"ET","massachusetts":"ET","michigan":"ET","new hampshire":"ET","new jersey":"ET","new york":"ET","north carolina":"ET","ohio":"ET","pennsylvania":"ET","rhode island":"ET","south carolina":"ET","tennessee":"ET","vermont":"ET","virginia":"ET","west virginia":"ET","district of columbia":"ET",
+        "alabama":"CT","arkansas":"CT","illinois":"CT","iowa":"CT","louisiana":"CT","minnesota":"CT","mississippi":"CT","missouri":"CT","nebraska":"CT","north dakota":"CT","oklahoma":"CT","south dakota":"CT","texas":"CT","wisconsin":"CT","kansas":"CT",
+        "arizona":"MT","colorado":"MT","idaho":"MT","montana":"MT","new mexico":"MT","utah":"MT","wyoming":"MT",
+        "california":"PT","nevada":"PT","oregon":"PT","washington":"PT",
+    }
+    if state:
+        return state_map.get(state.upper()) or named.get(state.lower(), "")
     return ""
+
+
+def _timezone_iana(tz: str) -> str:
+    key = str(tz or "").strip().lower()
+    aliases = {
+        "et": "America/New_York", "est": "America/New_York", "edt": "America/New_York", "eastern": "America/New_York", "eastern time": "America/New_York",
+        "ct": "America/Chicago", "cst": "America/Chicago", "cdt": "America/Chicago", "central": "America/Chicago", "central time": "America/Chicago",
+        "mt": "America/Denver", "mst": "America/Denver", "mdt": "America/Denver", "mountain": "America/Denver", "mountain time": "America/Denver",
+        "pt": "America/Los_Angeles", "pst": "America/Los_Angeles", "pdt": "America/Los_Angeles", "pacific": "America/Los_Angeles", "pacific time": "America/Los_Angeles",
+        "az": "America/Phoenix", "arizona": "America/Phoenix",
+    }
+    if key in aliases:
+        return aliases[key]
+    try:
+        ZoneInfo(str(tz or ""))
+        return str(tz)
+    except Exception:
+        return ""
+
+
+def _lead_time_fields(lead: dict, ts: float | None = None) -> dict:
+    ts = ts or time.time()
+    tz_label = _lead_timezone(lead)
+    tz_iana = _timezone_iana(tz_label)
+    out = {"ts": ts, "date": datetime.fromtimestamp(ts).isoformat(timespec="seconds")}
+    if tz_label:
+        out["lead_timezone"] = tz_label
+    if tz_iana:
+        out["lead_timezone_iana"] = tz_iana
+        local = datetime.fromtimestamp(ts, ZoneInfo(tz_iana))
+        out["lead_local_date"] = local.isoformat(timespec="seconds")
+        out["lead_local_display"] = local.strftime("%Y-%m-%d %I:%M %p %Z")
+    return out
 
 
 def _is_autodial_eligible(lead: dict) -> bool:
@@ -167,6 +214,7 @@ def _autodial_snapshot() -> dict:
                 "name": item.get("lead", {}).get("Name", ""),
                 "phone": item.get("phone", ""),
                 "mode": item.get("mode", "live"),
+                "engine": item.get("engine", "GPT-Live" if item.get("mode", "live") == "live" else "GPT Lead Test"),
                 "state": item.get("state", "dialing"),
                 "last_speaker": item.get("last_speaker", ""),
                 "last_text": item.get("last_text", ""),
@@ -187,6 +235,27 @@ async def _autodial_broadcast(event: dict):
             await q.put(event)
         except Exception:
             _autodial_listeners.discard(q)
+
+
+async def _followup_broadcast(event: dict):
+    event = {**event, "ts": datetime.now().strftime("%H:%M:%S")}
+    for q in list(_followup_listeners):
+        try:
+            await q.put(event)
+        except Exception:
+            _followup_listeners.discard(q)
+
+
+def _followup_counts(items: list[dict] | None = None) -> dict:
+    if items is None:
+        from followups import list_follow_ups
+        items = list_follow_ups()
+    counts = {"total": len(items), "pending": 0, "attempted": 0, "scheduled": 0, "calling": 0, "completed": 0, "failed": 0, "cancelled": 0}
+    for item in items:
+        status = str(item.get("status") or "pending").lower()
+        if status in counts:
+            counts[status] += 1
+    return counts
 
 
 async def _autodial_note_call_event(call_sid: str, event: dict):
@@ -243,8 +312,8 @@ async def root():
 
 @app.post("/api/tts")
 async def generate_tts(req: TTSRequest):
-    if not ELEVENLABS_API_KEY:
-        raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY not set in .env")
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set in .env")
 
     cache_key = hashlib.md5(f"{req.section_id}:{req.text}".encode()).hexdigest()
     audio_path = AUDIO_CACHE_DIR / f"{cache_key}.mp3"
@@ -254,17 +323,18 @@ async def generate_tts(req: TTSRequest):
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-            headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+            "https://api.openai.com/v1/audio/speech",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
             json={
-                "text": req.text,
-                "model_id": "eleven_turbo_v2_5",
-                "voice_settings": {"stability": 0.4, "similarity_boost": 0.8, "style": 0.2, "use_speaker_boost": True},
+                "model": "gpt-4o-mini-tts",
+                "voice": "alloy",
+                "input": req.text,
+                "response_format": "mp3",
             },
         )
 
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"ElevenLabs error: {resp.text}")
+        raise HTTPException(status_code=502, detail=f"OpenAI audio preview error: {resp.text}")
 
     audio_path.write_bytes(resp.content)
     return JSONResponse({"url": f"/static/audio/{cache_key}.mp3", "cached": False})
@@ -384,6 +454,60 @@ async def _download_twilio_recording(call_sid: str, recording_sid: str, recordin
     filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}_{suffix}_twilio.wav"
     (_REC_DIR / filename).write_bytes(resp.content)
     return filename
+
+
+async def _fetch_latest_twilio_recording(call_sid: str) -> dict | None:
+    if not call_sid or not TWILIO_ACCOUNT_SID:
+        return None
+    async with httpx.AsyncClient(timeout=12) as client:
+        resp = await client.get(
+            f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{call_sid}/Recordings.json",
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+        )
+    if resp.status_code != 200:
+        print(f"[RECORDING RECOVERY] list failed for {call_sid}: {resp.status_code} {resp.text[:200]}")
+        return None
+    recordings = resp.json().get("recordings", []) or []
+    completed = [r for r in recordings if r.get("status") == "completed"]
+    if not completed:
+        return None
+    return sorted(completed, key=lambda r: r.get("date_created") or "", reverse=True)[0]
+
+
+async def _recover_twilio_recording(call_sid: str, lead_name: str = "") -> str:
+    for delay in (2, 5, 10, 20):
+        await asyncio.sleep(delay)
+        try:
+            rec = await _fetch_latest_twilio_recording(call_sid)
+            if not rec:
+                continue
+            recording_sid = rec.get("sid", "")
+            if not recording_sid:
+                continue
+            recording_url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Recordings/{recording_sid}"
+            filename = await _download_twilio_recording(call_sid, recording_sid, recording_url, lead_name)
+            if filename:
+                from call_history import update_recording_file
+                update_recording_file(call_sid, filename)
+                try:
+                    from followups import mark_call_recording
+                    updated = mark_call_recording(call_sid, filename)
+                    if updated:
+                        await _followup_broadcast({"type": "follow_up_updated", "follow_up": updated, "message": "Follow-up recording recovered"})
+                except Exception as e:
+                    print(f"[FOLLOWUP] recording recovery link failed: {e}")
+                await _autodial_broadcast({
+                    "type": "recording_ready",
+                    "call_sid": call_sid,
+                    "name": lead_name,
+                    "recording": filename,
+                    "message": "Twilio dual-channel recording recovered",
+                })
+                print(f"[RECORDING RECOVERY] stored Twilio recording for {call_sid}: {filename}")
+                return filename
+        except Exception as e:
+            print(f"[RECORDING RECOVERY] failed for {call_sid}: {e}")
+    return ""
 
 
 def _safe_recording_path(recording: str) -> Path:
@@ -565,6 +689,42 @@ async def _send_gmail_message(to_email: str, subject: str, html: str, text: str 
     return {"success": True, "id": data.get("id"), "thread_id": data.get("threadId")}
 
 
+def _log_email_sent(to_email: str, subject: str, result: dict) -> dict:
+    entry = {
+        "to": str(to_email or "").strip().lower(),
+        "subject": str(subject or "").strip()[:200],
+        "sent_at": datetime.now().isoformat(timespec="seconds"),
+        "gmail_id": result.get("id"),
+        "thread_id": result.get("thread_id"),
+        "status": "email_sent",
+    }
+    try:
+        with _EMAIL_SEND_LOG_FILE.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        print(f"[EMAIL] send log failed: {e}")
+    return entry
+
+
+def _email_delivery_status_for(email: str) -> str:
+    target = str(email or "").strip().lower()
+    if not target or not _EMAIL_SEND_LOG_FILE.exists():
+        return "unknown"
+    try:
+        for line in _EMAIL_SEND_LOG_FILE.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if str(item.get("to") or "").strip().lower() == target and item.get("status") == "email_sent":
+                return "email_sent"
+    except Exception as e:
+        print(f"[EMAIL] send log read failed: {e}")
+    return "unknown"
+
+
 async def _transcribe_recording(recording: str) -> dict:
     path = _safe_recording_path(recording)
     cache = _transcript_cache_path(recording)
@@ -619,14 +779,13 @@ async def _ask_transcript_agent(recording: str, question: str) -> dict:
         "Put the subject in a fenced code block tagged subject and the HTML email in a fenced code block tagged html. "
         "Make the HTML responsive with inline CSS, a clean dark/blue Lynkflow style, mobile-safe width, and no external images unless they are fluid. Do not invent facts."
     )
-    async with httpx.AsyncClient(timeout=45) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
             json={
                 "model": "gpt-4.1",
                 "temperature": 0.2,
-                "max_tokens": 700,
                 "messages": [
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": f"Transcript:\n{transcript['transcript']}\n\nQuestion:\n{q}"},
@@ -699,7 +858,7 @@ def _recording_catalog(days: int = 365, q: str = "") -> list[dict]:
         if query and query not in haystack:
             continue
         out.append(item)
-    return out[:200]
+    return out
 
 
 def _call_matches_question(call: dict, question: str) -> bool:
@@ -724,7 +883,7 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
     from call_history import load_calls
     cfg = load_agent_config()
     calls = sorted(load_calls(days), key=lambda c: c.get("ts", 0), reverse=True)
-    recent = calls[:80]
+    recent = calls
     matched = [c for c in recent if _call_matches_question(c, question)]
     broad = _is_broad_analytics_question(question)
 
@@ -742,7 +901,7 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
                 "date": a.get("date", ""),
             })
 
-    selected = attached_calls + (matched or (recent[:16] if broad else recent[:8]))
+    selected = attached_calls + (matched or recent)
     deduped = []
     seen_keys = set()
     for call in selected:
@@ -751,7 +910,7 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
             continue
         seen_keys.add(key)
         deduped.append(call)
-    selected = deduped[:24]
+    selected = deduped
     transcripts = []
     auto_transcribed = []
 
@@ -760,13 +919,14 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
         if not recording:
             continue
         cache = _transcript_cache_path(recording)
-        should_auto = recording in attached_recordings or bool(matched) or broad
+        should_auto = recording in attached_recordings or bool(matched) or cache.exists()
         if not cache.exists() and not should_auto:
             continue
         try:
             was_cached = cache.exists()
             t = await _transcribe_recording(recording)
             transcripts.append({
+                "call_sid": call.get("call_sid", ""),
                 "business": call.get("business", ""),
                 "phone": call.get("phone", ""),
                 "outcome": call.get("outcome", ""),
@@ -778,6 +938,7 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
                 auto_transcribed.append(recording)
         except Exception as e:
             transcripts.append({
+                "call_sid": call.get("call_sid", ""),
                 "business": call.get("business", ""),
                 "phone": call.get("phone", ""),
                 "outcome": call.get("outcome", ""),
@@ -788,12 +949,14 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
     summary_rows = []
     for c in recent:
         summary_rows.append({
+            "call_sid": c.get("call_sid", ""),
             "business": c.get("business", ""),
             "phone": c.get("phone", ""),
             "outcome": c.get("outcome", ""),
             "duration_s": c.get("duration_s", 0),
             "recording": c.get("recording", ""),
             "followup_note": c.get("followup_note", ""),
+            "details": c.get("details", ""),
             "date": c.get("date", ""),
         })
 
@@ -814,7 +977,7 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
     if not OPENAI_API_KEY:
         raise HTTPException(500, "OPENAI_API_KEY not set")
     context = await _build_analyst_context(question, days, chat.get("attachments", []))
-    prior = [m for m in chat.get("messages", [])[-10:] if m.get("role") in {"user", "assistant"}]
+    prior = [m for m in chat.get("messages", []) if m.get("role") in {"user", "assistant"}]
     system = (
         "You are Lynkflow's internal call analyst. You know Lynkflow's offer and you have access to call history and available transcripts. "
         "Attached recordings are selected by the operator and are the highest-priority context. "
@@ -829,6 +992,11 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
         "The draft should mention Anna from Lynkflow reached out about helping them handle customer calls so they do not miss leads. "
         "If a receptionist gave an email, write the message as a professional follow-up to the owner or office manager without pretending the owner was interested. "
         "Never invent emails, phone numbers, callback times, or interest. If transcript evidence is missing, say so. "
+        "Controlled actions: only if the operator explicitly asks you to create, add, prepare, or persist a follow-up task, and the transcript/call evidence supports it, append one strict action block after your normal answer. "
+        "The exact format is [ACTION:CREATE_FOLLOW_UP] on its own line, then one JSON object, then [/ACTION] on its own line. "
+        "The JSON must include previous_call_id using the call_sid from the context, plus business, phone, priority, reason, previous_contact_role, previous_contact_name, email, pain_point, current_solution, interest_signal, previous_action, follow_up_goal, agent_summary, context_summary, details, and scheduled_for. Use null for unknown fields. "
+        "For every interested lead action, include a details field. Details must be clear, concise, and factual: who was actually spoken to including role and name if known or 'name not provided', what was discussed, pain points/current process/questions, information provided such as email or callback time, and any test-call, non-staff, unusual event, or identity-confusion clarification. Do not invent missing information. "
+        "Do not emit action blocks for summaries, candidate lists, email drafts, or general recommendations. Never emit unapproved action names. "
         "Do not use em dashes or long dashes. Use commas, periods, colons, or simple hyphens only."
     )
     messages = [{"role": "system", "content": system}]
@@ -836,13 +1004,13 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
         messages.append({"role": m["role"], "content": m.get("content", "")})
     messages.append({
         "role": "user",
-        "content": f"Call context JSON:\n{json.dumps(context, ensure_ascii=False)[:60000]}\n\nQuestion:\n{question}",
+        "content": f"Call context JSON:\n{json.dumps(context, ensure_ascii=False)}\n\nQuestion:\n{question}",
     })
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "gpt-4.1", "temperature": 0.2, "max_tokens": 1000, "messages": messages},
+            json={"model": "gpt-4.1", "temperature": 0.2, "messages": messages},
         )
     if resp.status_code != 200:
         raise HTTPException(502, f"Analyst failed: {resp.text}")
@@ -858,7 +1026,456 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
     }
 
 
-async def _start_agent_call(phone: str, lead: dict, base_url: str) -> str:
+def _extract_json_object(text: str) -> dict:
+    text = (text or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return {}
+    return {}
+
+
+def _parse_analyst_action_blocks(text: str) -> tuple[str, list[dict]]:
+    """Extract strict action blocks without treating normal prose as actions."""
+    actions = []
+    pattern = re.compile(r"\[ACTION:([A-Z_]+)\]\s*([\s\S]*?)\s*\[/ACTION\]", re.MULTILINE)
+
+    def repl(match: re.Match) -> str:
+        action_type = match.group(1).strip()
+        raw_payload = match.group(2).strip()
+        if action_type not in _ALLOWED_ANALYST_ACTIONS:
+            actions.append({"type": action_type, "valid": False, "error": "unapproved action"})
+            return ""
+        try:
+            payload = json.loads(raw_payload)
+        except Exception:
+            actions.append({"type": action_type, "valid": False, "error": "invalid JSON payload"})
+            return ""
+        if not isinstance(payload, dict):
+            actions.append({"type": action_type, "valid": False, "error": "payload must be a JSON object"})
+            return ""
+        actions.append({"type": action_type, "marker": f"[ACTION:{action_type}]", "payload": payload, "valid": True})
+        return ""
+
+    clean = pattern.sub(repl, text or "")
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    return clean, actions
+
+
+def _extract_structured_analyst_actions(data: dict) -> list[dict]:
+    actions = []
+    raw_actions = data.get("actions") if isinstance(data, dict) else None
+    if not isinstance(raw_actions, list):
+        return actions
+    for raw in raw_actions:
+        if not isinstance(raw, dict):
+            actions.append({"type": "", "valid": False, "error": "action must be an object"})
+            continue
+        marker = str(raw.get("marker") or "").strip()
+        action_type = str(raw.get("type") or "").strip()
+        if marker == _ANALYST_ACTION_MARKER_CREATE_FOLLOW_UP:
+            action_type = _ANALYST_ACTION_CREATE_FOLLOW_UP
+        if action_type not in _ALLOWED_ANALYST_ACTIONS:
+            actions.append({"type": action_type, "marker": marker, "valid": False, "error": "unapproved action"})
+            continue
+        if marker and marker != f"[ACTION:{action_type}]":
+            actions.append({"type": action_type, "marker": marker, "valid": False, "error": "invalid marker"})
+            continue
+        payload = raw.get("payload")
+        if not isinstance(payload, dict):
+            actions.append({"type": action_type, "marker": marker, "valid": False, "error": "payload must be an object"})
+            continue
+        actions.append({"type": action_type, "marker": f"[ACTION:{action_type}]", "payload": payload, "valid": True})
+    return actions
+
+
+def _validate_create_follow_up_action_payload(payload: dict, call: dict | None = None) -> tuple[bool, str, dict, dict]:
+    call = call or {}
+    previous_call_id = str(payload.get("previous_call_id") or payload.get("call_sid") or call.get("call_sid") or call.get("recording") or "").strip()
+    if not previous_call_id:
+        return False, "previous_call_id is required", {}, {}
+
+    source_call = call or _find_call(previous_call_id) or {}
+    if not source_call:
+        return False, "previous call not found", {}, {}
+
+    decision = {
+        "eligible": True,
+        "priority": payload.get("priority") or "warm",
+        "reason": payload.get("reason"),
+        "business": payload.get("business") or source_call.get("business"),
+        "phone": payload.get("phone") or source_call.get("phone"),
+        "contact_role": payload.get("contact_role"),
+        "contact_name": payload.get("contact_name"),
+        "previous_contact_role": payload.get("previous_contact_role") or payload.get("contact_role"),
+        "previous_contact_name": payload.get("previous_contact_name") or payload.get("contact_name"),
+        "current_contact_role": payload.get("current_contact_role"),
+        "current_contact_name": payload.get("current_contact_name"),
+        "email": payload.get("email"),
+        "pain_point": payload.get("pain_point"),
+        "current_solution": payload.get("current_solution"),
+        "interest_signal": payload.get("interest_signal"),
+        "previous_action": payload.get("previous_action"),
+        "email_delivery_status": payload.get("email_delivery_status"),
+        "email_received": payload.get("email_received"),
+        "prospect_reported_not_received": payload.get("prospect_reported_not_received"),
+        "email_status_details": payload.get("email_status_details"),
+        "next_action": payload.get("next_action"),
+        "follow_up_goal": payload.get("follow_up_goal"),
+        "agent_summary": payload.get("agent_summary"),
+        "context_summary": payload.get("context_summary"),
+        "details": payload.get("details"),
+        "lead_timezone": payload.get("lead_timezone") or source_call.get("lead_timezone"),
+        "lead_timezone_iana": payload.get("lead_timezone_iana") or source_call.get("lead_timezone_iana"),
+        "previous_call_local_date": payload.get("previous_call_local_date") or source_call.get("lead_local_date"),
+        "previous_call_local_display": payload.get("previous_call_local_display") or source_call.get("lead_local_display"),
+        "scheduled_for": payload.get("scheduled_for"),
+        "previous_call_id": previous_call_id,
+    }
+    if not decision.get("business") or not decision.get("phone"):
+        return False, "business and phone are required", {}, {}
+    if not decision.get("reason") or not decision.get("follow_up_goal"):
+        return False, "reason and follow_up_goal are required", {}, {}
+    if not (decision.get("interest_signal") or decision.get("context_summary") or decision.get("agent_summary")):
+        return False, "commercial evidence summary is required", {}, {}
+    if not decision.get("details"):
+        return False, "details is required for interested follow-up leads", {}, {}
+    return True, "", decision, source_call
+
+
+async def _execute_analyst_actions(actions: list[dict], source_call: dict | None = None) -> list[dict]:
+    results = []
+    for action in actions or []:
+        action_type = action.get("type")
+        if not action.get("valid") or action_type not in _ALLOWED_ANALYST_ACTIONS:
+            results.append({"type": action_type, "executed": False, "error": action.get("error") or "invalid action"})
+            continue
+
+        if action_type != _ANALYST_ACTION_CREATE_FOLLOW_UP:
+            results.append({"type": action_type, "executed": False, "error": "unsupported action"})
+            continue
+
+        payload = action.get("payload") or {}
+        call_id = str(payload.get("previous_call_id") or payload.get("call_sid") or "").strip()
+        call = _find_call(call_id) if call_id else None
+        if call_id and not call and source_call and call_id in {str(source_call.get("call_sid") or ""), str(source_call.get("recording") or "")}:
+            call = source_call
+        elif call_id and not call:
+            results.append({"type": action_type, "executed": False, "error": "previous call not found"})
+            continue
+        elif not call and source_call:
+            call = source_call
+        ok, error, decision, action_call = _validate_create_follow_up_action_payload(payload, call)
+        if not ok:
+            results.append({"type": action_type, "executed": False, "error": error})
+            continue
+
+        try:
+            from followups import create_or_update_from_analysis
+            email_status = _email_delivery_status_for(decision.get("email") or "")
+            result = create_or_update_from_analysis(action_call, decision, email_delivery_status=email_status)
+            follow_up = result.get("follow_up")
+            if decision.get("details") and action_call.get("call_sid"):
+                try:
+                    from call_history import update_call_details
+                    update_call_details(action_call.get("call_sid"), decision.get("details"))
+                except Exception as e:
+                    print(f"[HISTORY] analyst details patch failed: {e}")
+            if follow_up:
+                await _followup_broadcast({
+                    "type": "follow_up_created" if result.get("created") else "follow_up_updated",
+                    "follow_up": follow_up,
+                    "message": "Analyst action created a follow-up" if result.get("created") else "Analyst action updated a follow-up",
+                })
+            results.append({
+                "type": action_type,
+                "executed": bool(follow_up),
+                "created": bool(result.get("created")),
+                "updated": bool(result.get("updated")),
+                "follow_up_id": follow_up.get("id") if follow_up else None,
+            })
+        except Exception as e:
+            results.append({"type": action_type, "executed": False, "error": str(e)})
+    return results
+
+
+async def _ask_followup_analyst_json(messages: list[dict], max_tokens: int = 900) -> dict:
+    if not OPENAI_API_KEY:
+        return {}
+    async with httpx.AsyncClient(timeout=90) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-4.1",
+                "temperature": 0.1,
+                "max_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+                "messages": messages,
+            },
+        )
+    if resp.status_code != 200:
+        print(f"[FOLLOWUP ANALYST] OpenAI failed: {resp.status_code} {resp.text[:300]}")
+        return {}
+    return _extract_json_object(resp.json()["choices"][0]["message"].get("content", "{}"))
+
+
+def _compact_call_for_analysis(call: dict, transcript: dict) -> dict:
+    return {
+        "call_sid": call.get("call_sid"),
+        "business": call.get("business"),
+        "phone": call.get("phone"),
+        "city": call.get("city"),
+        "category": call.get("category"),
+        "outcome": call.get("outcome"),
+        "date": call.get("date"),
+        "lead_timezone": call.get("lead_timezone"),
+        "lead_timezone_iana": call.get("lead_timezone_iana"),
+        "lead_local_date": call.get("lead_local_date"),
+        "lead_local_display": call.get("lead_local_display"),
+        "duration_s": call.get("duration_s"),
+        "turns": call.get("turns"),
+        "recording": call.get("recording"),
+        "call_mode": call.get("call_mode"),
+        "follow_up_id": call.get("follow_up_id"),
+        "followup_note": call.get("followup_note"),
+        "details": call.get("details"),
+        "contacts": transcript.get("contacts", {}),
+        "transcript": transcript.get("transcript", ""),
+    }
+
+
+async def _initial_followup_decision(call: dict, transcript: dict) -> dict:
+    system = """
+You are Lynkflow's internal call analyst. Decide whether a completed outbound call deserves a commercial follow-up task.
+
+Use only the provided call metadata and transcript. Do not infer facts that are not in the conversation. Unknown fields must be null.
+
+Use call metadata lead_local_display/lead_local_date and lead_timezone as the authoritative local time for the lead. Include the local previous call time in details when available.
+
+Lynkflow is an AI voice receptionist / AI call handling system. Do not describe it as a human-staffed receptionist service.
+
+Create a follow-up only when there is meaningful commercial evidence, such as a decision maker showing interest, asking questions, asking for info/demo/callback, providing an email for information, agreeing to continue later, or showing interest without completing the next step.
+
+Do not create a follow-up merely because someone answered, a receptionist answered, the call connected, voicemail/IVR occurred, the prospect said no, the number was wrong, they already have a solution and showed no interest, or there is no clear commercial signal.
+
+Return strict JSON only with this shape when a follow-up should be created:
+{
+  "assistant_text": "brief evidence summary",
+  "actions": [
+    {
+      "marker": "[ACTION:CREATE_FOLLOW_UP]",
+      "payload": {
+        "previous_call_id": "call_sid from the provided call metadata",
+        "priority": "hot|warm|low",
+        "reason": "short evidence-based reason",
+        "business": "business or null",
+        "phone": "phone or null",
+        "contact_role": "role or null",
+        "contact_name": "name or null",
+        "previous_contact_role": "role from the original lead conversation or null",
+        "previous_contact_name": "name from the original lead conversation, or null if name not provided",
+        "lead_timezone": "lead timezone from call metadata or null",
+        "lead_timezone_iana": "IANA timezone from call metadata or null",
+        "previous_call_local_date": "lead-local ISO date/time from call metadata or null",
+        "previous_call_local_display": "lead-local display date/time from call metadata or null",
+        "email": "email or null",
+        "pain_point": "pain discussed or null",
+        "current_solution": "current handling or null",
+        "interest_signal": "exact commercial signal or null",
+        "previous_action": "what happened or was requested, not invented",
+        "email_delivery_status": "unknown",
+        "email_received": false,
+        "prospect_reported_not_received": false,
+        "email_status_details": "concise verified email state or null",
+        "next_action": "appropriate next step based on verified information or null",
+        "follow_up_goal": "specific next call objective",
+        "agent_summary": "2-4 concise sentences for the follow-up caller: who they spoke with, what was discussed, pain, interest, previous action/email status, and the goal. Do not include the full transcript.",
+        "context_summary": "concise factual prior-call context",
+        "details": "clear factual analyst details: who was spoken to, whether name was provided, what was discussed, info provided, and any test/persona/identity confusion flags. Do not invent.",
+        "scheduled_for": null
+      }
+    }
+  ]
+}
+
+If no follow-up is warranted, return:
+{"assistant_text":"short evidence-based reason","actions":[]}
+""".strip()
+    payload = _compact_call_for_analysis(call, transcript)
+    result = await _ask_followup_analyst_json([
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ])
+    return result if isinstance(result, dict) else {"assistant_text": "Analyst returned no object.", "actions": []}
+
+
+async def _followup_call_result_decision(call: dict, transcript: dict, follow_up: dict) -> dict:
+    system = """
+You are Lynkflow's internal follow-up call analyst. Evaluate a completed follow-up call and update the existing follow-up task.
+
+Use only the stored follow-up context, call metadata, and transcript. Do not invent names, promises, emails, demo requests, or callback times.
+
+Keep previous-contact identity and current-caller identity separate. If the current caller says "This is Pam", record current_contact_name as Pam, but do not overwrite previous_contact_name unless the transcript explicitly confirms Pam was the original previous contact.
+
+Lynkflow is an AI voice receptionist / AI call handling system. Do not describe it as a human-staffed receptionist service.
+
+Use the latest_call lead_local_display/lead_local_date when describing when the call happened. If available, include that local time in details.
+
+Email state rules:
+- email_delivery_status=email_sent only means the system verified sending succeeded.
+- Never change email_delivery_status from email_sent to email_failed because the prospect says they did not receive it.
+- Use email_failed only for verified system sending failure evidence.
+- Set email_received=true only if the prospect explicitly confirms receiving the email.
+- Set prospect_reported_not_received=true when the prospect explicitly says they did not receive it.
+- Preserve historical verified email facts in email_status_details/details; do not overwrite sent with received/not received.
+- If prospect did not receive it, next_action should ask them to check spam/junk and, if still missing, ask for a preferred alternate email. Do not automatically resend unless explicitly authorized.
+
+Choose status:
+- completed: the follow-up reached a clear resolution, next step was handled, or the prospect clearly declined.
+- pending: no answer, voicemail, IVR, busy/no clear contact, or another attempt is still commercially reasonable. The backend will display this as attempted when at least one follow-up call has already been placed.
+- scheduled: the prospect requested a specific future callback.
+- failed: the call failed, wrong number, or no further useful path exists.
+- cancelled: they asked not to be contacted again.
+
+If the current caller says this is the wrong number, return status="failed" and result="wrong_number". If they gave a current name, put it in current_contact_name only.
+
+Return strict JSON only with this shape:
+{
+  "follow_up_result": {
+    "status": "completed|pending|scheduled|failed|cancelled",
+    "result": "short factual result",
+    "reason": "why this status was chosen",
+    "scheduled_for": "callback time or null",
+    "contact_role": "role or null",
+    "contact_name": "name or null",
+    "current_contact_role": "role stated in this follow-up call or null",
+    "current_contact_name": "name stated in this follow-up call or null. Never use this as previous_contact_name.",
+    "email": "email or null",
+    "email_delivery_status": "email_sent|email_failed|email_ready_for_review|email_generated|unknown|null",
+    "email_received": true|false|null,
+    "prospect_reported_not_received": true|false|null,
+    "email_status_details": "latest verified email state without contradicting history or null",
+    "next_action": "appropriate next step based on latest verified email state or null",
+    "pain_point": "updated pain or null",
+    "current_solution": "updated current solution or null",
+    "interest_signal": "updated interest signal or null",
+    "previous_action": "latest action or null",
+    "follow_up_goal": "next goal if still pending/scheduled, else null",
+    "agent_summary": "updated concise summary for any later follow-up caller, no full transcript",
+    "context_summary": "updated concise context",
+    "details": "append-only factual detail from this call including lead-local call time, who answered, whether they are the original contact, new info, wrong number/test/persona flags, and identity confusion. Do not erase prior history."
+  }
+}
+""".strip()
+    payload = {
+        "existing_follow_up": follow_up,
+        "latest_call": _compact_call_for_analysis(call, transcript),
+    }
+    result = await _ask_followup_analyst_json([
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ])
+    decision = result.get("follow_up_result") if isinstance(result, dict) else None
+    return decision if isinstance(decision, dict) else {"status": "completed", "result": call.get("outcome") or "completed", "reason": "Analyst returned no follow_up_result object."}
+
+
+async def _analyze_call_for_follow_up(call: dict):
+    recording = call.get("recording") or ""
+    if not recording:
+        return
+    try:
+        transcript = await _transcribe_recording(recording)
+    except Exception as e:
+        print(f"[FOLLOWUP ANALYST] transcript unavailable for {recording}: {e}")
+        return
+
+    if not (transcript.get("transcript") or "").strip():
+        return
+
+    try:
+        from followups import complete_call_attempt, get_follow_up
+        if call.get("call_mode") == "follow_up" and call.get("follow_up_id"):
+            follow_up = get_follow_up(call.get("follow_up_id"))
+            if not follow_up:
+                return
+            decision = await _followup_call_result_decision(call, transcript, follow_up)
+            if decision.get("details") and call.get("call_sid"):
+                try:
+                    from call_history import update_call_details
+                    update_call_details(call.get("call_sid"), decision.get("details"))
+                except Exception as e:
+                    print(f"[HISTORY] follow-up details patch failed: {e}")
+            updated = complete_call_attempt(follow_up["id"], call, decision)
+            if updated:
+                await _followup_broadcast({"type": "follow_up_updated", "follow_up": updated, "message": "Follow-up call analyzed"})
+            return
+
+        analysis = await _initial_followup_decision(call, transcript)
+        action_results = await _execute_analyst_actions(_extract_structured_analyst_actions(analysis), source_call=call)
+        if not any(r.get("executed") for r in action_results):
+            print(f"[FOLLOWUP ANALYST] no follow-up action for {call.get('call_sid')}: {analysis.get('assistant_text', '')}")
+    except Exception as e:
+        print(f"[FOLLOWUP ANALYST] failed for {call.get('call_sid')}: {e}")
+
+
+def _find_call(call_id: str) -> dict | None:
+    if not call_id:
+        return None
+    from call_history import load_calls
+    for call in sorted(load_calls(3650), key=lambda c: c.get("ts", 0), reverse=True):
+        if call.get("call_sid") == call_id or call.get("recording") == call_id:
+            return call
+    return None
+
+
+def _runtime_agent_config_for_mode(cfg: AgentConfig, call_mode: str = "outbound") -> AgentConfig:
+    cfg.voice_engine = "gpt_live"
+    cfg.followup_voice_engine = "gpt_live"
+    if call_mode != "follow_up":
+        cfg.voice_engine = "gpt_live"
+        return cfg
+    runtime = cfg.model_copy(deep=True)
+    overrides = {
+        "first_message": "followup_first_message",
+        "system_prompt": "followup_system_prompt",
+        "end_call_phrases": "followup_end_call_phrases",
+        "model": "followup_model",
+        "temperature": "followup_temperature",
+        "max_tokens": "followup_max_tokens",
+        "live_model": "followup_live_model",
+        "live_voice": "followup_live_voice",
+        "tone": "followup_tone",
+        "endpointing_ms": "followup_endpointing_ms",
+        "utterance_end_ms": "followup_utterance_end_ms",
+        "silence_timeout_s": "followup_silence_timeout_s",
+        "max_duration_s": "followup_max_duration_s",
+        "allow_interruption": "followup_allow_interruption",
+        "voicemail_enabled": "followup_voicemail_enabled",
+        "voicemail_message": "followup_voicemail_message",
+        "callback_number": "followup_callback_number",
+    }
+    for target, source in overrides.items():
+        value = getattr(cfg, source, None)
+        if value is not None:
+            setattr(runtime, target, value)
+    runtime.voice_engine = "gpt_live"
+    return runtime
+
+
+def _runtime_agent_config(call_mode: str = "outbound") -> AgentConfig:
+    return _runtime_agent_config_for_mode(load_agent_config(), call_mode)
+
+
+async def _start_agent_call(phone: str, lead: dict, base_url: str, call_mode: str = "outbound", follow_up_id: str = "") -> str:
     phone = _format_us_phone(phone)
     base_url = (base_url or "").rstrip("/")
 
@@ -879,10 +1496,12 @@ async def _start_agent_call(phone: str, lead: dict, base_url: str) -> str:
     lead_city  = urllib.parse.quote(lead.get("City", ""))
     lead_cat   = urllib.parse.quote(lead.get("Category", ""))
     lead_tz    = urllib.parse.quote(_lead_timezone(lead))
+    lead_mode  = urllib.parse.quote(call_mode or "outbound")
+    lead_fu    = urllib.parse.quote(follow_up_id or "")
     twiml_url  = (
         f"{base_url}/api/agent/twiml"
         f"?phone={lead_phone}&name={lead_name}&city={lead_city}&category={lead_cat}"
-        f"&timezone={lead_tz}"
+        f"&timezone={lead_tz}&call_mode={lead_mode}&follow_up_id={lead_fu}"
     )
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -911,7 +1530,7 @@ async def _start_agent_call(phone: str, lead: dict, base_url: str) -> str:
     call_sid = r.json()["sid"]
     _agent_queues[call_sid] = asyncio.Queue()
     _agent_events[call_sid] = []
-    _call_leads[call_sid] = {**lead, "Phone": phone}
+    _call_leads[call_sid] = {**lead, "Phone": phone, "call_mode": call_mode or "outbound", "follow_up_id": follow_up_id or ""}
     return call_sid
 
 
@@ -1631,6 +2250,8 @@ async def get_agent_config():
 async def post_agent_config(request: Request):
     data = await request.json()
     cfg = AgentConfig(**data)
+    cfg.voice_engine = "gpt_live"
+    cfg.followup_voice_engine = "gpt_live"
     _save_agent_config(cfg)
     return JSONResponse({"success": True})
 
@@ -1646,9 +2267,17 @@ async def agent_initiate(request: Request):
     phone    = data.get("phone", "").strip()
     lead     = data.get("lead", {})
     base_url = data.get("base_url", "").rstrip("/")
+    call_mode = str(data.get("call_mode") or "outbound").strip() or "outbound"
+    follow_up_id = str(data.get("follow_up_id") or "").strip()
 
-    call_sid = await _start_agent_call(phone, lead, base_url)
-    return JSONResponse({"success": True, "call_sid": call_sid})
+    call_sid = await _start_agent_call(phone, lead, base_url, call_mode=call_mode, follow_up_id=follow_up_id)
+    cfg = load_agent_config()
+    return JSONResponse({
+        "success": True,
+        "call_sid": call_sid,
+        "voice_engine": getattr(cfg, "voice_engine", "gpt_live"),
+        "live_model": getattr(cfg, "live_model", "gpt-live-1"),
+    })
 
 
 def _status_from_outcome(outcome: str, call_status: str = "") -> str:
@@ -1805,7 +2434,28 @@ async def _simulated_lead_reply(lead: dict, scenario: str, history: list[dict], 
     return {"text": text, "done": bool(data.get("done", False)), "outcome": data.get("outcome", "conversation")}
 
 
-async def _sim_agent_text_response(handler: AgentCallHandler) -> str | None:
+def _sim_agent_system_prompt(cfg: AgentConfig, lead: dict) -> str:
+    business = lead.get("Name") or "the business"
+    category = lead.get("Category") or "service business"
+    city = lead.get("City") or ""
+    timezone = _lead_timezone(lead) or "local time"
+    call_mode = lead.get("call_mode") or "outbound"
+    follow_up = lead.get("FollowUp") or {}
+    follow_up_context = json.dumps(follow_up, ensure_ascii=False) if follow_up else "{}"
+    return f"""
+{getattr(cfg, 'system_prompt', '')}
+
+Simulation mode for QA only. Real phone calls use GPT-Live through agent_live_ws.GPTLiveCallHandler.
+Lead context: {business}, {category}{' in ' + city if city else ''}. Timezone: {timezone}. Call mode: {call_mode}.
+Follow-up context, if any: {follow_up_context}
+
+Respond as Anna, the Lynkflow AI voice agent. Keep replies short and natural for a phone call.
+Do not invent names, emails, prices, promises, or prior conversation details.
+Use [HANGUP] only as a silent control token when the simulated call should end.
+""".strip()
+
+
+async def _sim_agent_text_response(cfg: AgentConfig, conversation: list[dict], status_queue: asyncio.Queue) -> str | None:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set")
     async with httpx.AsyncClient(timeout=30) as client:
@@ -1813,10 +2463,10 @@ async def _sim_agent_text_response(handler: AgentCallHandler) -> str | None:
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
             json={
-                "model": handler.cfg.model,
-                "messages": handler.conversation,
-                "temperature": handler.cfg.temperature,
-                "max_tokens": handler.cfg.max_tokens,
+                "model": cfg.model,
+                "messages": conversation,
+                "temperature": cfg.temperature,
+                "max_tokens": cfg.max_tokens,
             },
         )
     if resp.status_code != 200:
@@ -1824,12 +2474,10 @@ async def _sim_agent_text_response(handler: AgentCallHandler) -> str | None:
     text = resp.json()["choices"][0]["message"].get("content", "").strip()
     clean = text.replace("[HANGUP]", "").strip()
     if clean:
-        await handler.status_queue.put({
+        await status_queue.put({
             "type": "transcript_final", "speaker": "agent", "text": clean,
             "ts": datetime.now().strftime("%H:%M:%S"),
         })
-    handler.metrics.tokens_in += sum(len(m.get("content", "")) for m in handler.conversation) // 4
-    handler.metrics.tokens_out += len(text) // 4
     return text or None
 
 
@@ -1840,6 +2488,12 @@ async def _drain_sim_events(call_sid: str, queue: asyncio.Queue) -> str:
             event = queue.get_nowait()
         except asyncio.QueueEmpty:
             break
+        if call_sid:
+            _agent_events.setdefault(call_sid, []).append(event)
+            _agent_events[call_sid] = _agent_events[call_sid][-200:]
+            q = _agent_queues.get(call_sid)
+            if q:
+                await q.put(event)
         if event.get("type") in ("status", "transcript", "transcript_final"):
             await _autodial_note_call_event(call_sid, event)
         if event.get("type") in ("transcript", "transcript_final") and event.get("speaker") == "agent":
@@ -1869,94 +2523,6 @@ def _save_sim_transcript(lead: dict, phone: str, call_sid: str, scenario: str, h
     return filename
 
 
-async def _elevenlabs_ulaw_tts(text: str, voice_id: str, cfg: AgentConfig) -> bytes:
-    if not ELEVENLABS_API_KEY:
-        return b""
-    text = (text or "").strip()
-    if not text:
-        return b""
-
-    ws_url = (
-        f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input"
-        f"?model_id=eleven_flash_v2_5&output_format=ulaw_8000&auto_mode=true"
-    )
-    tts_ws = None
-    audio = bytearray()
-    try:
-        headers = {"xi-api-key": ELEVENLABS_API_KEY}
-        try:
-            tts_ws = await websockets.connect(ws_url, additional_headers=headers)
-        except TypeError:
-            tts_ws = await websockets.connect(ws_url, extra_headers=headers)
-
-        await tts_ws.send(json.dumps({
-            "text": " ",
-            "voice_settings": {
-                "stability": getattr(cfg, "stability", 0.55),
-                "similarity_boost": getattr(cfg, "similarity_boost", 0.75),
-                "style": getattr(cfg, "style", 0.05),
-                "speed": getattr(cfg, "speaking_rate", 1.0),
-            },
-        }))
-        await tts_ws.send(json.dumps({"text": text}))
-        await tts_ws.send(json.dumps({"text": ""}))
-
-        async for raw in tts_ws:
-            msg = json.loads(raw)
-            if msg.get("audio"):
-                audio.extend(base64.b64decode(msg["audio"]))
-            if msg.get("isFinal"):
-                break
-    except Exception as e:
-        print(f"[SIM TTS] failed for {voice_id}: {e}")
-        return b""
-    finally:
-        if tts_ws:
-            try:
-                await tts_ws.close()
-            except Exception:
-                pass
-    return bytes(audio)
-
-
-def _sim_recording_filename(lead: dict, call_sid: str, ext: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9_. -]+", "", lead.get("Name") or "GPT Lead Test").strip()
-    name = re.sub(r"\s+", " ", name)[:42] or "GPT Lead Test"
-    suffix = call_sid[-6:] if call_sid else uuid.uuid4().hex[:6]
-    return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}_{suffix}_sim.{ext}"
-
-
-async def _save_sim_audio_recording(lead: dict, call_sid: str, history: list[dict], cfg: AgentConfig) -> str:
-    if not ELEVENLABS_API_KEY:
-        return ""
-
-    filename = _sim_recording_filename(lead, call_sid, "wav")
-    path = _REC_DIR / filename
-    pcm = bytearray()
-    silence = b"\x00\x00" * int(8000 * 0.35)
-
-    for item in history:
-        text = (item.get("text") or "").strip()
-        if not text:
-            continue
-        voice_id = getattr(cfg, "voice_id", ELEVENLABS_VOICE_ID) if item.get("speaker") == "agent" else SIM_LEAD_VOICE_ID
-        ulaw = await _elevenlabs_ulaw_tts(text, voice_id, cfg)
-        if not ulaw:
-            continue
-        pcm.extend(audioop.ulaw2lin(ulaw, 2))
-        pcm.extend(silence)
-
-    if not pcm:
-        return ""
-
-    with wave.open(str(path), "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(8000)
-        wav.writeframes(bytes(pcm))
-    return filename
-
-
 async def _finish_sim_call(call_sid: str, outcome: str, message: str = "", recording: str = ""):
     async with _autodial_lock:
         item = _autodial_state["active"].pop(call_sid, None)
@@ -1977,25 +2543,51 @@ async def _finish_sim_call(call_sid: str, outcome: str, message: str = "", recor
     })
 
 
+def _followup_test_reply(scenario: str, history: list[dict]) -> dict:
+    turns = sum(1 for item in history if item.get("speaker") == "lead")
+    scenario = (scenario or "remembers_context").lower()
+    if turns <= 1:
+        if scenario == "forgot_context":
+            return {"text": "I do not remember, what was this about?", "done": False, "outcome": "conversation"}
+        if scenario == "not_interested":
+            return {"text": "We are not interested anymore, thanks.", "done": True, "outcome": "not_interested"}
+        if scenario == "asks_questions":
+            return {"text": "Yes, I remember. How does the call coverage actually work?", "done": False, "outcome": "conversation"}
+        return {"text": "Yes, I remember speaking with you about missed calls.", "done": False, "outcome": "conversation"}
+    if turns <= 2 and scenario == "asks_questions":
+        return {"text": "Can you send details and maybe set up a short demo?", "done": True, "outcome": "interested"}
+    if turns <= 2 and scenario == "forgot_context":
+        return {"text": "Okay, send me the details again by email.", "done": True, "outcome": "interested"}
+    return {"text": "That sounds fine, send me the next step.", "done": True, "outcome": "interested"}
+
+
 async def _run_simulated_agent_call(call_sid: str, lead: dict, phone: str, scenario: str, endpoint: str):
-    cfg = load_agent_config()
+    cfg = _runtime_agent_config(lead.get("call_mode", "outbound") or "outbound")
     status_queue = asyncio.Queue()
-    handler = AgentCallHandler(twilio_ws=None, cfg=cfg, lead_info=lead, status_queue=status_queue)
-    handler.call_sid = call_sid
-    handler.stream_sid = call_sid
-
-    async def no_audio(_text: str, _seq: int):
-        return None
-
-    async def sim_hangup():
-        handler._stop = True
-
-    handler._speak_chunk = no_audio
-    handler._respond = lambda: _sim_agent_text_response(handler)
-    handler._hangup = sim_hangup
+    conversation: list[dict] = [{"role": "system", "content": _sim_agent_system_prompt(cfg, lead)}]
+    tokens_in = 0
+    tokens_out = 0
+    sim_started = time.time()
+    stop_requested = False
+    end_phrases = [p.strip().lower() for p in (getattr(cfg, "end_call_phrases", "") or "").split(",") if p.strip()]
 
     history: list[dict] = []
     outcome = "conversation"
+
+    async def agent_turn() -> str:
+        nonlocal tokens_in, tokens_out, stop_requested
+        response = await _sim_agent_text_response(cfg, conversation, status_queue)
+        text = response or ""
+        clean = text.replace("[HANGUP]", "").strip()
+        tokens_in += sum(len(m.get("content", "")) for m in conversation) // 4
+        tokens_out += len(text) // 4
+        if clean:
+            conversation.append({"role": "assistant", "content": clean})
+        low = clean.lower()
+        if "[hangup]" in text.lower() or any(p in low for p in end_phrases):
+            stop_requested = True
+        return await _drain_sim_events(call_sid, status_queue)
+
     try:
         await status_queue.put({"type": "status", "state": "active", "message": f"GPT lead test: {scenario}"})
         await _drain_sim_events(call_sid, status_queue)
@@ -2010,11 +2602,11 @@ async def _run_simulated_agent_call(call_sid: str, lead: dict, phone: str, scena
                 "type": "transcript_final", "speaker": "prospect", "text": lead_text,
                 "ts": datetime.now().strftime("%H:%M:%S"),
             })
-            await handler._handle_transcript(lead_text)
-            last_agent = await _drain_sim_events(call_sid, status_queue)
+            conversation.append({"role": "user", "content": lead_text})
+            last_agent = await agent_turn()
             if last_agent:
                 history.append({"speaker": "agent", "text": last_agent})
-            if handler._stop:
+            if stop_requested:
                 break
             if not last_agent and openings:
                 lead_text = openings.pop(0)
@@ -2022,7 +2614,10 @@ async def _run_simulated_agent_call(call_sid: str, lead: dict, phone: str, scena
                 continue
             if not last_agent:
                 break
-            reply = await _simulated_lead_reply(lead, scenario, history, endpoint)
+            if lead.get("call_mode") == "follow_up" and not endpoint:
+                reply = _followup_test_reply(scenario, history)
+            else:
+                reply = await _simulated_lead_reply(lead, scenario, history, endpoint)
             lead_text = reply.get("text", "")
             outcome = reply.get("outcome") or outcome
             if reply.get("done"):
@@ -2032,40 +2627,48 @@ async def _run_simulated_agent_call(call_sid: str, lead: dict, phone: str, scena
                         "type": "transcript_final", "speaker": "prospect", "text": lead_text,
                         "ts": datetime.now().strftime("%H:%M:%S"),
                     })
-                    await handler._handle_transcript(lead_text)
-                    last_agent = await _drain_sim_events(call_sid, status_queue)
+                    conversation.append({"role": "user", "content": lead_text})
+                    last_agent = await agent_turn()
                     if last_agent:
                         history.append({"speaker": "agent", "text": last_agent})
                 break
             await asyncio.sleep(0.4)
-        final_outcome = handler.outcome if handler.outcome != "no_answer" else outcome
+        final_outcome = outcome
         transcript_file = _save_sim_transcript(lead, phone, call_sid, scenario, history, final_outcome)
-        audio_file = await _save_sim_audio_recording(lead, call_sid, history, cfg)
-        recording = audio_file or transcript_file
+        recording = transcript_file
+        await status_queue.put({"type": "status", "state": "ended", "message": f"GPT lead test finished: {final_outcome}"})
+        await _drain_sim_events(call_sid, status_queue)
         try:
             from call_history import record_call
-            handler.metrics.ended = time.time()
-            snap = handler.metrics.snapshot()
-            duration_s = round(max(0.1, handler.metrics.ended - handler.metrics.started), 1)
-            llm_cost = snap.get("cost", {}).get("llm", 0.0)
-            record_call({
+            from metrics import RATES
+            ended = time.time()
+            duration_s = round(max(0.1, ended - sim_started), 1)
+            llm_cost = (
+                tokens_in / 1_000_000 * RATES.get(f"{cfg.model}_in", RATES["gpt-4o-mini_in"]) +
+                tokens_out / 1_000_000 * RATES.get(f"{cfg.model}_out", RATES["gpt-4o-mini_out"])
+            )
+            call_entry = {
+                **_lead_time_fields(lead, ended),
                 "call_sid": call_sid,
                 "business": lead.get("Name", ""),
                 "phone": phone,
                 "city": lead.get("City", ""),
+                "state": lead.get("State", ""),
                 "category": lead.get("Category", ""),
+                "call_mode": lead.get("call_mode", "outbound") or "outbound",
+                "follow_up_id": lead.get("follow_up_id", ""),
                 "answered": bool(history),
                 "outcome": final_outcome,
                 "turns": sum(1 for item in history if item.get("speaker") == "agent"),
                 "interrupts": 0,
                 "duration_s": duration_s,
-                "latency": snap.get("latency", {}),
+                "latency": {"stt_ms": 0, "llm_ms": 0, "tts_ms": 0, "total_ms": 0, "total_p95_ms": 0, "samples": 0},
                 "cost": {
                     "twilio": 0.0,
                     "stt": 0.0,
-                    "llm": llm_cost,
+                    "llm": round(llm_cost, 5),
                     "tts": 0.0,
-                    "total": llm_cost,
+                    "total": round(llm_cost, 5),
                     "per_min": round(llm_cost / (duration_s / 60), 4) if duration_s else 0.0,
                     "duration_min": round(duration_s / 60, 3),
                     "duration_s": duration_s,
@@ -2074,7 +2677,17 @@ async def _run_simulated_agent_call(call_sid: str, lead: dict, phone: str, scena
                 "transcript_file": transcript_file,
                 "test_mode": True,
                 "sim_scenario": scenario,
-            })
+            }
+            record_call(call_entry)
+            if call_entry.get("follow_up_id") and recording:
+                try:
+                    from followups import mark_call_recording
+                    updated = mark_call_recording(call_sid, recording)
+                    if updated:
+                        await _followup_broadcast({"type": "follow_up_updated", "follow_up": updated, "message": "Follow-up recording saved"})
+                except Exception as e:
+                    print(f"[FOLLOWUP] simulated recording link failed: {e}")
+            asyncio.create_task(_analyze_call_for_follow_up(call_entry))
         except Exception as e:
             print(f"[SIM HISTORY] failed: {e}")
         await _finish_sim_call(call_sid, final_outcome, recording=recording)
@@ -2148,16 +2761,20 @@ async def _autodial_loop():
                                 "lead": lead,
                                 "phone": phone,
                                 "mode": "test",
+                                "engine": "GPT Lead Test",
                                 "state": "testing",
                                 "started_at": time.time(),
                             }
                         asyncio.create_task(_run_simulated_agent_call(call_sid, lead, phone, sim_scenario, sim_endpoint))
                     else:
                         call_sid = await _start_agent_call(phone, lead, base_url)
+                        engine = "GPT-Live"
                         async with _autodial_lock:
                             _autodial_state["active"][call_sid] = {
                                 "lead": lead,
                                 "phone": phone,
+                                "mode": "live",
+                                "engine": engine,
                                 "started_at": time.time(),
                             }
                         await _update_lead_record(lead.get("Name", ""), phone, "Calling", "Auto dialer started call", lead)
@@ -2167,6 +2784,7 @@ async def _autodial_loop():
                         "name": lead.get("Name", ""),
                         "phone": phone,
                         "mode": "test" if test_mode else "live",
+                        "engine": "GPT Lead Test" if test_mode else engine,
                         "message": "GPT lead simulation started" if test_mode else "Auto dialer started call",
                     })
                     launched += 1
@@ -2196,6 +2814,24 @@ async def _autodial_finish_call(call_sid: str, outcome: str = "", call_status: s
     async with _autodial_lock:
         item = _autodial_state["active"].pop(call_sid, None)
         if not item:
+            lead_meta = _call_leads.get(call_sid, {})
+            follow_up_id = lead_meta.get("follow_up_id")
+            if follow_up_id and call_status and not outcome:
+                from followups import complete_call_attempt
+                result_status = "failed"
+                result_text = f"Call {call_status}; no live media stream was opened, so no transcript or recording was created."
+                updated = complete_call_attempt(follow_up_id, {
+                    "call_sid": call_sid,
+                    "outcome": call_status,
+                    "phone": lead_meta.get("Phone", ""),
+                    "business": lead_meta.get("Name", ""),
+                }, {
+                    "status": result_status,
+                    "result": result_text,
+                    "reason": "Twilio ended before the AI media stream produced an analyzable call.",
+                })
+                if updated:
+                    await _followup_broadcast({"type": "follow_up_failed", "follow_up": updated, "call_sid": call_sid, "message": result_text})
             return
         _autodial_state["completed"] += 1
 
@@ -2349,6 +2985,9 @@ async def agent_twiml(request: Request):
     name     = urllib.parse.quote(params.get("name", ""),     safe="")
     city     = urllib.parse.quote(params.get("city", ""),     safe="")
     category = urllib.parse.quote(params.get("category", ""), safe="")
+    timezone = urllib.parse.quote(params.get("timezone", ""), safe="")
+    call_mode = urllib.parse.quote(params.get("call_mode", "outbound"), safe="")
+    follow_up_id = urllib.parse.quote(params.get("follow_up_id", ""), safe="")
 
     cfg = load_agent_config()
     base_url = cfg.base_url.rstrip("/")
@@ -2363,6 +3002,7 @@ async def agent_twiml(request: Request):
     stream_url = (
         f"{ws_base}/ws/agent/stream"
         f"?phone={phone}&amp;name={name}&amp;city={city}&amp;category={category}"
+        f"&amp;timezone={timezone}&amp;call_mode={call_mode}&amp;follow_up_id={follow_up_id}"
     )
 
     def xml_esc(s: str) -> str:
@@ -2373,12 +3013,14 @@ async def agent_twiml(request: Request):
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<Response>'
         '<Connect>'
-        f'<Stream url="{ws_base}/ws/agent/stream">'
+        f'<Stream url="{stream_url}">'
         f'<Parameter name="phone" value="{xml_esc(params.get("phone",""))}" />'
         f'<Parameter name="name" value="{xml_esc(params.get("name",""))}" />'
         f'<Parameter name="city" value="{xml_esc(params.get("city",""))}" />'
         f'<Parameter name="category" value="{xml_esc(params.get("category",""))}" />'
         f'<Parameter name="timezone" value="{xml_esc(params.get("timezone",""))}" />'
+        f'<Parameter name="call_mode" value="{xml_esc(params.get("call_mode","outbound"))}" />'
+        f'<Parameter name="follow_up_id" value="{xml_esc(params.get("follow_up_id",""))}" />'
         '</Stream>'
         '</Connect>'
         '</Response>'
@@ -2437,6 +3079,19 @@ async def agent_recording_status(request: Request):
             from call_history import update_recording_file
             if not update_recording_file(call_sid, filename):
                 _pending_recordings[call_sid] = filename
+            follow_up_id = ""
+            if handler:
+                follow_up_id = handler.lead_info.get("follow_up_id", "")
+            if not follow_up_id:
+                follow_up_id = _call_leads.get(call_sid, {}).get("follow_up_id", "")
+            if follow_up_id:
+                try:
+                    from followups import mark_call_recording
+                    updated = mark_call_recording(call_sid, filename)
+                    if updated:
+                        await _followup_broadcast({"type": "follow_up_updated", "follow_up": updated, "message": "Follow-up recording saved"})
+                except Exception as e:
+                    print(f"[FOLLOWUP] recording link failed: {e}")
             await _autodial_broadcast({
                 "type": "recording_ready",
                 "call_sid": call_sid,
@@ -2482,13 +3137,20 @@ async def agent_stream(websocket: WebSocket):
         "City":     urllib.parse.unquote(params.get("city", "")),
         "Category": urllib.parse.unquote(params.get("category", "")),
         "Timezone": urllib.parse.unquote(params.get("timezone", "")),
+        "call_mode": urllib.parse.unquote(params.get("call_mode", "outbound")),
+        "follow_up_id": urllib.parse.unquote(params.get("follow_up_id", "")),
     }
+    if lead_info.get("call_mode") == "follow_up" and lead_info.get("follow_up_id"):
+        try:
+            from followups import get_follow_up
+            lead_info["FollowUp"] = get_follow_up(lead_info["follow_up_id"])
+        except Exception as e:
+            print(f"[FOLLOWUP] context load failed: {e}")
 
-    cfg          = load_agent_config()
+    cfg          = _runtime_agent_config(lead_info.get("call_mode", "outbound") or "outbound")
     status_queue = asyncio.Queue()
 
-    Handler = GPTLiveCallHandler if getattr(cfg, "voice_engine", "gpt_live") == "gpt_live" else AgentCallHandler
-    handler = Handler(
+    handler = GPTLiveCallHandler(
         twilio_ws    = websocket,
         cfg          = cfg,
         lead_info    = lead_info,
@@ -2539,12 +3201,16 @@ async def agent_stream(websocket: WebSocket):
             from call_history import record_call
             snap = handler.metrics.snapshot()
             recording_file = _pending_recordings.pop(handler.call_sid, None) or getattr(handler, "recording_file", None)
-            record_call({
+            call_entry = {
+                **_lead_time_fields(handler.lead_info, snap["cost"].get("ended_ts") or time.time()),
                 "call_sid":   handler.call_sid,
                 "business":   handler.lead_info.get("Name", ""),
                 "phone":      handler.lead_info.get("Phone", ""),
                 "city":       handler.lead_info.get("City", ""),
+                "state":      handler.lead_info.get("State", ""),
                 "category":   handler.lead_info.get("Category", ""),
+                "call_mode":  handler.lead_info.get("call_mode", "outbound") or "outbound",
+                "follow_up_id": handler.lead_info.get("follow_up_id", ""),
                 "voice_engine": getattr(cfg, "voice_engine", "gpt_live"),
                 "live_model": getattr(cfg, "live_model", "gpt-live-1"),
                 "live_voice": getattr(cfg, "live_voice", "gleam"),
@@ -2560,7 +3226,22 @@ async def agent_stream(websocket: WebSocket):
                 "recording": recording_file,
                 "recording_source": "twilio_dual_channel" if recording_file and str(recording_file).endswith("_twilio.wav") else "local_stream",
                 "followup_note": getattr(handler, "followup_note", ""),
-            })
+            }
+            record_call(call_entry)
+            if call_entry.get("follow_up_id") and recording_file:
+                try:
+                    from followups import mark_call_recording
+                    updated = mark_call_recording(handler.call_sid, recording_file)
+                    if updated:
+                        await _followup_broadcast({"type": "follow_up_updated", "follow_up": updated, "message": "Follow-up recording saved"})
+                except Exception as e:
+                    print(f"[FOLLOWUP] recording link failed: {e}")
+            asyncio.create_task(_analyze_call_for_follow_up(call_entry))
+            if handler.call_sid and (not recording_file or not str(recording_file).endswith("_twilio.wav")):
+                asyncio.create_task(_recover_twilio_recording(
+                    handler.call_sid,
+                    handler.lead_info.get("Name", ""),
+                ))
             asyncio.create_task(_store_twilio_actual_price(handler.call_sid))
             await _autodial_finish_call(
                 handler.call_sid,
@@ -2650,8 +3331,7 @@ async def agent_metrics_info():
     """Static reference card data + presets for the metrics panel."""
     from metrics import COMPONENT_INFO, PRESETS, RATES
     cfg = load_agent_config()
-    using_live = getattr(cfg, "voice_engine", "gpt_live") == "gpt_live"
-    model_key = getattr(cfg, "live_model", "gpt-live-1") if using_live else cfg.model
+    model_key = getattr(cfg, "live_model", "gpt-live-1") or "gpt-live-1"
     model_info = COMPONENT_INFO["model"].get(model_key, COMPONENT_INFO["model"]["gpt-4o-mini"])
     transcriber_info = {
         "name": "Built into GPT-Live",
@@ -2660,7 +3340,7 @@ async def agent_metrics_info():
         "cost_per_min": 0.0,
         "metric_label": "Separate STT",
         "metric_value": "None",
-    } if using_live else COMPONENT_INFO["transcriber"]
+    }
     voice_info = {
         "name": f"GPT-Live {getattr(cfg, 'live_voice', 'gleam')}",
         "provider": "OpenAI",
@@ -2668,7 +3348,7 @@ async def agent_metrics_info():
         "cost_per_min": 0.0,
         "metric_label": "Separate TTS",
         "metric_value": "None",
-    } if using_live else COMPONENT_INFO["voice"]
+    }
 
     est_per_min = (
         RATES["twilio_voice_us"] + RATES["twilio_media_stream"]
@@ -2680,18 +3360,17 @@ async def agent_metrics_info():
         transcriber_info["typical_latency_ms"]
         + model_info["typical_latency_ms"]
         + voice_info["typical_latency_ms"]
-        + (0 if using_live else cfg.endpointing_ms)
     )
 
     return JSONResponse({
-        "engine": "gpt_live" if using_live else "chained",
+        "engine": "gpt_live",
         "transcriber": transcriber_info,
         "model":       model_info,
         "voice":       voice_info,
         "estimated": {
             "cost_per_min": round(est_per_min, 4),
             "latency_ms":   est_latency,
-            "endpointing_ms": 0 if using_live else cfg.endpointing_ms,
+            "endpointing_ms": 0,
         },
         "presets": {k: v["label"] for k, v in PRESETS.items()},
         "rates": RATES,
@@ -2745,6 +3424,172 @@ async def analytics_ask(request: Request):
     recording = data.get("recording", "")
     question = data.get("question", "")
     return JSONResponse(await _ask_transcript_agent(recording, question))
+
+
+@app.get("/api/follow-ups")
+async def followups_list(status: str = ""):
+    from followups import list_follow_ups
+    items = list_follow_ups(status=status)
+    return JSONResponse({"follow_ups": items, "counts": _followup_counts(items)})
+
+
+@app.get("/api/follow-ups/events")
+async def followups_events():
+    async def stream():
+        q = asyncio.Queue()
+        _followup_listeners.add(q)
+        try:
+            from followups import list_follow_ups
+            items = list_follow_ups()
+            yield f"data: {json.dumps({'type': 'snapshot', 'counts': _followup_counts(items), 'follow_ups': items})}\n\n"
+            while True:
+                try:
+                    evt = await asyncio.wait_for(q.get(), timeout=30)
+                    yield f"data: {json.dumps(evt)}\n\n"
+                except asyncio.TimeoutError:
+                    yield "data: {\"type\":\"ping\"}\n\n"
+        finally:
+            _followup_listeners.discard(q)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/follow-ups/{follow_up_id}")
+async def followups_get(follow_up_id: str):
+    from followups import get_follow_up
+    item = get_follow_up(follow_up_id)
+    if not item:
+        raise HTTPException(404, "follow-up not found")
+    previous_call = _find_call(item.get("previous_call_id") or "")
+    latest_call = _find_call(item.get("call_id") or "")
+    return JSONResponse({"follow_up": item, "previous_call": previous_call, "latest_call": latest_call})
+
+
+@app.patch("/api/follow-ups/{follow_up_id}")
+async def followups_patch(follow_up_id: str, request: Request):
+    from followups import update_follow_up
+    payload = await request.json()
+    item = update_follow_up(follow_up_id, payload)
+    if not item:
+        raise HTTPException(404, "follow-up not found")
+    await _followup_broadcast({"type": "follow_up_updated", "follow_up": item, "message": "Follow-up updated"})
+    return JSONResponse({"success": True, "follow_up": item})
+
+
+@app.post("/api/follow-ups/{follow_up_id}/cancel")
+async def followups_cancel(follow_up_id: str):
+    from followups import update_follow_up
+    item = update_follow_up(follow_up_id, {"status": "cancelled"})
+    if not item:
+        raise HTTPException(404, "follow-up not found")
+    await _followup_broadcast({"type": "follow_up_updated", "follow_up": item, "message": "Follow-up cancelled"})
+    return JSONResponse({"success": True, "follow_up": item})
+
+
+@app.post("/api/follow-ups/{follow_up_id}/call")
+async def followups_call(follow_up_id: str, request: Request):
+    from followups import get_follow_up, mark_call_started, update_follow_up
+    item = get_follow_up(follow_up_id)
+    if not item:
+        raise HTTPException(404, "follow-up not found")
+    if item.get("status") == "calling" and item.get("call_id"):
+        return JSONResponse({"success": True, "already_calling": True, "follow_up": item, "call_sid": item.get("call_id")})
+    if item.get("status") == "cancelled":
+        raise HTTPException(400, f"follow-up is {item.get('status')}")
+
+    payload = await request.json()
+    cfg = load_agent_config()
+    base_url = (payload.get("base_url") or cfg.base_url or "").rstrip("/")
+    phone = item.get("phone") or payload.get("phone") or ""
+    if not phone:
+        raise HTTPException(400, "follow-up phone required")
+    if not base_url:
+        raise HTTPException(400, "base_url required")
+
+    lead = {
+        "Name": item.get("business") or "",
+        "Phone": phone,
+        "City": "",
+        "Category": "service business",
+        "Timezone": item.get("lead_timezone") or item.get("lead_timezone_iana") or "",
+        "call_mode": "follow_up",
+        "follow_up_id": follow_up_id,
+    }
+    try:
+        call_sid = await _start_agent_call(phone, lead, base_url, call_mode="follow_up", follow_up_id=follow_up_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        failed = update_follow_up(follow_up_id, {"status": "failed", "result": str(e)})
+        if failed:
+            await _followup_broadcast({"type": "follow_up_updated", "follow_up": failed, "message": "Follow-up call failed to start"})
+        raise
+
+    updated = mark_call_started(follow_up_id, call_sid)
+    await _followup_broadcast({"type": "follow_up_call_started", "follow_up": updated, "call_sid": call_sid, "message": "Follow-up call started"})
+    runtime_cfg = _runtime_agent_config("follow_up")
+    return JSONResponse({
+        "success": True,
+        "call_sid": call_sid,
+        "follow_up": updated,
+        "voice_engine": getattr(runtime_cfg, "voice_engine", "gpt_live"),
+        "live_model": getattr(runtime_cfg, "live_model", "gpt-live-1"),
+        "live_voice": getattr(runtime_cfg, "live_voice", "gleam"),
+    })
+
+
+@app.post("/api/follow-ups/{follow_up_id}/test-call")
+async def followups_test_call(follow_up_id: str, request: Request):
+    raise HTTPException(400, "Follow-Up Agent is GPT-Live only; legacy simulated follow-up calls are disabled")
+    from followups import get_follow_up, mark_call_started
+    item = get_follow_up(follow_up_id)
+    if not item:
+        raise HTTPException(404, "follow-up not found")
+    payload = await request.json()
+    scenario = str(payload.get("scenario") or load_agent_config().followup_test_scenario or "remembers_context")
+    call_sid = f"SIMFU{uuid.uuid4().hex[:22]}"
+    _agent_queues[call_sid] = asyncio.Queue()
+    _agent_events[call_sid] = []
+    lead = {
+        "Name": item.get("business") or "Follow-Up Test",
+        "Phone": item.get("phone") or "+15550000000",
+        "City": "Test City",
+        "State": "IN",
+        "Category": "service business",
+        "Timezone": "Eastern",
+        "Status": "Queued",
+        "call_mode": "follow_up",
+        "follow_up_id": follow_up_id,
+        "FollowUp": item,
+    }
+    _call_leads[call_sid] = {**lead, "test_mode": True}
+    updated = mark_call_started(follow_up_id, call_sid)
+    await _followup_broadcast({"type": "follow_up_call_started", "follow_up": updated, "call_sid": call_sid, "message": "Test follow-up started"})
+    asyncio.create_task(_run_simulated_agent_call(call_sid, lead, lead["Phone"], scenario, endpoint=""))
+    runtime_cfg = _runtime_agent_config("follow_up")
+    return JSONResponse({
+        "success": True,
+        "test_mode": True,
+        "call_sid": call_sid,
+        "follow_up": updated,
+        "voice_engine": getattr(runtime_cfg, "voice_engine", "gpt_live"),
+    })
+
+
+@app.post("/api/follow-ups/analyze-call")
+async def followups_analyze_call(request: Request):
+    payload = await request.json()
+    call = _find_call(str(payload.get("call_sid") or payload.get("recording") or ""))
+    if not call:
+        raise HTTPException(404, "call not found")
+    await _analyze_call_for_follow_up(call)
+    from followups import find_by_previous_call_id
+    item = find_by_previous_call_id(call.get("call_sid") or call.get("recording") or "")
+    return JSONResponse({"success": True, "follow_up": item})
 
 
 @app.get("/api/email/status")
@@ -2839,12 +3684,32 @@ async def email_oauth_callback(request: Request):
 @app.post("/api/email/send")
 async def email_send(request: Request):
     data = await request.json()
-    return JSONResponse(await _send_gmail_message(
-        to_email=data.get("to", ""),
-        subject=data.get("subject", ""),
-        html=data.get("html", ""),
-        text=data.get("text", ""),
-    ))
+    try:
+        result = await _send_gmail_message(
+            to_email=data.get("to", ""),
+            subject=data.get("subject", ""),
+            html=data.get("html", ""),
+            text=data.get("text", ""),
+        )
+    except HTTPException as e:
+        if e.status_code >= 500:
+            try:
+                from followups import note_email_failed
+                changed = note_email_failed(data.get("to", ""), data.get("subject", ""), str(e.detail))
+                for item in changed:
+                    await _followup_broadcast({"type": "follow_up_updated", "follow_up": item, "message": "Verified email send failure recorded"})
+            except Exception as log_err:
+                print(f"[EMAIL] follow-up email failure update failed: {log_err}")
+        raise
+    _log_email_sent(data.get("to", ""), data.get("subject", ""), result)
+    try:
+        from followups import note_email_sent
+        changed = note_email_sent(data.get("to", ""), data.get("subject", ""))
+        for item in changed:
+            await _followup_broadcast({"type": "follow_up_updated", "follow_up": item, "message": "Follow-up email marked sent"})
+    except Exception as e:
+        print(f"[EMAIL] follow-up email status update failed: {e}")
+    return JSONResponse(result)
 
 
 @app.get("/api/analyst/chats")
@@ -2972,12 +3837,18 @@ async def analyst_message(chat_id: str, request: Request):
     now = datetime.now().isoformat(timespec="seconds")
     chat.setdefault("messages", []).append({"role": "user", "content": question, "ts": now})
     result = await _ask_global_analyst(chat, question, days)
-    chat["messages"].append({"role": "assistant", "content": result["answer"], "ts": datetime.now().isoformat(timespec="seconds"), "context": result["context"]})
+    clean_answer, actions = _parse_analyst_action_blocks(result["answer"])
+    action_results = await _execute_analyst_actions(actions)
+    context = {**result["context"]}
+    if action_results:
+        context["actions"] = action_results
+    display_answer = clean_answer or ("Action processed." if actions else result["answer"])
+    chat["messages"].append({"role": "assistant", "content": display_answer, "ts": datetime.now().isoformat(timespec="seconds"), "context": context})
     if chat.get("title") == "New chat":
         chat["title"] = question[:60]
     chat["updated_at"] = datetime.now().isoformat(timespec="seconds")
     _save_analyst_chats(data)
-    return JSONResponse({"chat": chat, "answer": result["answer"], "context": result["context"]})
+    return JSONResponse({"chat": chat, "answer": display_answer, "context": context})
 
 @app.get("/api/recordings")
 async def list_recordings():
