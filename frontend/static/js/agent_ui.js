@@ -517,7 +517,12 @@ function setListenBtn(on) {
 }
 
 function escAttr(s) {
-  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function findLeadByPhone(number) {
@@ -2413,7 +2418,7 @@ async function askAnalyticsAi() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Ask failed');
     status.textContent = 'Answered from transcript.';
-    answer.innerHTML = renderAnalystMarkdown(data.answer || '');
+    answer.innerHTML = renderAnalystMarkdown(data.answer || '') + renderPreparedEmailPanel(data.answer || '', question);
     wireAnalystCopyButtons(answer);
     if (copyBtn && data.answer) copyBtn.style.display = '';
   } catch (e) {
@@ -2587,12 +2592,12 @@ function renderAnalystChat(chat) {
     wrap.innerHTML = '<div class="analyst-empty">Ask something like “which calls provided info?” or “tell me what happened in R.E. Michel.”</div>';
     return;
   }
-  wrap.innerHTML = messages.map((m, idx) => renderAnalystMessage(m, idx)).join('');
+  wrap.innerHTML = messages.map((m, idx) => renderAnalystMessage(m, idx, messages)).join('');
   wireAnalystCopyButtons(wrap, messages);
   wrap.scrollTop = wrap.scrollHeight;
 }
 
-function renderAnalystMessage(m, idx) {
+function renderAnalystMessage(m, idx, messages = []) {
   const role = m.role === 'user' ? 'user' : 'assistant';
   const label = role === 'user' ? 'You' : 'AI Analyst';
   const copyAction = role === 'assistant'
@@ -2601,12 +2606,76 @@ function renderAnalystMessage(m, idx) {
   const context = m.context
     ? `<div class="analyst-msg-context">Used ${m.context.calls || 0} calls / ${m.context.transcripts || 0} transcripts${m.context.attachments ? ' / ' + m.context.attachments + ' attached audio' : ''}</div>`
     : '';
+  const priorQuestion = messages[idx - 1]?.role === 'user' ? messages[idx - 1]?.content || '' : '';
+  const emailPanel = role === 'assistant' ? renderPreparedEmailPanel(m.content || '', priorQuestion) : '';
   return `
     <div class="analyst-msg analyst-msg--${role}" data-message-index="${idx}">
       <div class="analyst-msg-role">${label}</div>
       ${copyAction}
       <div class="analyst-msg-text markdown-body">${renderAnalystMarkdown(m.content || '')}</div>
+      ${emailPanel}
       ${context}
+    </div>
+  `;
+}
+
+function shouldShowPreparedEmailPanel(content, question = '') {
+  const q = String(question || '').toLowerCase();
+  const c = String(content || '').toLowerCase();
+  return (
+    /(create|draft|write|prepare|make|send)\b[\s\S]{0,80}\b(email|follow-up email|message)/i.test(question) ||
+    /\b(email|follow-up email)\b[\s\S]{0,80}\b(create|draft|write|prepare|send)/i.test(question) ||
+    /```\s*html|html\s+body|email\s+subject|subject:/i.test(content) ||
+    (q.includes('email') && c.includes('subject'))
+  );
+}
+
+function extractPreparedEmail(content) {
+  const src = String(content || '').replace(/\r\n/g, '\n');
+  const fenced = lang => {
+    const m = src.match(new RegExp('```\\s*' + lang + '\\s*\\n([\\s\\S]*?)\\n```', 'i'));
+    return m ? m[1].trim() : '';
+  };
+  let subject = fenced('subject');
+  if (!subject) {
+    const line = src.match(/^\s*(?:email\s*)?subject\s*:\s*(.+)$/im);
+    if (line) subject = line[1].trim();
+  }
+  if (!subject) {
+    const section = src.match(/^#{1,6}\s*(?:email\s*)?subject\s*:?\s*\n([\s\S]*?)(?=\n#{1,6}\s*(?:html\s*)?body|\n```\s*html|$)/im);
+    if (section) subject = section[1].replace(/```[\s\S]*?```/g, '').trim();
+  }
+  subject = subject.replace(/^Subject:\s*/i, '').replace(/[`*_#]/g, '').split('\n').map(s => s.trim()).filter(Boolean)[0] || 'Following up from Lynkflow';
+
+  let html = fenced('html');
+  if (!html) {
+    const bodySection = src.match(/^#{1,6}\s*(?:html\s*body|body\s*html)\s*:?\s*\n([\s\S]*)$/im);
+    if (bodySection) html = bodySection[1].trim();
+  }
+  if (!html) {
+    const loose = src.match(/(?:html\s*body|body\s*html)\s*:?\s*\n([\s\S]*)$/i);
+    if (loose) html = loose[1].trim();
+  }
+  html = html.replace(/^```\s*html\s*/i, '').replace(/```$/i, '').trim();
+  if (!html) html = renderAnalystMarkdown(src, { allowCopyCards: false });
+  return { subject, html };
+}
+
+function renderPreparedEmailPanel(content, question = '') {
+  if (!shouldShowPreparedEmailPanel(content, question)) return '';
+  const draft = extractPreparedEmail(content);
+  return `
+    <div class="analyst-copy-card analyst-email-panel">
+      <div class="analyst-copy-head"><span>Prepared email</span><button class="analyst-copy-btn" type="button">Copy HTML</button></div>
+      <div class="analyst-email-send-row analyst-email-send-row--prepared">
+        <input class="analyst-email-to" type="email" placeholder="recipient@email.com" />
+        <button class="analyst-send-email-btn" type="button">Send email</button>
+        <span class="analyst-email-status"></span>
+      </div>
+      <label class="analyst-email-label">Subject</label>
+      <input class="analyst-email-subject" type="text" value="${escAttr(draft.subject)}" />
+      <label class="analyst-email-label">HTML body</label>
+      <textarea class="analyst-email-html" rows="8">${escapeHtml(draft.html)}</textarea>
     </div>
   `;
 }
@@ -2623,7 +2692,7 @@ function wireAnalystCopyButtons(scope, messages = []) {
         text = msg?.content || '';
       } else {
         const card = btn.closest('.analyst-copy-card');
-        text = card?.querySelector('.analyst-copy-body')?.innerText || '';
+        text = card?.querySelector('.analyst-email-html')?.value || card?.querySelector('.analyst-copy-body')?.innerText || '';
       }
       text = text.trim();
       if (!text) return;
@@ -2688,8 +2757,8 @@ async function sendAnalystEmail(btn) {
   const card = btn.closest('.analyst-copy-card');
   const to = card?.querySelector('.analyst-email-to')?.value.trim() || '';
   const status = card?.querySelector('.analyst-email-status');
-  const subject = findEmailSubjectForCard(card);
-  const html = (card?.querySelector('.analyst-copy-body')?.innerText || '').trim();
+  const subject = (card?.querySelector('.analyst-email-subject')?.value || findEmailSubjectForCard(card)).trim();
+  const html = (card?.querySelector('.analyst-email-html')?.value || card?.querySelector('.analyst-copy-body')?.innerText || '').trim();
   if (!to) return alert('Enter the recipient email first.');
   if (!subject) return alert('No email subject found. Ask the analyst to draft the email again.');
   if (!html) return alert('No HTML body found. Ask the analyst to draft the email again.');

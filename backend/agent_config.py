@@ -147,7 +147,7 @@ class AgentConfig(BaseModel):
     # ── Call behaviour ──────────────────────────────────────────────────────
     endpointing_ms: int = 600          # silence before agent responds
     utterance_end_ms: int = 1500       # silence marking end of a turn
-    silence_timeout_s: int = 10        # hang up after this much dead air
+    silence_timeout_s: int = 30        # hang up after this much dead air
     max_duration_s: int = 300          # hard cap on call length
     allow_interruption: bool = True    # barge-in
 

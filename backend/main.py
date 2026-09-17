@@ -777,6 +777,7 @@ async def _ask_transcript_agent(recording: str, question: str) -> dict:
         f"<a href=\"{PUBLIC_WEBSITE_URL}\">{PUBLIC_WEBSITE_LABEL}</a>. "
         "Return the draft with separate sections named 'Email subject' and 'HTML body'. "
         "Put the subject in a fenced code block tagged subject and the HTML email in a fenced code block tagged html. "
+        "If the operator asks to create, draft, write, prepare, or send an email, always include both fenced blocks. "
         "Make the HTML responsive with inline CSS, a clean dark/blue Lynkflow style, mobile-safe width, and no external images unless they are fluid. Do not invent facts."
     )
     async with httpx.AsyncClient(timeout=180) as client:
@@ -985,6 +986,7 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
         "If they ask which calls provided information, use a compact markdown table with business, info found, evidence, and next action when that is clearer than prose. "
         "If asked to draft an email/message, create a polished copy-ready HTML email, not plain text unless the operator specifically asks for plain text. "
         "Separate the output into two sections named exactly 'Email subject' and 'HTML body'. Put the subject in a fenced code block tagged subject and the email body in a fenced code block tagged html. "
+        "If the operator asks to create, draft, write, prepare, or send an email, always include both fenced blocks so the UI can show the recipient input and send button. "
         "The HTML body should look like Lynkflow's website: clean dark navy background, blue/cyan accent, rounded white/dark content card, strong headline, concise paragraphs, and clear CTA. Use inline CSS suitable for email clients. "
         "Make the HTML responsive for phones, laptops, and desktops: max-width around 640px, width 100%, mobile-safe padding, and any image/banner must use width:100%; max-width:100%; height:auto. "
         f"Include Lynkflow's website only inside the HTML email as <a href=\"{PUBLIC_WEBSITE_URL}\">{PUBLIC_WEBSITE_LABEL}</a>. Do not show the raw long URL as visible text. "
@@ -1475,6 +1477,19 @@ def _runtime_agent_config(call_mode: str = "outbound") -> AgentConfig:
     return _runtime_agent_config_for_mode(load_agent_config(), call_mode)
 
 
+def _compact_lead_context(lead: dict) -> dict:
+    allowed = (
+        "Name", "Phone", "City", "State", "Category", "Timezone", "Status",
+        "Notes", "Address", "Website", "Email", "Owner", "Manager",
+        "Business", "Company", "Source", "Last Call", "Last Outcome",
+    )
+    context = {k: str((lead or {}).get(k) or "").strip() for k in allowed if str((lead or {}).get(k) or "").strip()}
+    notes = context.get("Notes")
+    if notes and len(notes) > 600:
+        context["Notes"] = notes[:600] + "..."
+    return context
+
+
 async def _start_agent_call(phone: str, lead: dict, base_url: str, call_mode: str = "outbound", follow_up_id: str = "") -> str:
     phone = _format_us_phone(phone)
     base_url = (base_url or "").rstrip("/")
@@ -1498,10 +1513,11 @@ async def _start_agent_call(phone: str, lead: dict, base_url: str, call_mode: st
     lead_tz    = urllib.parse.quote(_lead_timezone(lead))
     lead_mode  = urllib.parse.quote(call_mode or "outbound")
     lead_fu    = urllib.parse.quote(follow_up_id or "")
+    lead_ctx   = urllib.parse.quote(json.dumps(_compact_lead_context(lead), ensure_ascii=False)[:1400])
     twiml_url  = (
         f"{base_url}/api/agent/twiml"
         f"?phone={lead_phone}&name={lead_name}&city={lead_city}&category={lead_cat}"
-        f"&timezone={lead_tz}&call_mode={lead_mode}&follow_up_id={lead_fu}"
+        f"&timezone={lead_tz}&call_mode={lead_mode}&follow_up_id={lead_fu}&lead_context={lead_ctx}"
     )
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -2988,6 +3004,7 @@ async def agent_twiml(request: Request):
     timezone = urllib.parse.quote(params.get("timezone", ""), safe="")
     call_mode = urllib.parse.quote(params.get("call_mode", "outbound"), safe="")
     follow_up_id = urllib.parse.quote(params.get("follow_up_id", ""), safe="")
+    lead_context = urllib.parse.quote(params.get("lead_context", ""), safe="")
 
     cfg = load_agent_config()
     base_url = cfg.base_url.rstrip("/")
@@ -3003,6 +3020,7 @@ async def agent_twiml(request: Request):
         f"{ws_base}/ws/agent/stream"
         f"?phone={phone}&amp;name={name}&amp;city={city}&amp;category={category}"
         f"&amp;timezone={timezone}&amp;call_mode={call_mode}&amp;follow_up_id={follow_up_id}"
+        f"&amp;lead_context={lead_context}"
     )
 
     def xml_esc(s: str) -> str:
@@ -3021,6 +3039,7 @@ async def agent_twiml(request: Request):
         f'<Parameter name="timezone" value="{xml_esc(params.get("timezone",""))}" />'
         f'<Parameter name="call_mode" value="{xml_esc(params.get("call_mode","outbound"))}" />'
         f'<Parameter name="follow_up_id" value="{xml_esc(params.get("follow_up_id",""))}" />'
+        f'<Parameter name="lead_context" value="{xml_esc(params.get("lead_context",""))}" />'
         '</Stream>'
         '</Connect>'
         '</Response>'
@@ -3140,6 +3159,14 @@ async def agent_stream(websocket: WebSocket):
         "call_mode": urllib.parse.unquote(params.get("call_mode", "outbound")),
         "follow_up_id": urllib.parse.unquote(params.get("follow_up_id", "")),
     }
+    raw_lead_context = urllib.parse.unquote(params.get("lead_context", ""))
+    if raw_lead_context:
+        try:
+            lead_context = json.loads(raw_lead_context)
+            if isinstance(lead_context, dict):
+                lead_info["LeadContext"] = lead_context
+        except Exception:
+            pass
     if lead_info.get("call_mode") == "follow_up" and lead_info.get("follow_up_id"):
         try:
             from followups import get_follow_up
@@ -3226,6 +3253,7 @@ async def agent_stream(websocket: WebSocket):
                 "recording": recording_file,
                 "recording_source": "twilio_dual_channel" if recording_file and str(recording_file).endswith("_twilio.wav") else "local_stream",
                 "followup_note": getattr(handler, "followup_note", ""),
+                "end_reason": getattr(handler, "end_reason", ""),
             }
             record_call(call_entry)
             if call_entry.get("follow_up_id") and recording_file:

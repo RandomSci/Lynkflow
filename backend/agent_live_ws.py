@@ -122,7 +122,13 @@ class GPTLiveCallHandler:
         self._last_input_transcript_at = 0.0
         self._last_output_transcript_at = 0.0
         self._last_activity_at = time.time()
+        self._last_prospect_audio_at = 0.0
+        self._last_prospect_voice_at = 0.0
+        self._prospect_voice_observed = False
         self._ending_started_at = 0.0
+        self._hangup_after_agent_turn = False
+        self._no_transcript_audio_warned = False
+        self.end_reason = ""
         self._last_clear_at = 0.0
         self._audio_clear_seq = 0
         self._prospect_loud_frames = 0
@@ -172,28 +178,40 @@ class GPTLiveCallHandler:
             await asyncio.sleep(1)
             now = time.time()
             elapsed = now - self._call_started_at
-            silence_timeout = max(5, getattr(self.cfg, "silence_timeout_s", 10) or 10)
             is_followup = self.lead_info.get("call_mode") == "follow_up"
+            silence_timeout = max(30, getattr(self.cfg, "silence_timeout_s", 10) or 10)
+            no_transcript_timeout = max(45, silence_timeout)
             if is_followup:
                 silence_timeout = max(45, silence_timeout)
+                no_transcript_timeout = max(75, silence_timeout + 20)
             if self._ending and self._ending_started_at and (now - self._ending_started_at) > 6:
                 print("[GPT-LIVE WATCHDOG] ending state exceeded 6s; forcing local close")
                 self._stop = True
                 await self._close_live()
                 return
-            if self.call_sid and self.outcome == "no_answer" and elapsed > silence_timeout:
-                if is_followup and not self._followup_no_answer_warned:
-                    self._followup_no_answer_warned = True
-                    await self._push_status("listening", "No response yet; keeping follow-up call open")
+            if self.call_sid and self.outcome == "no_answer" and elapsed > no_transcript_timeout:
+                recent_remote_audio = self._last_prospect_audio_at and (now - self._last_prospect_audio_at) < 12
+                recent_remote_voice = self._last_prospect_voice_at and (now - self._last_prospect_voice_at) < max(25, silence_timeout)
+                if recent_remote_audio or recent_remote_voice:
+                    if not self._no_transcript_audio_warned:
+                        self._no_transcript_audio_warned = True
+                        await self._push_status("listening", "Remote audio heard; waiting for GPT-Live transcript")
                     continue
-                if is_followup and elapsed < silence_timeout + 20:
+                if self._prospect_voice_observed and self._last_prospect_voice_at and (now - self._last_prospect_voice_at) < max(35, silence_timeout + 10):
                     continue
-                print("[GPT-LIVE WATCHDOG] no human transcript detected")
-                await self._push_status("ended", "No human detected")
-                await self._hangup("no human detected")
+                print("[GPT-LIVE WATCHDOG] no transcript after answer window")
+                await self._push_status("ended", "No transcript after answer window")
+                await self._hangup("no transcript after answer window")
                 return
             if self.call_sid and self.outcome != "no_answer" and not self._agent_turn_open:
-                idle = now - max(self._last_activity_at, self._last_input_transcript_at, self._last_output_transcript_at)
+                last_activity = max(
+                    self._last_activity_at,
+                    self._last_input_transcript_at,
+                    self._last_output_transcript_at,
+                    self._last_prospect_audio_at,
+                    self._last_prospect_voice_at,
+                )
+                idle = now - last_activity
                 if idle > silence_timeout:
                     if is_followup and not self._followup_idle_warned:
                         self._followup_idle_warned = True
@@ -310,6 +328,9 @@ class GPTLiveCallHandler:
             context += f" in {city}"
         if timezone:
             context += f". Timezone: {timezone}"
+        lead_context = self.lead_info.get("LeadContext") or {}
+        if lead_context:
+            context += f". Extra lead context JSON: {json.dumps(lead_context, ensure_ascii=False)}"
         tone = TONE_NOTES.get(getattr(self.cfg, "tone", "professional"), TONE_NOTES["professional"])
         callback = (getattr(self.cfg, "callback_number", "") or TWILIO_CALLER_ID or "the number I called from").strip()
         return (
@@ -321,6 +342,7 @@ class GPTLiveCallHandler:
             "Live voice behavior:\n"
             "- You are on a phone call. Keep replies short and natural.\n"
             "- Listen while the other person speaks; stop when interrupted.\n"
+            "- Do not end the call just because there is a pause. Wait for the other person after asking a question.\n"
             "- Answer the exact question first, then continue naturally.\n"
             "- Do not repeat a previous line or restart the call.\n"
             "- Do not pitch until a decision maker has allowed the 30-second pitch.\n"
@@ -408,6 +430,15 @@ class GPTLiveCallHandler:
             cp = start.get("customParameters", {}) or {}
             if cp:
                 existing_follow_up = self.lead_info.get("FollowUp")
+                lead_context = self.lead_info.get("LeadContext")
+                raw_lead_context = cp.get("lead_context", "")
+                if raw_lead_context:
+                    try:
+                        parsed_context = json.loads(raw_lead_context)
+                        if isinstance(parsed_context, dict):
+                            lead_context = parsed_context
+                    except Exception:
+                        pass
                 follow_up_id = cp.get("follow_up_id", "")
                 if not existing_follow_up and cp.get("call_mode") == "follow_up" and follow_up_id:
                     try:
@@ -424,6 +455,7 @@ class GPTLiveCallHandler:
                     "call_mode": cp.get("call_mode", ""),
                     "follow_up_id": follow_up_id,
                     "FollowUp": existing_follow_up,
+                    "LeadContext": lead_context,
                 }
             print(f"[GPT-LIVE STREAM START] {self.call_sid} lead={self.lead_info}")
             self._stream_started.set()
@@ -437,11 +469,16 @@ class GPTLiveCallHandler:
             raw = base64.b64decode(payload)
             self._record_prospect_frame(raw)
             self._fanout_nowait(payload, "prospect")
+            try:
+                rms = audioop.rms(audioop.ulaw2lin(raw, 2), 2)
+            except Exception:
+                rms = 0
+            if rms > 120:
+                self._last_prospect_audio_at = time.time()
+            if rms > 550:
+                self._last_prospect_voice_at = self._last_prospect_audio_at or time.time()
+                self._prospect_voice_observed = True
             if self._agent_turn_open:
-                try:
-                    rms = audioop.rms(audioop.ulaw2lin(raw, 2), 2)
-                except Exception:
-                    rms = 0
                 if rms > self._barge_vad_threshold:
                     self._prospect_loud_frames += 1
                     if self._prospect_loud_frames >= 6:
@@ -529,7 +566,7 @@ class GPTLiveCallHandler:
                 low = self._output_text.lower()
                 if "[hangup]" in low or self._is_agent_end_text(low):
                     print(f"[GPT-LIVE END PHRASE] {text[:120]}")
-                    await self._hangup("end phrase")
+                    self._hangup_after_agent_turn = True
             return
 
         if typ == "session.usage.updated":
@@ -597,6 +634,9 @@ class GPTLiveCallHandler:
             buf = buf[n:]
             if not buf and self._out_audio_queue.empty():
                 self._agent_turn_open = False
+                if self._hangup_after_agent_turn and not self._ending:
+                    self._hangup_after_agent_turn = False
+                    asyncio.create_task(self._delayed_hangup())
 
     async def _clear_twilio_output(self, reason: str, force: bool = False):
         now = time.time()
@@ -663,13 +703,14 @@ class GPTLiveCallHandler:
     async def _delayed_hangup(self):
         await asyncio.sleep(1.2)
         if not self._stop:
-            await self._hangup("delayed")
+            await self._hangup("agent finished end phrase")
 
     async def _hangup(self, reason: str = ""):
         if self._ending:
             return
         self._ending = True
         self._ending_started_at = time.time()
+        self.end_reason = reason or self.end_reason or "local hangup"
         if reason:
             print(f"[GPT-LIVE HANGUP] {reason}")
         try:
