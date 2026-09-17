@@ -91,6 +91,7 @@ class GPTLiveCallHandler:
         self.live_ws = None
         self.live_session_id = ""
         self.live_started = False
+        self._live_reconnects = 0
         self._stream_started = asyncio.Event()
         self._pending_audio: list[str] = []
         self._out_audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
@@ -197,7 +198,10 @@ class GPTLiveCallHandler:
                         self._no_transcript_audio_warned = True
                         await self._push_status("listening", "Remote audio heard; waiting for GPT-Live transcript")
                     continue
-                if self._prospect_voice_observed and self._last_prospect_voice_at and (now - self._last_prospect_voice_at) < max(35, silence_timeout + 10):
+                if self._prospect_voice_observed:
+                    if not self._no_transcript_audio_warned:
+                        self._no_transcript_audio_warned = True
+                        await self._push_status("listening", "Customer voice heard; keeping call open while waiting for GPT-Live transcript")
                     continue
                 print("[GPT-LIVE WATCHDOG] no transcript after answer window")
                 await self._push_status("ended", "No transcript after answer window")
@@ -224,6 +228,10 @@ class GPTLiveCallHandler:
                     return
             max_duration = getattr(self.cfg, "max_duration_s", 300) or 300
             if elapsed > max_duration and self.outcome not in {"conversation", "interested", "callback"}:
+                recent_customer_activity = self._last_prospect_audio_at and (now - self._last_prospect_audio_at) < 20
+                if recent_customer_activity:
+                    await self._push_status("listening", "Max duration reached but customer audio is active; not dropping call")
+                    continue
                 print("[GPT-LIVE WATCHDOG] max duration without useful conversation")
                 await self._push_status("ended", "Max duration reached")
                 await self._hangup("max duration")
@@ -385,6 +393,34 @@ class GPTLiveCallHandler:
             },
         }))
 
+    async def _reconnect_live(self, reason: str):
+        if self._stop or self._ending:
+            return False
+        self._live_reconnects += 1
+        wait_s = min(5, 0.5 * self._live_reconnects)
+        await self._push_status("connecting", f"Reconnecting GPT-Live after {reason}")
+        try:
+            await self._close_live(send_close=False)
+        except Exception:
+            pass
+        if self._out_audio_task and not self._out_audio_task.done():
+            try:
+                await asyncio.wait_for(self._out_audio_task, timeout=0.5)
+            except Exception:
+                self._out_audio_task.cancel()
+        self._out_audio_queue = asyncio.Queue()
+        self.live_ws = None
+        self.live_started = False
+        self.live_session_id = ""
+        await asyncio.sleep(wait_s)
+        try:
+            await self._connect_live()
+            return True
+        except Exception as e:
+            print(f"[GPT-LIVE RECONNECT] failed after {reason}: {e}")
+            await self._push_status("listening", "GPT-Live reconnect failed; keeping phone call open")
+            return False
+
     async def _twilio_loop(self):
         try:
             async for raw in self.twilio_ws.iter_text():
@@ -399,21 +435,25 @@ class GPTLiveCallHandler:
             await self._close_live()
 
     async def _live_loop(self):
-        try:
-            async for raw in self.live_ws:
-                if self._stop:
+        while not self._stop:
+            try:
+                async for raw in self.live_ws:
+                    if self._stop:
+                        break
+                    try:
+                        event = json.loads(raw)
+                    except Exception:
+                        continue
+                    await self._on_live_event(event)
+            except Exception as e:
+                if self._stop or self._ending:
                     break
-                try:
-                    event = json.loads(raw)
-                except Exception:
-                    continue
-                await self._on_live_event(event)
-        except Exception as e:
-            if not self._stop:
                 print(f"[GPT-LIVE] loop error: {e}")
-                await self._push_status("ended", f"GPT-Live error: {e}")
-        finally:
-            self._stop = True
+                await self._reconnect_live("loop error")
+                continue
+            if self._stop or self._ending:
+                break
+            await self._reconnect_live("session closed")
 
     async def _on_twilio_event(self, data: dict):
         evt = data.get("event")
@@ -581,14 +621,16 @@ class GPTLiveCallHandler:
             self._live_usage_seconds = float(usage.get("seconds") or self._live_usage_seconds or 0.0)
             if self._live_usage_seconds:
                 self._live_usage_source = "openai_session_closed"
-            self._stop = True
+            if self._ending:
+                self._stop = True
             return
 
         if typ == "error":
             err = event.get("error", {}) or {}
             msg = err.get("message") or json.dumps(err)
             print(f"[GPT-LIVE ERROR] {msg}")
-            await self._push_status("ended", f"GPT-Live error: {msg}")
+            await self._push_status("connecting", f"GPT-Live error, reconnecting: {msg}")
+            await self._close_live(send_close=False)
 
     async def _pump_twilio_audio(self):
         sent_frames = 0
@@ -739,16 +781,17 @@ class GPTLiveCallHandler:
         except Exception:
             pass
 
-    async def _close_live(self):
+    async def _close_live(self, send_close: bool = True):
         try:
             await self._out_audio_queue.put(None)
         except Exception:
             pass
         if self.live_ws:
-            try:
-                await self.live_ws.send(json.dumps({"type": "session.close"}))
-            except Exception:
-                pass
+            if send_close:
+                try:
+                    await self.live_ws.send(json.dumps({"type": "session.close"}))
+                except Exception:
+                    pass
             try:
                 await self.live_ws.close()
             except Exception:

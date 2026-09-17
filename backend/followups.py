@@ -38,11 +38,31 @@ def _save_store(data: dict) -> None:
     _FOLLOWUPS_FILE.write_text(json.dumps(data, indent=2))
 
 
-def _clean_text(value, max_len: int = _MAX_TEXT):
+def _purge_cancelled(data: dict) -> tuple[dict, bool]:
+    items = data.get("follow_ups", []) if isinstance(data, dict) else []
+    kept = [f for f in items if str(f.get("status") or "").lower() != "cancelled"]
+    changed = len(kept) != len(items)
+    data["follow_ups"] = kept
+    return data, changed
+
+
+def _clean_text(value, max_len: int | None = _MAX_TEXT):
     if value is None:
         return None
     text = re.sub(r"\s+", " ", str(value)).strip()
-    return text[:max_len] if text else None
+    if not text:
+        return None
+    return text[:max_len] if max_len else text
+
+
+def _clean_details(value):
+    """Details are the long-running source of truth; never truncate them."""
+    if value is None:
+        return None
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text or None
 
 
 def _clean_email(value):
@@ -69,13 +89,13 @@ def _local_now(item: dict) -> str | None:
 
 
 def _append_details(existing: str | None, addition: str | None, local_time: str | None = None) -> str | None:
-    addition = _clean_text(addition, 1500)
+    addition = _clean_details(addition)
     if not addition:
-        return _clean_text(existing, 1500)
+        return _clean_details(existing)
     prefix = f"[{local_time}] " if local_time else ""
-    base = _clean_text(existing, 1500)
-    merged = f"{base} {prefix}{addition}" if base else f"{prefix}{addition}"
-    return _clean_text(merged, 2500)
+    base = _clean_details(existing)
+    merged = f"{base}\n{prefix}{addition}" if base else f"{prefix}{addition}"
+    return _clean_details(merged)
 
 
 def _bool_or_none(value):
@@ -120,18 +140,45 @@ def _stable_id(previous_call_id: str, phone: str = "") -> str:
 
 def list_follow_ups(status: str = "") -> list[dict]:
     data = _load_store()
+    data, changed = _purge_cancelled(data)
+    if changed:
+        _save_store(data)
     items = data.get("follow_ups", [])
     if status:
         wanted = status.strip().lower()
+        if wanted == "cancelled":
+            return []
         items = [f for f in items if str(f.get("status", "")).lower() == wanted]
     return sorted(items, key=lambda f: f.get("updated_at") or f.get("created_at") or "", reverse=True)
 
 
 def get_follow_up(follow_up_id: str) -> dict | None:
-    for item in _load_store().get("follow_ups", []):
+    data = _load_store()
+    data, changed = _purge_cancelled(data)
+    if changed:
+        _save_store(data)
+    for item in data.get("follow_ups", []):
         if item.get("id") == follow_up_id:
             return item
     return None
+
+
+def delete_follow_up(follow_up_id: str) -> dict | None:
+    if not follow_up_id:
+        return None
+    data = _load_store()
+    items = data.get("follow_ups", [])
+    deleted = None
+    kept = []
+    for item in items:
+        if item.get("id") == follow_up_id:
+            deleted = item
+            continue
+        kept.append(item)
+    if deleted is not None:
+        data["follow_ups"] = kept
+        _save_store(data)
+    return deleted
 
 
 def find_by_previous_call_id(previous_call_id: str) -> dict | None:
@@ -192,7 +239,7 @@ def _normalise_payload(payload: dict, call: dict, email_delivery_status: str = "
         "follow_up_goal": _clean_text(payload.get("follow_up_goal")),
         "agent_summary": _clean_text(payload.get("agent_summary") or payload.get("context_summary")),
         "context_summary": _clean_text(payload.get("context_summary")),
-        "details": _clean_text(payload.get("details"), 1500),
+        "details": _clean_details(payload.get("details")),
         "reason": _clean_text(payload.get("reason")),
         "scheduled_for": _clean_text(payload.get("scheduled_for"), 80),
     }
@@ -250,6 +297,12 @@ def create_or_update_from_analysis(call: dict, decision: dict, email_delivery_st
 
 
 def update_follow_up(follow_up_id: str, updates: dict) -> dict | None:
+    if str((updates or {}).get("status") or "").lower() == "cancelled":
+        deleted = delete_follow_up(follow_up_id)
+        if deleted is not None:
+            deleted["status"] = "cancelled"
+        return deleted
+
     data = _load_store()
     now = _now()
     allowed = {
@@ -291,6 +344,8 @@ def update_follow_up(follow_up_id: str, updates: dict) -> dict | None:
                 value = [v for v in value if isinstance(v, dict)][-100:]
             elif key == "email_events":
                 value = [v for v in value if isinstance(v, dict)][-50:]
+            elif key == "details":
+                value = _clean_details(value)
             elif isinstance(value, str) or value is None:
                 value = _clean_text(value)
             item[key] = value

@@ -559,7 +559,18 @@ def _extract_contact_candidates(text: str) -> dict:
 
 
 def _sanitize_analyst_answer(text: str) -> str:
-    return re.sub(r"[—–]", "-", str(text or "")).strip()
+    text = re.sub(r"[—–]", "-", str(text or ""))
+    text = re.sub(
+        r"(?i)paste this into follow-ups\s*>\s*update json\.?",
+        "Use the Apply to Follow-Ups button shown under the JSON.",
+        text,
+    )
+    text = re.sub(
+        r"(?i)the json is ready to apply using the [^.]*\. ?",
+        "The follow-up JSON is ready.",
+        text,
+    )
+    return text.strip()
 
 
 def _email_oauth_configured() -> bool:
@@ -862,6 +873,268 @@ def _recording_catalog(days: int = 365, q: str = "") -> list[dict]:
     return out
 
 
+def _normalise_analytics_days(value, default: int = 30, max_days: int = 3650) -> int:
+    try:
+        days = int(value or default)
+    except Exception:
+        days = default
+    return max(1, min(max_days, days))
+
+
+def _recording_ext(recording: str) -> str:
+    ext = Path(str(recording or "")).suffix.lower().lstrip(".")
+    return ext or "missing"
+
+
+def _increment_count(target: dict, key: str, amount: int = 1) -> None:
+    target[key] = int(target.get(key) or 0) + amount
+
+
+def _directory_extension_counts(directory: Path, suffixes: set[str] | None = None) -> dict:
+    counts = {"total": 0, "by_extension": {}, "available": directory.exists()}
+    if not directory.exists():
+        return counts
+    for path in directory.iterdir():
+        if not path.is_file():
+            continue
+        ext = path.suffix.lower().lstrip(".") or "missing"
+        if suffixes and ext not in suffixes:
+            continue
+        counts["total"] += 1
+        _increment_count(counts["by_extension"], ext)
+    return counts
+
+
+def _follow_up_store_counts() -> dict:
+    try:
+        from followups import list_follow_ups
+        items = list_follow_ups()
+    except Exception as e:
+        return {"total": 0, "by_status": {}, "error": str(e)}
+    by_status = {}
+    for item in items:
+        _increment_count(by_status, str(item.get("status") or "unknown").lower())
+    return {"total": len(items), "by_status": by_status}
+
+
+def _analytics_data_snapshot(days: int = 30) -> dict:
+    from call_history import load_calls
+    days = _normalise_analytics_days(days)
+    calls = load_calls(days)
+    recording_counts = {"wav": 0, "txt": 0, "mp3": 0, "m4a": 0, "missing": 0, "other": 0}
+    outcome_counts = {}
+    linked_transcript_calls = 0
+    linked_transcript_recordings = set()
+    unique_recordings = set()
+    call_sids = []
+
+    for call in calls:
+        recording = str(call.get("recording") or "")
+        ext = _recording_ext(recording)
+        _increment_count(recording_counts, ext if ext in recording_counts else "other")
+        _increment_count(outcome_counts, str(call.get("outcome") or "unknown").lower())
+        if recording:
+            unique_recordings.add(recording)
+            if _transcript_cache_path(recording).exists():
+                linked_transcript_calls += 1
+                linked_transcript_recordings.add(recording)
+        if call.get("call_sid"):
+            call_sids.append(str(call.get("call_sid")))
+
+    unique_call_sids = set(call_sids)
+    recording_inventory = _directory_extension_counts(_REC_DIR, {"wav", "txt", "mp3", "m4a"})
+    transcript_inventory = _directory_extension_counts(_TRANSCRIPT_DIR, {"json"})
+    follow_ups = _follow_up_store_counts()
+    total_calls = len(calls)
+    timestamps = [float(c.get("ts") or 0) for c in calls if c.get("ts")]
+    oldest_ts = min(timestamps) if timestamps else 0
+    latest_ts = max(timestamps) if timestamps else 0
+
+    return {
+        "source": "backend_counter",
+        "days": days,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "range": {
+            "oldest_call_ts": oldest_ts,
+            "oldest_call_date": datetime.fromtimestamp(oldest_ts).isoformat(timespec="seconds") if oldest_ts else None,
+            "latest_call_ts": latest_ts,
+            "latest_call_date": datetime.fromtimestamp(latest_ts).isoformat(timespec="seconds") if latest_ts else None,
+        },
+        "counts": {
+            "call_records": total_calls,
+            "unique_call_sids": len(unique_call_sids),
+            "duplicate_call_sid_records": max(0, len(call_sids) - len(unique_call_sids)),
+            "recordings": {
+                "total_linked_to_call_records": total_calls - recording_counts.get("missing", 0),
+                "unique_linked_recordings": len(unique_recordings),
+                "by_call_record_extension": recording_counts,
+            },
+            "transcripts": {
+                "linked_call_records": linked_transcript_calls,
+                "unique_linked_recordings": len(linked_transcript_recordings),
+                "cache_files": transcript_inventory["total"],
+            },
+            "follow_ups": follow_ups,
+            "outcomes": outcome_counts,
+        },
+        "methods": {
+            "call_history_entries": {
+                "description": "Count parsed call_history.jsonl entries inside the selected day range.",
+                "count": total_calls,
+            },
+            "recording_field_by_extension": {
+                "description": "Count each call record's recording field by file extension.",
+                "counts": recording_counts,
+            },
+            "linked_transcript_cache": {
+                "description": "For each call record recording, check whether its expected transcript cache JSON exists.",
+                "linked_call_records": linked_transcript_calls,
+                "unique_linked_recordings": len(linked_transcript_recordings),
+            },
+            "recording_directory_inventory": {
+                "description": "Count actual recording files currently present on disk, independent of call-history date filtering.",
+                **recording_inventory,
+            },
+            "transcript_directory_inventory": {
+                "description": "Count actual transcript cache JSON files currently present on disk, including orphaned cache files.",
+                **transcript_inventory,
+            },
+            "follow_up_store": {
+                "description": "Count current follow-up tasks from the follow-up store.",
+                **follow_ups,
+            },
+        },
+    }
+
+
+def _is_analytics_count_question(question: str) -> bool:
+    text = str(question or "").strip()
+    q = text.lower()
+    explicit_request_terms = (
+        "how many", "please count", "count the", "count entries", "count records",
+        "provide a breakdown", "breakdown of", "show me", "tell me", "report",
+        "what are the counts", "what are the totals", "get_data", "updated counts",
+        "latest counts", "current counts", "new totals", "total calls", "total call records",
+    )
+    if not any(term in q for term in explicit_request_terms):
+        return False
+    future_context_terms = (
+        "that's the current data", "that is the current data", "i'll add more",
+        "i will add more", "will add more", "add more that's latest", "add more thats latest",
+        "latest will be analyzed", "analyzed properly later", "analyse properly later",
+    )
+    if any(term in q for term in future_context_terms) and not any(term in q for term in ("updated counts", "latest counts", "current counts", "get_data")):
+        return False
+    if any(term in q for term in ("updated counts", "latest counts", "current counts", "get_data")):
+        return True
+    inventory_terms = (
+        "call record", "call records", "total calls", "calls total", "current call context", "audio", "audios",
+        "recording", "recordings", "wav", "txt", "transcript", "transcripts",
+        "follow-up", "follow up", "followups", "context", "used",
+    )
+    return any(term in q for term in inventory_terms)
+
+
+def _analytics_count_answer(snapshot: dict) -> str:
+    counts = snapshot.get("counts", {})
+    date_range = snapshot.get("range", {})
+    recordings = counts.get("recordings", {}).get("by_call_record_extension", {})
+    transcripts = counts.get("transcripts", {})
+    follow_ups = counts.get("follow_ups", {})
+    return (
+        "**Verified Backend Counts**\n"
+        f"For the selected `{snapshot.get('days')}` day range, these numbers come from the backend counter, not from model-estimated prompt context.\n\n"
+        f"Oldest call in range: `{date_range.get('oldest_call_date') or 'none'}`. Latest call in range: `{date_range.get('latest_call_date') or 'none'}`.\n\n"
+        "| Metric | Count |\n"
+        "|---|---:|\n"
+        f"| Total call records | {counts.get('call_records', 0)} |\n"
+        f"| Unique call SIDs | {counts.get('unique_call_sids', 0)} |\n"
+        f"| Duplicate call SID records | {counts.get('duplicate_call_sid_records', 0)} |\n"
+        f"| Calls with `.wav` recording | {recordings.get('wav', 0)} |\n"
+        f"| Calls with `.txt` recording | {recordings.get('txt', 0)} |\n"
+        f"| Calls with other recording types | {recordings.get('mp3', 0) + recordings.get('m4a', 0) + recordings.get('other', 0)} |\n"
+        f"| Calls missing recording field | {recordings.get('missing', 0)} |\n"
+        f"| Call records with linked transcript cache | {transcripts.get('linked_call_records', 0)} |\n"
+        f"| Unique recordings with linked transcript cache | {transcripts.get('unique_linked_recordings', 0)} |\n"
+        f"| Transcript cache files on disk | {transcripts.get('cache_files', 0)} |\n"
+        f"| Current follow-ups | {follow_ups.get('total', 0)} |\n\n"
+        "Counting methods available to the Analyst: call-history entry count, recording-field extension count, linked transcript cache check, recording directory inventory, transcript directory inventory, and follow-up store count."
+    )
+
+
+def _is_future_data_readiness_message(question: str) -> bool:
+    q = str(question or "").lower()
+    return any(term in q for term in (
+        "i'll add more", "i will add more", "will add more", "add more that's latest",
+        "add more thats latest", "latest will be analyzed", "analyzed properly later",
+        "analyse properly later", "make sure the latest",
+    ))
+
+
+def _future_data_readiness_answer(snapshot: dict) -> str:
+    counts = snapshot.get("counts", {})
+    date_range = snapshot.get("range", {})
+    transcripts = counts.get("transcripts", {})
+    return (
+        "**Ready For Latest Data**\n"
+        "When new calls are appended to call history and new transcript caches are created, the Analyst will use the backend counter again instead of reusing this chat's old numbers.\n\n"
+        f"Current backend baseline for the selected `{snapshot.get('days')}` day range: `{counts.get('call_records', 0)}` call records, `{transcripts.get('linked_call_records', 0)}` linked transcript call records.\n"
+        f"Current latest call seen by the backend: `{date_range.get('latest_call_date') or 'none'}`.\n\n"
+        "After adding the latest batch, ask for `updated counts` or `latest counts` and the backend will recalculate from storage at request time."
+    )
+
+
+def _analyst_data_tools() -> list[dict]:
+    return [{
+        "type": "function",
+        "function": {
+            "name": "GET_DATA",
+            "description": "Return exact backend analytics counts for calls, recordings, transcripts, outcomes, and follow-ups. Use this for any count, total, breakdown, or statistics question.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dataset": {
+                        "type": "string",
+                        "enum": ["analytics_counts"],
+                        "description": "The dataset to retrieve. Use analytics_counts for call, recording, transcript, and follow-up numbers.",
+                    }
+                },
+                "required": ["dataset"],
+                "additionalProperties": False,
+            },
+        },
+    }]
+
+
+def _run_analyst_data_tool(name: str, arguments: str, context: dict) -> dict:
+    if name != "GET_DATA":
+        return {"error": f"Unsupported tool: {name}"}
+    try:
+        args = json.loads(arguments or "{}")
+    except Exception:
+        args = {}
+    dataset = args.get("dataset") or "analytics_counts"
+    if dataset != "analytics_counts":
+        return {"error": f"Unsupported dataset: {dataset}"}
+    return context.get("data_snapshot") or _analytics_data_snapshot(context.get("days") or 30)
+
+
+def _analyst_context_metadata(context: dict, get_data_used: bool = False) -> dict:
+    snapshot = context.get("data_snapshot") or {}
+    counts = snapshot.get("counts") or {}
+    transcripts = counts.get("transcripts") or {}
+    follow_ups = counts.get("follow_ups") or {}
+    return {
+        "calls": counts.get("call_records", len(context.get("calls") or [])),
+        "transcripts": transcripts.get("linked_call_records", len(context.get("transcripts") or [])),
+        "attachments": len(context.get("attachments") or []),
+        "follow_ups": follow_ups.get("total", len(context.get("follow_up_action_plan") or [])),
+        "data_source": snapshot.get("source") or "context",
+        "get_data_used": get_data_used,
+        "verified_counts": counts,
+    }
+
+
 def _call_matches_question(call: dict, question: str) -> bool:
     q = question.lower()
     business = str(call.get("business") or "").lower()
@@ -880,9 +1153,50 @@ def _is_broad_analytics_question(question: str) -> bool:
     ))
 
 
+def _followup_action_plan_context(limit: int = 25) -> list[dict]:
+    try:
+        from followups import list_follow_ups
+        items = list_follow_ups()
+    except Exception:
+        return []
+    priority_rank = {"hot": 0, "warm": 1, "low": 2}
+    status_rank = {"calling": 0, "pending": 1, "scheduled": 2, "failed": 3, "attempted": 4, "completed": 5, "cancelled": 6}
+    items = sorted(
+        items,
+        key=lambda f: (
+            priority_rank.get(str(f.get("priority") or "warm").lower(), 1),
+            status_rank.get(str(f.get("status") or "pending").lower(), 9),
+            str(f.get("updated_at") or ""),
+        ),
+    )
+    plan = []
+    for f in items[:limit]:
+        plan.append({
+            "id": f.get("id"),
+            "business": f.get("business"),
+            "phone": f.get("phone"),
+            "email": f.get("email"),
+            "priority": f.get("priority"),
+            "status": f.get("status"),
+            "attempts": f.get("attempts"),
+            "next_action": f.get("next_action"),
+            "follow_up_goal": f.get("follow_up_goal"),
+            "reason": f.get("reason"),
+            "details": f.get("details"),
+            "email_delivery_status": f.get("email_delivery_status"),
+            "email_received": f.get("email_received"),
+            "prospect_reported_not_received": f.get("prospect_reported_not_received"),
+            "email_status_details": f.get("email_status_details"),
+            "last_attempt_at": f.get("last_attempt_at"),
+            "result": f.get("result"),
+        })
+    return plan
+
+
 async def _build_analyst_context(question: str, days: int = 30, attachments: list[dict] | None = None) -> dict:
     from call_history import load_calls
     cfg = load_agent_config()
+    days = _normalise_analytics_days(days)
     calls = sorted(load_calls(days), key=lambda c: c.get("ts", 0), reverse=True)
     recent = calls
     matched = [c for c in recent if _call_matches_question(c, question)]
@@ -967,14 +1281,35 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
         "current_agent_system_prompt": getattr(cfg, "system_prompt", ""),
         "current_first_message": getattr(cfg, "first_message", ""),
         "current_price": "$350 setup and $100/month unless your system prompt says otherwise",
+        "data_snapshot": _analytics_data_snapshot(days),
         "calls": summary_rows,
         "attachments": attachments,
         "transcripts": transcripts,
         "auto_transcribed": auto_transcribed,
+        "follow_up_action_plan": _followup_action_plan_context(),
     }
 
 
 async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict:
+    days = _normalise_analytics_days(days)
+    if _is_analytics_count_question(question):
+        snapshot = _analytics_data_snapshot(days)
+        context_meta = _analyst_context_metadata({
+            "days": days,
+            "data_snapshot": snapshot,
+            "attachments": chat.get("attachments", []),
+        }, get_data_used=True)
+        return {"answer": _analytics_count_answer(snapshot), "context": context_meta}
+
+    if _is_future_data_readiness_message(question):
+        snapshot = _analytics_data_snapshot(days)
+        context_meta = _analyst_context_metadata({
+            "days": days,
+            "data_snapshot": snapshot,
+            "attachments": chat.get("attachments", []),
+        }, get_data_used=True)
+        return {"answer": _future_data_readiness_answer(snapshot), "context": context_meta}
+
     if not OPENAI_API_KEY:
         raise HTTPException(500, "OPENAI_API_KEY not set")
     context = await _build_analyst_context(question, days, chat.get("attachments", []))
@@ -982,7 +1317,11 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
     system = (
         "You are Lynkflow's internal call analyst. You know Lynkflow's offer and you have access to call history and available transcripts. "
         "Attached recordings are selected by the operator and are the highest-priority context. "
-        "Answer the operator's question directly. If they ask about a specific business, focus on that business. "
+        "For any count, total, percentage, breakdown, stats, records, recordings, transcript, or follow-up quantity question, call the GET_DATA tool and use its backend_counter result as the source of truth. Do not count the calls or transcripts arrays manually and do not estimate. "
+        "The context also includes follow_up_action_plan, which is the current execution ledger: what follow-ups exist, what was attempted, email state, and next priority. Use it when the operator asks what to do next or how to prevent the follow-up flow from failing. "
+        "Answer the operator's question directly. Use clean Markdown headings, numbered lists, and bullets. Do not show raw Markdown markers as decoration. Do not wrap normal explanations in code fences. "
+        "If you write a numbered section title, use format like '1. **Title:** explanation' so it renders cleanly. "
+        "If they ask about a specific business, focus on that business. "
         "If they ask which calls provided information, use a compact markdown table with business, info found, evidence, and next action when that is clearer than prose. "
         "If asked to draft an email/message, create a polished copy-ready HTML email, not plain text unless the operator specifically asks for plain text. "
         "Separate the output into two sections named exactly 'Email subject' and 'HTML body'. Put the subject in a fenced code block tagged subject and the email body in a fenced code block tagged html. "
@@ -999,6 +1338,9 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
         "The JSON must include previous_call_id using the call_sid from the context, plus business, phone, priority, reason, previous_contact_role, previous_contact_name, email, pain_point, current_solution, interest_signal, previous_action, follow_up_goal, agent_summary, context_summary, details, and scheduled_for. Use null for unknown fields. "
         "For every interested lead action, include a details field. Details must be clear, concise, and factual: who was actually spoken to including role and name if known or 'name not provided', what was discussed, pain points/current process/questions, information provided such as email or callback time, and any test-call, non-staff, unusual event, or identity-confusion clarification. Do not invent missing information. "
         "Do not emit action blocks for summaries, candidate lists, email drafts, or general recommendations. Never emit unapproved action names. "
+        "If asked to update an existing follow-up, action plan, next_action, details, email status, attempts, or result, do not tell the operator to edit files, paste manually, click a button, or manually replace records. Return one complete fenced json object with id when known and all fields that should change. Do not narrate UI mechanics. Do not imply that you applied it unless an API/tool result proves it. "
+        "If asked to update, improve, rewrite, or create a system prompt, return a complete replacement prompt, not a patch, not fragments, and not only the changed sections. Use this exact structure: short explanation first, then a section named 'Complete system prompt', then one fenced code block tagged system-prompt containing the full prompt from top to bottom. The code block must include all roles, objectives, context rules, action rules, communication rules, email rules, end-call rules, and hard constraints needed to run safely. "
+        "For follow-up agent prompt updates, include these sections inside the system-prompt block: ROLE, SOURCE OF TRUTH, OBJECTIVE, EXECUTION PRIORITY, OPENING RULES, COMMUNICATION STYLE, EMAIL HANDLING, ACTION COLLECTION, ENDING RULES, HARD RULES. "
         "Do not use em dashes or long dashes. Use commas, periods, colons, or simple hyphens only."
     )
     messages = [{"role": "system", "content": system}]
@@ -1008,23 +1350,59 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
         "role": "user",
         "content": f"Call context JSON:\n{json.dumps(context, ensure_ascii=False)}\n\nQuestion:\n{question}",
     })
+    get_data_used = False
     async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "gpt-4.1", "temperature": 0.2, "messages": messages},
+            json={"model": "gpt-4.1", "temperature": 0.2, "messages": messages, "tools": _analyst_data_tools(), "tool_choice": "auto"},
         )
+        if resp.status_code != 200:
+            raise HTTPException(502, f"Analyst failed: {resp.text}")
+        message = resp.json()["choices"][0]["message"]
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": message.get("content") or "",
+                "tool_calls": tool_calls,
+            })
+            for tool_call in tool_calls:
+                fn = tool_call.get("function") or {}
+                result = _run_analyst_data_tool(fn.get("name") or "", fn.get("arguments") or "{}", context)
+                if fn.get("name") == "GET_DATA":
+                    get_data_used = True
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.get("id"),
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "gpt-4.1", "temperature": 0.2, "messages": messages},
+            )
+        elif re.search(r"\bGET_DATA\b", message.get("content") or ""):
+            get_data_used = True
+            messages.append({"role": "assistant", "content": message.get("content") or ""})
+            messages.append({
+                "role": "user",
+                "content": "Backend GET_DATA result:\n"
+                + json.dumps(context.get("data_snapshot") or _analytics_data_snapshot(days), ensure_ascii=False)
+                + "\n\nAnswer the original question using only this backend_counter data for numeric counts.",
+            })
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "gpt-4.1", "temperature": 0.2, "messages": messages},
+            )
     if resp.status_code != 200:
         raise HTTPException(502, f"Analyst failed: {resp.text}")
     answer = resp.json()["choices"][0]["message"].get("content", "")
     answer = _sanitize_analyst_answer(answer)
     return {
         "answer": answer,
-        "context": {
-            "calls": len(context["calls"]),
-            "transcripts": len(context["transcripts"]),
-            "attachments": len(context.get("attachments", [])),
-        },
+        "context": _analyst_context_metadata(context, get_data_used=get_data_used),
     }
 
 
@@ -1043,6 +1421,48 @@ def _extract_json_object(text: str) -> dict:
         except Exception:
             return {}
     return {}
+
+
+def _extract_follow_up_update_json(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+    if fenced:
+        try:
+            data = json.loads(fenced.group(1).strip())
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+    return _extract_json_object(text)
+
+
+def _match_follow_up_for_update(data: dict) -> str:
+    follow_up_id = str(data.get("id") or data.get("follow_up_id") or "").strip()
+    if follow_up_id:
+        return follow_up_id
+
+    try:
+        from followups import list_follow_ups
+        items = list_follow_ups()
+    except Exception:
+        items = []
+    phone = _phone_key(str(data.get("phone") or ""))
+    email = str(data.get("email") or "").strip().lower()
+    business = re.sub(r"\s+", " ", str(data.get("business") or "").strip().lower())
+    for item in items:
+        item_phone = _phone_key(str(item.get("phone") or ""))
+        item_email = str(item.get("email") or "").strip().lower()
+        item_business = re.sub(r"\s+", " ", str(item.get("business") or "").strip().lower())
+        if phone and item_phone and phone == item_phone:
+            return item.get("id", "")
+        if email and item_email and email == item_email:
+            return item.get("id", "")
+        if business and item_business and business == item_business:
+            return item.get("id", "")
+    return ""
 
 
 def _parse_analyst_action_blocks(text: str) -> tuple[str, list[dict]]:
@@ -3436,6 +3856,11 @@ async def get_analytics(days: int = 30):
     return JSONResponse(summarise(days))
 
 
+@app.get("/api/analytics/counts")
+async def get_analytics_counts(days: int = 30):
+    return JSONResponse(_analytics_data_snapshot(days))
+
+
 @app.post("/api/analytics/transcribe")
 async def analytics_transcribe(request: Request):
     data = await request.json()
@@ -3486,6 +3911,34 @@ async def followups_events():
     )
 
 
+@app.post("/api/follow-ups/apply-json")
+async def followups_apply_json(request: Request):
+    from followups import update_follow_up
+    payload = await request.json()
+    data = _extract_follow_up_update_json(payload.get("json") or payload.get("text") or payload.get("payload") or payload)
+    if not data:
+        raise HTTPException(400, "valid follow-up JSON required")
+    selected_id = str(payload.get("follow_up_id") or payload.get("selected_id") or "").strip()
+    if selected_id and not data.get("id") and not data.get("follow_up_id"):
+        data["id"] = selected_id
+
+    follow_up_id = _match_follow_up_for_update(data)
+    if not follow_up_id:
+        raise HTTPException(400, "follow-up id required, or include matching phone, email, or business")
+
+    updates = {k: v for k, v in data.items() if k not in {"id", "follow_up_id"}}
+    if not updates:
+        raise HTTPException(400, "no update fields found")
+    item = update_follow_up(follow_up_id, updates)
+    if not item:
+        raise HTTPException(404, "follow-up not found")
+    if str(item.get("status") or "").lower() == "cancelled":
+        await _followup_broadcast({"type": "follow_up_deleted", "follow_up_id": follow_up_id, "follow_up": item, "message": "Follow-up deleted"})
+        return JSONResponse({"success": True, "deleted": True, "follow_up_id": follow_up_id})
+    await _followup_broadcast({"type": "follow_up_updated", "follow_up": item, "message": "Follow-up JSON applied"})
+    return JSONResponse({"success": True, "follow_up": item})
+
+
 @app.get("/api/follow-ups/{follow_up_id}")
 async def followups_get(follow_up_id: str):
     from followups import get_follow_up
@@ -3510,12 +3963,12 @@ async def followups_patch(follow_up_id: str, request: Request):
 
 @app.post("/api/follow-ups/{follow_up_id}/cancel")
 async def followups_cancel(follow_up_id: str):
-    from followups import update_follow_up
-    item = update_follow_up(follow_up_id, {"status": "cancelled"})
+    from followups import delete_follow_up
+    item = delete_follow_up(follow_up_id)
     if not item:
         raise HTTPException(404, "follow-up not found")
-    await _followup_broadcast({"type": "follow_up_updated", "follow_up": item, "message": "Follow-up cancelled"})
-    return JSONResponse({"success": True, "follow_up": item})
+    await _followup_broadcast({"type": "follow_up_deleted", "follow_up_id": follow_up_id, "follow_up": item, "message": "Follow-up deleted"})
+    return JSONResponse({"success": True, "deleted": True, "follow_up_id": follow_up_id})
 
 
 @app.post("/api/follow-ups/{follow_up_id}/call")
@@ -3859,7 +4312,7 @@ async def analyst_message(chat_id: str, request: Request):
     question = str(payload.get("message") or "").strip()
     if not question:
         raise HTTPException(400, "message required")
-    days = max(1, min(365, int(payload.get("days") or 30)))
+    days = _normalise_analytics_days(payload.get("days") or 30)
     data = _load_analyst_chats()
     chat = _find_analyst_chat(data, chat_id)
     now = datetime.now().isoformat(timespec="seconds")

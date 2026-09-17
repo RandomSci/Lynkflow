@@ -4,13 +4,18 @@ Stored as newline-delimited JSON at call_history.jsonl next to this file.
 """
 
 import json
+import os
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import median
 
 _HISTORY_FILE = Path(__file__).parent / "call_history.jsonl"
-_MAX_RECORDS = 5000
+try:
+    _MAX_RECORDS = int(os.getenv("CALL_HISTORY_MAX_RECORDS", "1000000"))
+except ValueError:
+    _MAX_RECORDS = 1000000
 
 
 def record_call(entry: dict) -> None:
@@ -27,7 +32,7 @@ def record_call(entry: dict) -> None:
     # Trim occasionally
     try:
         lines = _HISTORY_FILE.read_text().splitlines()
-        if len(lines) > _MAX_RECORDS:
+        if _MAX_RECORDS > 0 and len(lines) > _MAX_RECORDS:
             _HISTORY_FILE.write_text("\n".join(lines[-_MAX_RECORDS:]) + "\n")
     except Exception:
         pass
@@ -100,7 +105,9 @@ def update_recording_file(call_sid: str, recording: str) -> bool:
 
 def update_call_details(call_sid: str, details: str) -> bool:
     """Patch a stored call with analyst details for future follow-up context."""
-    details = " ".join(str(details or "").split()).strip()
+    details = str(details or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    details = re.sub(r"[ \t]+", " ", details)
+    details = re.sub(r"\n{4,}", "\n\n\n", details)
     if not call_sid or not details or not _HISTORY_FILE.exists():
         return False
     try:
@@ -116,7 +123,7 @@ def update_call_details(call_sid: str, details: str) -> bool:
                 out.append(line)
                 continue
             if entry.get("call_sid") == call_sid:
-                entry["details"] = details[:1500]
+                entry["details"] = details
                 changed = True
             out.append(json.dumps(entry))
         if changed:

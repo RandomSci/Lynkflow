@@ -849,9 +849,12 @@ function setAgentIndicator(state) {
 }
 
 function escapeHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function getStoredAutoDialConcurrency() {
@@ -1223,7 +1226,7 @@ async function loadFollowUpsPage() {
   const area = document.getElementById('contentArea');
   if (!area) return;
   area.innerHTML = `
-    <div class="an-header">
+    <div class="an-header followup-page-head">
       <div>
         <div class="an-eyebrow">Call Intelligence</div>
         <h1 class="an-title">Follow-Ups</h1>
@@ -1561,7 +1564,7 @@ function renderFollowUpCard(f) {
       ${expanded ? `
         <div class="followup-details">
           ${details.map(([label, value]) => `
-            <div class="followup-detail">
+            <div class="followup-detail ${label === 'Details' ? 'followup-detail--long' : ''}">
               <span>${escapeHtml(label)}</span>
               <p>${escapeHtml(value)}</p>
             </div>
@@ -1813,7 +1816,7 @@ function renderFollowUpLiveLine(line) {
 }
 
 async function cancelFollowUp(id) {
-  if (!id || !confirm('Cancel this follow-up?')) return;
+  if (!id || !confirm('Delete this follow-up?')) return;
   try {
     const res = await fetch(`/api/follow-ups/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
     const data = await res.json();
@@ -2604,19 +2607,112 @@ function renderAnalystMessage(m, idx, messages = []) {
     ? `<div class="analyst-msg-actions"><button class="analyst-copy-btn" data-copy-message="${idx}">Copy answer</button></div>`
     : '';
   const context = m.context
-    ? `<div class="analyst-msg-context">Used ${m.context.calls || 0} calls / ${m.context.transcripts || 0} transcripts${m.context.attachments ? ' / ' + m.context.attachments + ' attached audio' : ''}</div>`
+    ? `<div class="analyst-msg-context">Used ${m.context.calls || 0} calls / ${m.context.transcripts || 0} transcripts${m.context.attachments ? ' / ' + m.context.attachments + ' attached audio' : ''}${m.context.follow_ups ? ' / ' + m.context.follow_ups + ' follow-ups' : ''}</div>`
     : '';
   const priorQuestion = messages[idx - 1]?.role === 'user' ? messages[idx - 1]?.content || '' : '';
+  const systemPromptPanel = role === 'assistant' ? renderSystemPromptPanel(m.content || '', priorQuestion) : '';
+  const displayContent = systemPromptPanel ? stripSystemPromptBlock(m.content || '') : (m.content || '');
   const emailPanel = role === 'assistant' ? renderPreparedEmailPanel(m.content || '', priorQuestion) : '';
   return `
     <div class="analyst-msg analyst-msg--${role}" data-message-index="${idx}">
       <div class="analyst-msg-role">${label}</div>
       ${copyAction}
-      <div class="analyst-msg-text markdown-body">${renderAnalystMarkdown(m.content || '')}</div>
+      <div class="analyst-msg-text markdown-body">${renderAnalystMarkdown(displayContent)}</div>
+      ${systemPromptPanel}
       ${emailPanel}
       ${context}
     </div>
   `;
+}
+
+function shouldShowSystemPromptPanel(content, question = '') {
+  const q = String(question || '').toLowerCase();
+  const c = String(content || '').toLowerCase();
+  return (
+    /\b(system\s*prompt|follow[-\s]?up\s*prompt|agent\s*prompt|prompt\s*message)\b/.test(q) &&
+    /(#\s*role|```\s*(system-prompt|prompt|markdown|text)|complete\s+system\s+prompt|replacement\s+prompt)/i.test(content)
+  ) || /```\s*system-prompt\s*\n[\s\S]*?\n```/i.test(content);
+}
+
+function extractSystemPrompt(content) {
+  const src = String(content || '').replace(/\r\n/g, '\n').trim();
+  const fenced = src.match(/```\s*(?:system-prompt|prompt|markdown|text)?\s*\n([\s\S]*?)\n```/i);
+  if (fenced && /#\s*ROLE|#\s*OBJECTIVE|#\s*RULES|#\s*FOLLOW/i.test(fenced[1])) return fenced[1].trim();
+  const roleIdx = src.search(/^#\s*ROLE\b/im);
+  if (roleIdx >= 0) return src.slice(roleIdx).trim();
+  const completeIdx = src.search(/^#{1,6}\s*(complete\s+system\s+prompt|replacement\s+prompt)\b/im);
+  if (completeIdx >= 0) return src.slice(completeIdx).replace(/^#{1,6}\s*[^\n]+\n+/i, '').trim();
+  return src;
+}
+
+function renderSystemPromptPanel(content, question = '') {
+  if (!shouldShowSystemPromptPanel(content, question)) return '';
+  const prompt = extractSystemPrompt(content);
+  return `
+    <div class="analyst-copy-card analyst-system-prompt-card">
+      <div class="analyst-copy-head"><span>Complete system prompt</span><button class="analyst-copy-btn" type="button">Copy full prompt</button></div>
+      <textarea class="analyst-system-prompt-copy" rows="14">${escapeHtml(prompt)}</textarea>
+    </div>
+  `;
+}
+
+function stripSystemPromptBlock(content) {
+  let src = String(content || '').replace(/\r\n/g, '\n');
+  src = src.replace(/```\s*(?:system-prompt|prompt|markdown|text)?\s*\n[\s\S]*?#\s*ROLE[\s\S]*?\n```/i, '').trim();
+  const roleIdx = src.search(/^#\s*ROLE\b/im);
+  if (roleIdx >= 0) src = src.slice(0, roleIdx).trim();
+  return src || 'Complete replacement prompt is ready below.';
+}
+
+function isFollowUpJsonUpdateText(text) {
+  const raw = String(text || '').trim();
+  if (!raw.startsWith('{') || !raw.endsWith('}')) return false;
+  try {
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+    return !!(data.id || data.follow_up_id || data.next_action || data.follow_up_goal || data.details) &&
+      !!(data.business || data.phone || data.email || data.id || data.follow_up_id);
+  } catch {
+    return false;
+  }
+}
+
+function wireAnalystFollowUpJsonButtons(scope) {
+  if (!scope) return;
+  scope.querySelectorAll('.analyst-apply-followup-json-btn').forEach(btn => {
+    if (btn.dataset.applyWired === '1') return;
+    btn.dataset.applyWired = '1';
+    btn.addEventListener('click', () => applyAnalystFollowUpJson(btn));
+  });
+}
+
+async function applyAnalystFollowUpJson(btn) {
+  const card = btn.closest('.analyst-copy-card');
+  const status = card?.querySelector('.analyst-followup-json-status');
+  const jsonText = card?.querySelector('.analyst-copy-code code')?.textContent?.trim() || '';
+  if (!jsonText) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Applying...';
+  if (status) status.textContent = '';
+  try {
+    const res = await fetch('/api/follow-ups/apply-json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: jsonText }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.detail || 'Apply failed');
+    btn.textContent = 'Applied';
+    if (status) status.textContent = data.deleted ? 'Deleted' : 'Updated';
+    if (typeof refreshFollowUps === 'function') refreshFollowUps();
+    setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 1600);
+  } catch (e) {
+    btn.textContent = original;
+    btn.disabled = false;
+    if (status) status.textContent = e.message;
+    else alert(e.message);
+  }
 }
 
 function shouldShowPreparedEmailPanel(content, question = '') {
@@ -2692,7 +2788,7 @@ function wireAnalystCopyButtons(scope, messages = []) {
         text = msg?.content || '';
       } else {
         const card = btn.closest('.analyst-copy-card');
-        text = card?.querySelector('.analyst-email-html')?.value || card?.querySelector('.analyst-copy-body')?.innerText || '';
+        text = card?.querySelector('.analyst-system-prompt-copy')?.value || card?.querySelector('.analyst-email-html')?.value || card?.querySelector('.analyst-copy-body')?.innerText || '';
       }
       text = text.trim();
       if (!text) return;
@@ -2707,6 +2803,7 @@ function wireAnalystCopyButtons(scope, messages = []) {
     });
   });
   wireAnalystEmailButtons(scope);
+  wireAnalystFollowUpJsonButtons(scope);
 }
 
 function wireAnalystEmailButtons(scope) {
@@ -2955,16 +3052,19 @@ async function removeAnalystAttachment(recording) {
 
 function renderAnalystMarkdown(text, options = {}) {
   const allowCopyCards = options.allowCopyCards !== false;
-  const src = String(text || '').replace(/\r\n/g, '\n');
+  const src = String(text || '')
+    .replace(/Paste this into Follow-Ups\s*>\s*[^.]+\.?/gi, 'The follow-up JSON is ready.')
+    .replace(/The JSON is ready to apply using the [^.]*\.?/gi, 'The follow-up JSON is ready.')
+    .replace(/\r\n/g, '\n');
   const lines = src.split('\n');
   let html = '';
   let inUl = false, inOl = false, inCode = false, code = [], codeLang = '';
 
   const inline = s => escapeHtml(s)
     .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/__([^_]+)__/g, '<strong>$1</strong>')
-    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/__([\s\S]+?)__/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
     .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>')
     .replace(/\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b/gi, '<a href="mailto:$1">$1</a>');
@@ -3009,7 +3109,7 @@ function renderAnalystMarkdown(text, options = {}) {
   };
   const isCopyHeading = t => {
     const h = headingParts(t);
-    return h && /(copy[-\s]?ready|draft|follow[-\s]?up|email|message|sms|text to send|send this)/i.test(h.text);
+    return h && /(copy[-\s]?ready|draft|email|message|sms|text to send|send this)/i.test(h.text);
   };
   const isEmailCopyPartHeading = h => h && /^(email\s+subject|subject|html\s+body|body\s+html):?$/i.test(h.text.trim());
   const extractSingleCodeBlock = bodyText => {
@@ -3026,6 +3126,12 @@ function renderAnalystMarkdown(text, options = {}) {
     <div class="analyst-copy-card analyst-copy-card--code">
       <div class="analyst-copy-head"><span>${escapeHtml(label || 'Copy code')}</span><button class="analyst-copy-btn" type="button">Copy</button></div>
       <div class="analyst-copy-body analyst-copy-code"><pre><code>${escapeHtml(codeText || '')}</code></pre></div>
+      ${isFollowUpJsonUpdateText(codeText) ? `
+        <div class="analyst-followup-json-row">
+          <button class="analyst-apply-followup-json-btn" type="button">Apply to Follow-Ups</button>
+          <span class="analyst-followup-json-status"></span>
+        </div>
+      ` : ''}
       ${/html body/i.test(label || '') ? `
         <div class="analyst-email-send-row">
           <input class="analyst-email-to" type="email" placeholder="recipient@email.com" />
@@ -3049,8 +3155,8 @@ function renderAnalystMarkdown(text, options = {}) {
 
     if (t.startsWith('```')) {
       if (inCode) {
-        const copyableCode = allowCopyCards && /^(email|message|sms|text|followup|follow-up|html|subject)$/i.test(codeLang);
-        const codeLabel = codeLang === 'html' ? 'Copy HTML body' : codeLang === 'subject' ? 'Copy subject' : 'Copy-ready message';
+        const copyableCode = allowCopyCards && /^(email|message|sms|text|followup|follow-up|html|subject|json)$/i.test(codeLang);
+        const codeLabel = codeLang === 'html' ? 'Copy HTML body' : codeLang === 'subject' ? 'Copy subject' : codeLang === 'json' ? 'Copy JSON' : 'Copy-ready message';
         closeLists();
         html += copyableCode
           ? renderCodeCopyCard(codeLabel, code.join('\n'))
