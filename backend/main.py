@@ -108,8 +108,39 @@ _followup_listeners: set[asyncio.Queue] = set()
 
 _AUTODIAL_ELIGIBLE_STATUSES = {"", "new", "retry", "queued"}
 _ANALYST_ACTION_CREATE_FOLLOW_UP = "CREATE_FOLLOW_UP"
+_ANALYST_ACTION_UPDATE_CALL_OUTCOMES = "UPDATE_CALL_OUTCOMES"
 _ANALYST_ACTION_MARKER_CREATE_FOLLOW_UP = "[ACTION:CREATE_FOLLOW_UP]"
-_ALLOWED_ANALYST_ACTIONS = {_ANALYST_ACTION_CREATE_FOLLOW_UP}
+_ANALYST_ACTION_MARKER_UPDATE_CALL_OUTCOMES = "[ACTION:UPDATE_CALL_OUTCOMES]"
+_ALLOWED_ANALYST_ACTIONS = {_ANALYST_ACTION_CREATE_FOLLOW_UP, _ANALYST_ACTION_UPDATE_CALL_OUTCOMES}
+_ALLOWED_CALL_OUTCOMES = {
+    "interested", "skeptical", "callback", "not_interested", "voicemail",
+    "gatekeeper", "wrong_number", "no_answer", "ivr", "conversation",
+    "busy", "failed", "do_not_call", "unknown",
+}
+_CALL_OUTCOME_ALIASES = {
+    "interested owner": "interested",
+    "owner_interested": "interested",
+    "warm": "interested",
+    "warm_lead": "interested",
+    "skeptical owner": "skeptical",
+    "owner_skeptical": "skeptical",
+    "callback request": "callback",
+    "call_back": "callback",
+    "call back": "callback",
+    "not interested": "not_interested",
+    "no interest": "not_interested",
+    "declined": "not_interested",
+    "voicemail left": "voicemail",
+    "left voicemail": "voicemail",
+    "gate keeper": "gatekeeper",
+    "receptionist": "gatekeeper",
+    "wrong number": "wrong_number",
+    "bad number": "wrong_number",
+    "no answer": "no_answer",
+    "did not answer": "no_answer",
+    "dnc": "do_not_call",
+    "do not call": "do_not_call",
+}
 
 
 def _phone_key(phone: str) -> str:
@@ -250,11 +281,20 @@ def _followup_counts(items: list[dict] | None = None) -> dict:
     if items is None:
         from followups import list_follow_ups
         items = list_follow_ups()
-    counts = {"total": len(items), "pending": 0, "attempted": 0, "scheduled": 0, "calling": 0, "completed": 0, "failed": 0, "cancelled": 0}
+    counts = {
+        "total": len(items), "pending": 0, "attempted": 0, "scheduled": 0,
+        "calling": 0, "completed": 0, "failed": 0, "cancelled": 0,
+        "hot": 0, "warm": 0, "low": 0, "needs_action": 0,
+    }
     for item in items:
         status = str(item.get("status") or "pending").lower()
         if status in counts:
             counts[status] += 1
+        priority = str(item.get("priority") or "warm").lower()
+        if priority in counts:
+            counts[priority] += 1
+        if status in {"pending", "attempted"}:
+            counts["needs_action"] += 1
     return counts
 
 
@@ -777,6 +817,7 @@ async def _ask_transcript_agent(recording: str, question: str) -> dict:
     if not OPENAI_API_KEY:
         raise HTTPException(500, "OPENAI_API_KEY not set")
     transcript = await _transcribe_recording(recording)
+    call = _find_call(recording) or {}
     q = (question or "").strip()
     if not q:
         q = "Summarize this call, extract any emails or phone numbers, and draft a short follow-up message I can copy."
@@ -789,18 +830,19 @@ async def _ask_transcript_agent(recording: str, question: str) -> dict:
         "Return the draft with separate sections named 'Email subject' and 'HTML body'. "
         "Put the subject in a fenced code block tagged subject and the HTML email in a fenced code block tagged html. "
         "If the operator asks to create, draft, write, prepare, or send an email, always include both fenced blocks. "
-        "Make the HTML responsive with inline CSS, a clean dark/blue Lynkflow style, mobile-safe width, and no external images unless they are fluid. Do not invent facts."
+        "Make the HTML responsive with inline CSS, a clean dark/blue Lynkflow style, mobile-safe width, and no external images unless they are fluid. Do not invent facts. "
+        "If and only if the operator explicitly asks you to update, apply, change, set, mark, move, or persist this call's analytics outcome, append [ACTION:UPDATE_CALL_OUTCOMES] on its own line, then one JSON object, then [/ACTION] on its own line. The JSON must contain updates with one item using the exact call_sid from metadata, outcome, reason, evidence, and confidence from 0 to 1. Allowed outcomes are interested, skeptical, callback, not_interested, voicemail, gatekeeper, wrong_number, no_answer, ivr, conversation, busy, failed, do_not_call, unknown. Do not emit action blocks for ordinary summaries or non-persistent classification questions. "
     )
     async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
             json={
-                "model": "gpt-4.1",
+                "model": "gpt-4.5-mini",
                 "temperature": 0.2,
                 "messages": [
                     {"role": "system", "content": prompt},
-                    {"role": "user", "content": f"Transcript:\n{transcript['transcript']}\n\nQuestion:\n{q}"},
+                    {"role": "user", "content": f"Call metadata:\n{json.dumps(_compact_call_for_analysis(call, transcript), ensure_ascii=False)}\n\nTranscript:\n{transcript['transcript']}\n\nQuestion:\n{q}"},
                 ],
             },
         )
@@ -808,7 +850,7 @@ async def _ask_transcript_agent(recording: str, question: str) -> dict:
         raise HTTPException(502, f"Transcript agent failed: {resp.text}")
     answer = resp.json()["choices"][0]["message"].get("content", "")
     answer = _sanitize_analyst_answer(answer)
-    return {"recording": Path(recording).name, "question": q, "answer": answer, "transcript": transcript}
+    return {"recording": Path(recording).name, "question": q, "answer": answer, "transcript": transcript, "call": call}
 
 
 def _load_analyst_chats() -> dict:
@@ -1245,6 +1287,8 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
                 "business": call.get("business", ""),
                 "phone": call.get("phone", ""),
                 "outcome": call.get("outcome", ""),
+                "lead_status": call.get("lead_status", ""),
+                "outcome_reason": call.get("outcome_reason", ""),
                 "recording": recording,
                 "transcript": t.get("transcript", ""),
                 "contacts": t.get("contacts", {}),
@@ -1257,6 +1301,8 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
                 "business": call.get("business", ""),
                 "phone": call.get("phone", ""),
                 "outcome": call.get("outcome", ""),
+                "lead_status": call.get("lead_status", ""),
+                "outcome_reason": call.get("outcome_reason", ""),
                 "recording": recording,
                 "error": str(e),
             })
@@ -1268,6 +1314,9 @@ async def _build_analyst_context(question: str, days: int = 30, attachments: lis
             "business": c.get("business", ""),
             "phone": c.get("phone", ""),
             "outcome": c.get("outcome", ""),
+            "lead_status": c.get("lead_status", ""),
+            "outcome_reason": c.get("outcome_reason", ""),
+            "outcome_evidence": c.get("outcome_evidence", ""),
             "duration_s": c.get("duration_s", 0),
             "recording": c.get("recording", ""),
             "followup_note": c.get("followup_note", ""),
@@ -1333,7 +1382,9 @@ async def _ask_global_analyst(chat: dict, question: str, days: int = 30) -> dict
         "The draft should mention Anna from Lynkflow reached out about helping them handle customer calls so they do not miss leads. "
         "If a receptionist gave an email, write the message as a professional follow-up to the owner or office manager without pretending the owner was interested. "
         "Never invent emails, phone numbers, callback times, or interest. If transcript evidence is missing, say so. "
-        "Controlled actions: only if the operator explicitly asks you to create, add, prepare, or persist a follow-up task, and the transcript/call evidence supports it, append one strict action block after your normal answer. "
+        "Controlled actions: only append action blocks after the operator explicitly asks you to update, apply, move, change, set, mark, or persist records. Never update records from a casual summary or non-persistent classification request. "
+        "To update call analytics outcomes, append [ACTION:UPDATE_CALL_OUTCOMES] on its own line, then one JSON object, then [/ACTION] on its own line. The JSON must contain an updates array. Each item must include call_sid from context or recording, outcome, reason, evidence, and confidence from 0 to 1. Allowed outcomes are interested, skeptical, callback, not_interested, voicemail, gatekeeper, wrong_number, no_answer, ivr, conversation, busy, failed, do_not_call, unknown. Use exact call_sid values, never loose business-name matching. Do not update an outcome unless the transcript or call metadata clearly supports it. "
+        "Only if the operator explicitly asks you to create, add, prepare, or persist a follow-up task, and the transcript/call evidence supports it, append a follow-up action block after your normal answer. "
         "The exact format is [ACTION:CREATE_FOLLOW_UP] on its own line, then one JSON object, then [/ACTION] on its own line. "
         "The JSON must include previous_call_id using the call_sid from the context, plus business, phone, priority, reason, previous_contact_role, previous_contact_name, email, pain_point, current_solution, interest_signal, previous_action, follow_up_goal, agent_summary, context_summary, details, and scheduled_for. Use null for unknown fields. "
         "For every interested lead action, include a details field. Details must be clear, concise, and factual: who was actually spoken to including role and name if known or 'name not provided', what was discussed, pain points/current process/questions, information provided such as email or callback time, and any test-call, non-staff, unusual event, or identity-confusion clarification. Do not invent missing information. "
@@ -1505,6 +1556,8 @@ def _extract_structured_analyst_actions(data: dict) -> list[dict]:
         action_type = str(raw.get("type") or "").strip()
         if marker == _ANALYST_ACTION_MARKER_CREATE_FOLLOW_UP:
             action_type = _ANALYST_ACTION_CREATE_FOLLOW_UP
+        if marker == _ANALYST_ACTION_MARKER_UPDATE_CALL_OUTCOMES:
+            action_type = _ANALYST_ACTION_UPDATE_CALL_OUTCOMES
         if action_type not in _ALLOWED_ANALYST_ACTIONS:
             actions.append({"type": action_type, "marker": marker, "valid": False, "error": "unapproved action"})
             continue
@@ -1579,6 +1632,15 @@ async def _execute_analyst_actions(actions: list[dict], source_call: dict | None
         action_type = action.get("type")
         if not action.get("valid") or action_type not in _ALLOWED_ANALYST_ACTIONS:
             results.append({"type": action_type, "executed": False, "error": action.get("error") or "invalid action"})
+            continue
+
+        if action_type == _ANALYST_ACTION_UPDATE_CALL_OUTCOMES:
+            payload = action.get("payload") or {}
+            try:
+                result = _apply_call_outcome_updates(payload, updated_by="ai_analyst", require_evidence=True)
+                results.append({"type": action_type, "executed": result.get("updated", 0) > 0, **result})
+            except Exception as e:
+                results.append({"type": action_type, "executed": False, "error": str(e)})
             continue
 
         if action_type != _ANALYST_ACTION_CREATE_FOLLOW_UP:
@@ -1658,6 +1720,9 @@ def _compact_call_for_analysis(call: dict, transcript: dict) -> dict:
         "city": call.get("city"),
         "category": call.get("category"),
         "outcome": call.get("outcome"),
+        "lead_status": call.get("lead_status"),
+        "outcome_reason": call.get("outcome_reason"),
+        "outcome_evidence": call.get("outcome_evidence"),
         "date": call.get("date"),
         "lead_timezone": call.get("lead_timezone"),
         "lead_timezone_iana": call.get("lead_timezone_iana"),
@@ -1685,14 +1750,32 @@ Use call metadata lead_local_display/lead_local_date and lead_timezone as the au
 
 Lynkflow is an AI voice receptionist / AI call handling system. Do not describe it as a human-staffed receptionist service.
 
+Always classify the call outcome for analytics. Prefer the most specific supported outcome over generic conversation. Use interested for clear buying interest or a positive decision-maker signal. Use callback when they requested a later call. Use skeptical when they engaged but raised doubts or objections without declining. Use not_interested when they clearly declined. Use voicemail, gatekeeper, wrong_number, no_answer, ivr, busy, failed, do_not_call, unknown, or conversation when those are the best evidence-based labels.
+
 Create a follow-up only when there is meaningful commercial evidence, such as a decision maker showing interest, asking questions, asking for info/demo/callback, providing an email for information, agreeing to continue later, or showing interest without completing the next step.
 
 Do not create a follow-up merely because someone answered, a receptionist answered, the call connected, voicemail/IVR occurred, the prospect said no, the number was wrong, they already have a solution and showed no interest, or there is no clear commercial signal.
 
-Return strict JSON only with this shape when a follow-up should be created:
+Return strict JSON only. The actions array must always include one UPDATE_CALL_OUTCOMES action for this call. Include CREATE_FOLLOW_UP only when a follow-up should be created.
+
+Shape when a follow-up should be created:
 {
   "assistant_text": "brief evidence summary",
   "actions": [
+    {
+      "marker": "[ACTION:UPDATE_CALL_OUTCOMES]",
+      "payload": {
+        "updates": [
+          {
+            "call_sid": "call_sid from the provided call metadata",
+            "outcome": "interested|skeptical|callback|not_interested|voicemail|gatekeeper|wrong_number|no_answer|ivr|conversation|busy|failed|do_not_call|unknown",
+            "reason": "short reason for this analytics label",
+            "evidence": "exact transcript or metadata evidence for the label",
+            "confidence": 0.0
+          }
+        ]
+      }
+    },
     {
       "marker": "[ACTION:CREATE_FOLLOW_UP]",
       "payload": {
@@ -1729,14 +1812,14 @@ Return strict JSON only with this shape when a follow-up should be created:
   ]
 }
 
-If no follow-up is warranted, return:
-{"assistant_text":"short evidence-based reason","actions":[]}
+If no follow-up is warranted, return only the UPDATE_CALL_OUTCOMES action:
+{"assistant_text":"short evidence-based reason","actions":[{"marker":"[ACTION:UPDATE_CALL_OUTCOMES]","payload":{"updates":[{"call_sid":"call_sid from the provided call metadata","outcome":"one allowed outcome","reason":"short reason","evidence":"exact transcript or metadata evidence","confidence":0.0}]}}]}
 """.strip()
     payload = _compact_call_for_analysis(call, transcript)
     result = await _ask_followup_analyst_json([
         {"role": "system", "content": system},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-    ])
+    ], max_tokens=1300)
     return result if isinstance(result, dict) else {"assistant_text": "Analyst returned no object.", "actions": []}
 
 
@@ -1857,6 +1940,105 @@ def _find_call(call_id: str) -> dict | None:
         if call.get("call_sid") == call_id or call.get("recording") == call_id:
             return call
     return None
+
+
+def _normalise_call_outcome(value: str) -> str:
+    raw = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if raw in _CALL_OUTCOME_ALIASES:
+        return _CALL_OUTCOME_ALIASES[raw]
+    cleaned = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    return _CALL_OUTCOME_ALIASES.get(cleaned, cleaned)
+
+
+def _call_update_items(payload: dict) -> list[dict]:
+    updates = payload.get("updates") or payload.get("items") or payload.get("calls")
+    if isinstance(updates, list):
+        return [x for x in updates if isinstance(x, dict)]
+    return [payload]
+
+
+def _apply_call_outcome_update(item: dict, updated_by: str = "operator", require_evidence: bool = False) -> dict:
+    call_id = str(item.get("call_sid") or item.get("call_id") or item.get("previous_call_id") or item.get("recording") or "").strip()
+    if not call_id:
+        return {"executed": False, "error": "call_sid or recording is required"}
+
+    call = _find_call(call_id)
+    if not call:
+        return {"executed": False, "call_id": call_id, "error": "call not found"}
+
+    outcome = _normalise_call_outcome(item.get("outcome") or item.get("lead_status") or item.get("status") or "")
+    if outcome not in _ALLOWED_CALL_OUTCOMES:
+        return {"executed": False, "call_id": call_id, "business": call.get("business"), "error": f"unsupported outcome: {outcome or 'missing'}"}
+
+    reason = re.sub(r"\s+", " ", str(item.get("reason") or item.get("outcome_reason") or "")).strip()[:800]
+    evidence = re.sub(r"\s+", " ", str(item.get("evidence") or item.get("outcome_evidence") or "")).strip()[:1200]
+    if require_evidence and (not reason or not evidence):
+        return {"executed": False, "call_id": call_id, "business": call.get("business"), "error": "reason and evidence are required for Analyst outcome updates"}
+
+    confidence = item.get("confidence") or item.get("outcome_confidence")
+    try:
+        confidence = float(confidence) if confidence not in (None, "") else None
+        if confidence is not None:
+            confidence = max(0.0, min(1.0, confidence))
+    except Exception:
+        confidence = None
+
+    fields = {
+        "outcome": outcome,
+        "lead_status": outcome,
+        "outcome_reason": reason or "Manual analytics update",
+        "outcome_evidence": evidence,
+        "outcome_updated_at": datetime.now().isoformat(timespec="seconds"),
+        "outcome_updated_by": updated_by,
+    }
+    if confidence is not None:
+        fields["outcome_confidence"] = confidence
+
+    try:
+        from call_history import update_call_fields
+        ok = update_call_fields(call.get("call_sid"), fields)
+    except Exception as e:
+        return {"executed": False, "call_id": call_id, "business": call.get("business"), "error": str(e)}
+
+    return {
+        "executed": bool(ok),
+        "call_sid": call.get("call_sid"),
+        "recording": call.get("recording"),
+        "business": call.get("business"),
+        "previous_outcome": call.get("outcome"),
+        "outcome": outcome,
+        "reason": fields["outcome_reason"],
+    }
+
+
+def _apply_call_outcome_updates(payload: dict, updated_by: str = "operator", require_evidence: bool = False) -> dict:
+    items = _call_update_items(payload)
+    if not items:
+        return {"success": False, "updated": 0, "failed": 0, "results": [], "error": "no updates supplied"}
+    results = [_apply_call_outcome_update(item, updated_by=updated_by, require_evidence=require_evidence) for item in items[:200]]
+    updated = sum(1 for r in results if r.get("executed"))
+    failed = len(results) - updated
+    return {"success": failed == 0, "updated": updated, "failed": failed, "results": results}
+
+
+def _is_call_outcome_update_request(question: str) -> bool:
+    q = str(question or "").lower()
+    action_terms = ("update", "change", "apply", "set", "mark", "move", "persist")
+    target_terms = ("outcome", "status", "lead", "business", "call", "interested", "skeptical", "callback", "voicemail", "not interested")
+    return any(term in q for term in action_terms) and any(term in q for term in target_terms)
+
+
+def _guard_outcome_update_actions(actions: list[dict], question: str) -> list[dict]:
+    if _is_call_outcome_update_request(question):
+        return actions
+    guarded = []
+    for action in actions or []:
+        if action.get("type") == _ANALYST_ACTION_UPDATE_CALL_OUTCOMES:
+            blocked = {**action, "valid": False, "error": "operator did not explicitly request outcome updates"}
+            guarded.append(blocked)
+        else:
+            guarded.append(action)
+    return guarded
 
 
 def _runtime_agent_config_for_mode(cfg: AgentConfig, call_mode: str = "outbound") -> AgentConfig:
@@ -3861,6 +4043,14 @@ async def get_analytics_counts(days: int = 30):
     return JSONResponse(_analytics_data_snapshot(days))
 
 
+@app.post("/api/analytics/calls/outcomes")
+async def analytics_update_call_outcomes(request: Request):
+    payload = await request.json()
+    result = _apply_call_outcome_updates(payload, updated_by="operator", require_evidence=False)
+    status = 200 if result.get("updated", 0) else 400
+    return JSONResponse(result, status_code=status)
+
+
 @app.post("/api/analytics/transcribe")
 async def analytics_transcribe(request: Request):
     data = await request.json()
@@ -3876,7 +4066,14 @@ async def analytics_ask(request: Request):
     data = await request.json()
     recording = data.get("recording", "")
     question = data.get("question", "")
-    return JSONResponse(await _ask_transcript_agent(recording, question))
+    result = await _ask_transcript_agent(recording, question)
+    clean_answer, actions = _parse_analyst_action_blocks(result.get("answer", ""))
+    actions = _guard_outcome_update_actions(actions, question)
+    action_results = await _execute_analyst_actions(actions, source_call=result.get("call") or None)
+    result["answer"] = (clean_answer or result.get("answer", "") or "Action processed.") + _analyst_action_result_summary(action_results)
+    if action_results:
+        result["actions"] = action_results
+    return JSONResponse(result)
 
 
 @app.get("/api/follow-ups")
@@ -4306,6 +4503,30 @@ async def analyst_delete_chat(chat_id: str):
     return JSONResponse({"success": True})
 
 
+def _analyst_action_result_summary(results: list[dict]) -> str:
+    if not results:
+        return ""
+    lines = ["", "**Action Results**"]
+    for result in results:
+        action_type = result.get("type") or "action"
+        if action_type == _ANALYST_ACTION_UPDATE_CALL_OUTCOMES:
+            lines.append(f"- UPDATE_CALL_OUTCOMES: {result.get('updated', 0)} updated, {result.get('failed', 0)} failed.")
+            for item in (result.get("results") or [])[:12]:
+                business = item.get("business") or item.get("call_id") or item.get("call_sid") or "call"
+                if item.get("executed"):
+                    lines.append(f"- {business}: {item.get('previous_outcome') or 'unknown'} -> {item.get('outcome')}")
+                else:
+                    lines.append(f"- {business}: failed, {item.get('error') or 'unknown error'}")
+            extra = len(result.get("results") or []) - 12
+            if extra > 0:
+                lines.append(f"- {extra} more result(s) not shown.")
+        elif result.get("executed"):
+            lines.append(f"- {action_type}: executed.")
+        else:
+            lines.append(f"- {action_type}: failed, {result.get('error') or 'unknown error'}")
+    return "\n".join(lines)
+
+
 @app.post("/api/analyst/chats/{chat_id}/message")
 async def analyst_message(chat_id: str, request: Request):
     payload = await request.json()
@@ -4319,11 +4540,13 @@ async def analyst_message(chat_id: str, request: Request):
     chat.setdefault("messages", []).append({"role": "user", "content": question, "ts": now})
     result = await _ask_global_analyst(chat, question, days)
     clean_answer, actions = _parse_analyst_action_blocks(result["answer"])
+    actions = _guard_outcome_update_actions(actions, question)
     action_results = await _execute_analyst_actions(actions)
     context = {**result["context"]}
     if action_results:
         context["actions"] = action_results
     display_answer = clean_answer or ("Action processed." if actions else result["answer"])
+    display_answer = (display_answer + _analyst_action_result_summary(action_results)).strip()
     chat["messages"].append({"role": "assistant", "content": display_answer, "ts": datetime.now().isoformat(timespec="seconds"), "context": context})
     if chat.get("title") == "New chat":
         chat["title"] = question[:60]

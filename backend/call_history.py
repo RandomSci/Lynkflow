@@ -140,7 +140,9 @@ def update_call_fields(call_sid: str, fields: dict) -> bool:
         return False
     allowed = {
         "details", "lead_timezone", "lead_timezone_iana", "lead_local_date",
-        "lead_local_display", "state", "timezone",
+        "lead_local_display", "state", "timezone", "outcome", "lead_status",
+        "outcome_reason", "outcome_evidence", "outcome_confidence",
+        "outcome_updated_at", "outcome_updated_by",
     }
     clean_fields = {k: v for k, v in fields.items() if k in allowed and v not in (None, "")}
     if not clean_fields:
@@ -195,7 +197,8 @@ def summarise(days: int = 30) -> dict:
         return {
             "empty": True, "days": days,
             "totals": {"calls": 0, "connected": 0, "conversations": 0,
-                       "ivr": 0, "interested": 0, "minutes": 0.0, "cost": 0.0},
+                       "ivr": 0, "interested": 0, "callback": 0, "skeptical": 0,
+                       "not_interested": 0, "voicemail": 0, "minutes": 0.0, "cost": 0.0},
             "rates": {"connect": 0, "conversation": 0, "interest": 0},
             "cost": {"twilio": 0, "stt": 0, "llm": 0, "tts": 0,
                      "total": 0, "per_call": 0, "per_min": 0,
@@ -209,6 +212,10 @@ def summarise(days: int = 30) -> dict:
     ivr       = sum(1 for c in calls if c.get("outcome") == "ivr")
     convos    = sum(1 for c in calls if c.get("turns", 0) >= 2 and c.get("outcome") != "ivr")
     interested = sum(1 for c in calls if c.get("outcome") == "interested")
+    callback = sum(1 for c in calls if c.get("outcome") == "callback")
+    skeptical = sum(1 for c in calls if c.get("outcome") == "skeptical")
+    not_interested = sum(1 for c in calls if c.get("outcome") == "not_interested")
+    voicemail = sum(1 for c in calls if c.get("outcome") == "voicemail")
 
     minutes = sum(c.get("duration_s", 0) for c in calls) / 60.0
 
@@ -258,6 +265,8 @@ def summarise(days: int = 30) -> dict:
         "totals": {
             "calls": total, "connected": connected, "conversations": convos,
             "ivr": ivr, "interested": interested,
+            "callback": callback, "skeptical": skeptical,
+            "not_interested": not_interested, "voicemail": voicemail,
             "minutes": round(minutes, 1), "cost": round(c_total, 4),
         },
         "rates": {

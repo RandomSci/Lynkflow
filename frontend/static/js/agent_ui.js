@@ -1217,7 +1217,12 @@ let followUpPollTimer = null;
 let followUpCallEventSource = null;
 let followUpLive = { callSid: null, followUpId: null, status: '', lines: [], active: false };
 let followUpActiveSection = 'approved';
+let followUpActiveFilter = 'actionable';
 let followUpExpandedIds = new Set();
+const FOLLOWUP_PRIORITIES = ['hot', 'warm', 'low'];
+const FOLLOWUP_STATUSES = ['pending', 'attempted', 'scheduled', 'completed', 'failed'];
+const FOLLOWUP_PRIORITY_RANK = { hot: 0, warm: 1, low: 2 };
+const FOLLOWUP_STATUS_RANK = { calling: 0, pending: 1, attempted: 2, scheduled: 3, failed: 4, completed: 5, cancelled: 6 };
 
 async function loadFollowUpsPage() {
   if (typeof setActiveNav === 'function') setActiveNav('followups');
@@ -1232,6 +1237,7 @@ async function loadFollowUpsPage() {
         <h1 class="an-title">Follow-Ups</h1>
       </div>
       <div class="followup-head-actions">
+        <button class="analyst-lite-btn" id="followUpsAskAiBtn">Ask AI To Prioritize</button>
         <button class="analyst-lite-btn" id="followUpsToggleAllBtn">Expand All</button>
         <button class="analyst-lite-btn" id="followUpsRefreshBtn">Refresh</button>
       </div>
@@ -1251,6 +1257,7 @@ async function loadFollowUpsPage() {
   `;
 
   document.getElementById('followUpsRefreshBtn')?.addEventListener('click', refreshFollowUps);
+  document.getElementById('followUpsAskAiBtn')?.addEventListener('click', () => openAnalystWithPrompt('Look at the follow-up action plan and tell me exactly who I should call first, second, and third. Include priority, why each matters, what to say on the call, and whether any follow-up status or priority should be updated.'));
   document.getElementById('followUpsToggleAllBtn')?.addEventListener('click', toggleAllFollowUpsExpanded);
   document.querySelectorAll('.followup-section-btn').forEach(btn => {
     btn.addEventListener('click', () => setFollowUpSection(btn.dataset.followupSection || 'approved'));
@@ -1319,11 +1326,16 @@ function renderFollowUps() {
   updateFollowUpsToggleAllBtn();
   const list = document.getElementById('followUpList');
   if (!list) return;
+  const visible = filterFollowUps(sortFollowUpsForAction(followUps));
   if (!followUps.length) {
     list.innerHTML = '<div class="followup-empty">No follow-ups yet. When the AI analyst finds a real commercial reason to call back, it will appear here.</div>';
     return;
   }
-  list.innerHTML = followUps.map(renderFollowUpCard).join('');
+  if (!visible.length) {
+    list.innerHTML = `<div class="followup-empty">No follow-ups match the current filter. Switch to All to see every lead.</div>`;
+    return;
+  }
+  list.innerHTML = visible.map(renderFollowUpCard).join('');
   list.querySelectorAll('.followup-call-btn').forEach(btn => {
     btn.addEventListener('click', () => callFollowUp(btn.dataset.id, btn));
   });
@@ -1333,6 +1345,62 @@ function renderFollowUps() {
   list.querySelectorAll('.followup-cancel-btn').forEach(btn => {
     btn.addEventListener('click', () => cancelFollowUp(btn.dataset.id));
   });
+  list.querySelectorAll('.followup-field-select').forEach(sel => {
+    sel.addEventListener('change', () => updateFollowUpQuickField(sel));
+  });
+}
+
+function followUpStatus(f) {
+  return String(f.status || 'pending').toLowerCase();
+}
+
+function followUpPriority(f) {
+  const p = String(f.priority || 'warm').toLowerCase();
+  return FOLLOWUP_PRIORITIES.includes(p) ? p : 'warm';
+}
+
+function isFollowUpActionable(f) {
+  return ['pending', 'attempted'].includes(followUpStatus(f));
+}
+
+function sortFollowUpsForAction(items) {
+  return [...(items || [])].sort((a, b) => {
+    const statusDiff = (FOLLOWUP_STATUS_RANK[followUpStatus(a)] ?? 9) - (FOLLOWUP_STATUS_RANK[followUpStatus(b)] ?? 9);
+    if (statusDiff) return statusDiff;
+    const priorityDiff = (FOLLOWUP_PRIORITY_RANK[followUpPriority(a)] ?? 9) - (FOLLOWUP_PRIORITY_RANK[followUpPriority(b)] ?? 9);
+    if (priorityDiff) return priorityDiff;
+    return String(b.updated_at || b.created_at || '').localeCompare(String(a.updated_at || a.created_at || ''));
+  });
+}
+
+function filterFollowUps(items) {
+  if (followUpActiveFilter === 'all') return items;
+  if (followUpActiveFilter === 'actionable') return items.filter(isFollowUpActionable);
+  if (followUpActiveFilter === 'done') return items.filter(f => ['completed', 'failed'].includes(followUpStatus(f)));
+  if (followUpActiveFilter === 'hot') return items.filter(f => followUpPriority(f) === 'hot' && !['completed', 'failed', 'cancelled'].includes(followUpStatus(f)));
+  if (followUpActiveFilter === 'scheduled') return items.filter(f => followUpStatus(f) === 'scheduled');
+  return items;
+}
+
+function getNextFollowUp() {
+  return sortFollowUpsForAction(followUps).find(isFollowUpActionable) || null;
+}
+
+function followUpRecommendedAction(f) {
+  const status = followUpStatus(f);
+  if (status === 'calling') return 'Call in progress. Watch the live transcript.';
+  if (status === 'scheduled') return `Scheduled callback${f.scheduled_for ? ': ' + f.scheduled_for : ''}.`;
+  if (status === 'attempted') return f.next_action || f.follow_up_goal || 'Review the last attempt, then call again if still useful.';
+  if (status === 'pending') return f.next_action || f.follow_up_goal || 'Call this lead next.';
+  if (status === 'completed') return f.result || 'Completed. No next action needed.';
+  if (status === 'failed') return f.result || 'Failed. Review before trying again.';
+  return f.next_action || f.follow_up_goal || f.reason || 'Review this lead.';
+}
+
+function followUpPriorityLabel(p) {
+  if (p === 'hot') return 'HOT - handle first';
+  if (p === 'low') return 'LOW - low urgency';
+  return 'WARM - normal priority';
 }
 
 function toggleAllFollowUpsExpanded() {
@@ -1504,17 +1572,56 @@ function reconnectFollowUpLiveIfNeeded() {
 function renderFollowUpSummary() {
   const wrap = document.getElementById('followUpSummary');
   if (!wrap) return;
+  const next = getNextFollowUp();
+  const nextAction = next ? followUpRecommendedAction(next) : 'No lead needs a call right now.';
   const items = [
-    ['Pending', followUpCounts.pending || 0],
-    ['Attempted', followUpCounts.attempted || 0],
-    ['Calling', followUpCounts.calling || 0],
+    ['Needs action', followUpCounts.needs_action || 0],
+    ['Hot priority', followUpCounts.hot || 0],
+    ['Warm', followUpCounts.warm || 0],
+    ['Low', followUpCounts.low || 0],
     ['Scheduled', followUpCounts.scheduled || 0],
-    ['Completed', followUpCounts.completed || 0],
-    ['Failed', followUpCounts.failed || 0],
+    ['Done', (followUpCounts.completed || 0) + (followUpCounts.failed || 0)],
   ];
-  wrap.innerHTML = items.map(([label, value]) => `
-    <div class="followup-kpi"><span>${label}</span><b>${value}</b></div>
-  `).join('');
+  const filters = [
+    ['actionable', 'Needs Action'],
+    ['hot', 'Hot'],
+    ['scheduled', 'Scheduled'],
+    ['done', 'Done'],
+    ['all', 'All'],
+  ];
+  wrap.innerHTML = `
+    <div class="followup-command-card ${next ? 'has-next' : ''}">
+      <div>
+        <div class="followup-command-label">Recommended next move</div>
+        <div class="followup-command-title">${next ? escapeHtml(next.business || 'Unknown business') : 'Queue clear'}</div>
+        <div class="followup-command-sub">${escapeHtml(nextAction)}</div>
+        ${next ? `<div class="followup-command-meta">
+          <span class="followup-priority followup-priority--${escapeHtml(followUpPriority(next))}">${escapeHtml(followUpPriorityLabel(followUpPriority(next)))}</span>
+          <span>${escapeHtml([next.phone, next.email].filter(Boolean).join(' · ') || 'No contact details shown')}</span>
+        </div>` : ''}
+      </div>
+      <button id="followUpCallNextBtn" class="followup-call-next" ${next ? '' : 'disabled'}>${next ? 'Call Next Lead' : 'Nothing To Call'}</button>
+    </div>
+    <div class="followup-filter-row">
+      ${filters.map(([key, label]) => `<button class="followup-filter-btn ${followUpActiveFilter === key ? 'active' : ''}" data-filter="${key}">${label}</button>`).join('')}
+    </div>
+    <div class="followup-guide">
+      Auto-sorted by urgency first, then priority: calling, pending, attempted, scheduled, then done. Use Hot for leads with strong interest or a clear callback, Warm for normal follow-up, Low for weak signals.
+    </div>
+    <div class="followup-summary-grid">
+      ${items.map(([label, value]) => `<div class="followup-kpi"><span>${label}</span><b>${value}</b></div>`).join('')}
+    </div>
+  `;
+  wrap.querySelector('#followUpCallNextBtn')?.addEventListener('click', (e) => {
+    const target = getNextFollowUp();
+    if (target) callFollowUp(target.id, e.currentTarget);
+  });
+  wrap.querySelectorAll('.followup-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      followUpActiveFilter = btn.dataset.filter || 'actionable';
+      renderFollowUps();
+    });
+  });
 }
 
 function renderFollowUpCard(f) {
@@ -1523,11 +1630,16 @@ function renderFollowUpCard(f) {
   const previousRole = f.previous_contact_role || f.contact_role || '';
   const previousContact = `Previous contact: ${[previousRole, previousName].filter(Boolean).join(' · ')}`;
   const currentContact = f.current_contact_name ? `Current caller: ${f.current_contact_name}${f.current_contact_role ? ' · ' + f.current_contact_role : ''}` : '';
-  const canCall = !['calling', 'cancelled'].includes(String(f.status || '').toLowerCase());
+  const status = followUpStatus(f);
+  const priority = followUpPriority(f);
+  const canCall = !['calling', 'cancelled'].includes(status);
   const preferredRecording = preferredFollowUpRecording(f);
   const recordingHtml = preferredRecording ? renderFollowUpRecordingBlock(preferredRecording) : '';
   const attemptHistoryHtml = renderFollowUpAttemptHistory(f);
-  const summary = f.next_action || f.result || f.follow_up_goal || f.reason || '';
+  const summary = followUpRecommendedAction(f);
+  const priorityOptions = FOLLOWUP_PRIORITIES.map(p => `<option value="${p}" ${p === priority ? 'selected' : ''}>${followUpPriorityLabel(p)}</option>`).join('');
+  const statusChoices = FOLLOWUP_STATUSES.includes(status) ? FOLLOWUP_STATUSES : [status, ...FOLLOWUP_STATUSES];
+  const statusOptions = statusChoices.map(s => `<option value="${s}" ${s === status ? 'selected' : ''}>${s.replace(/_/g, ' ')}</option>`).join('');
   const details = [
     ['Reason', f.reason],
     ['Previous contact', [previousRole, previousName].filter(Boolean).join(' · ')],
@@ -1546,19 +1658,26 @@ function renderFollowUpCard(f) {
   ].filter(([, value]) => value);
 
   return `
-    <article class="followup-card followup-card--${escapeHtml(f.status || 'pending')} ${expanded ? 'expanded' : 'collapsed'}">
+    <article class="followup-card followup-card--${escapeHtml(status)} followup-card--priority-${escapeHtml(priority)} ${expanded ? 'expanded' : 'collapsed'}">
       <div class="followup-card-head">
         <div>
           <div class="followup-business">${escapeHtml(f.business || 'Unknown business')}</div>
           <div class="followup-meta">${escapeHtml([previousContact, currentContact, f.phone, f.email].filter(Boolean).join(' · '))}</div>
         </div>
-        <div class="followup-badges">
-          <span class="followup-priority followup-priority--${escapeHtml(f.priority || 'warm')}">${escapeHtml(f.priority || 'warm')}</span>
-          <span class="followup-status">${escapeHtml(f.status || 'pending')}</span>
+        <div class="followup-controls">
+          <label>Priority<select class="followup-field-select followup-priority-select followup-priority--${escapeHtml(priority)}" data-id="${escapeHtml(f.id)}" data-field="priority" data-current="${escapeHtml(priority)}">${priorityOptions}</select></label>
+          <label>Status<select class="followup-field-select followup-status-select followup-status--${escapeHtml(status)}" data-id="${escapeHtml(f.id)}" data-field="status" data-current="${escapeHtml(status)}">${statusOptions}</select></label>
         </div>
       </div>
+      <div class="followup-action-strip">
+        <div>
+          <span>Recommended action</span>
+          <b>${escapeHtml(summary || 'Review this lead.')}</b>
+        </div>
+        <em>${escapeHtml(f.reason || f.interest_signal || 'AI-approved follow-up')}</em>
+      </div>
       <div class="followup-compact-line">
-        <span>${escapeHtml(summary || 'No next action recorded yet.')}</span>
+        <span>${escapeHtml(f.context_summary || f.details || 'Open details to review the call context before following up.')}</span>
         ${preferredRecording ? `<em>${preferredRecording.source === 'twilio' ? 'Twilio recording available' : 'Only local fallback recording available'}</em>` : '<em>No recording yet</em>'}
       </div>
       ${expanded ? `
@@ -1697,6 +1816,39 @@ async function callFollowUp(id, btn) {
     alert(e.message);
     btn.disabled = false;
     btn.textContent = original;
+  }
+}
+
+async function updateFollowUpQuickField(sel) {
+  const id = sel.dataset.id || '';
+  const field = sel.dataset.field || '';
+  const previous = sel.dataset.current || '';
+  const value = sel.value || '';
+  if (!id || !['priority', 'status'].includes(field)) {
+    sel.value = previous;
+    return;
+  }
+  if (field === 'status' && ['completed', 'failed'].includes(value)) {
+    const label = value === 'completed' ? 'completed' : 'failed';
+    if (!confirm(`Mark this follow-up as ${label}?`)) {
+      sel.value = previous;
+      return;
+    }
+  }
+  sel.disabled = true;
+  try {
+    const res = await fetch(`/api/follow-ups/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [field]: value }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.detail || 'Update failed');
+    await refreshFollowUps();
+  } catch (e) {
+    sel.disabled = false;
+    sel.value = previous;
+    alert(e.message);
   }
 }
 
@@ -2065,6 +2217,11 @@ async function fetchRealTwilioPrice(callSid, attempt = 0) {
 let analyticsRange = 30;
 let activeAnalystChat = null;
 let analystRecordingResults = [];
+const ANALYTICS_OUTCOMES = [
+  'interested', 'skeptical', 'callback', 'not_interested', 'voicemail',
+  'gatekeeper', 'wrong_number', 'no_answer', 'ivr', 'conversation',
+  'busy', 'failed', 'do_not_call', 'unknown',
+];
 
 async function loadAnalytics() {
   const area = document.getElementById('contentArea');
@@ -2231,11 +2388,17 @@ function renderAnalytics(d) {
       <div class="an-day-label">${x.date.slice(5)}</div>
     </div>`).join('');
 
+  const renderOutcomeSelect = x => {
+    const current = x.outcome || 'unknown';
+    const options = ANALYTICS_OUTCOMES.map(o => `<option value="${o}" ${o === current ? 'selected' : ''}>${o.replace(/_/g, ' ')}</option>`).join('');
+    return `<select class="an-outcome-select an-tag an-tag--${escAttr(current)}" data-call-sid="${escAttr(x.call_sid || '')}" data-current="${escAttr(current)}" data-business="${escAttr(x.business || '')}">${options}</select>`;
+  };
+
   const recentRows = d.recent.map(x => `
     <tr>
       <td class="an-td-time">${new Date(x.ts * 1000).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'})}</td>
       <td class="an-td-name">${escapeHtml(x.business || '—')}</td>
-      <td><span class="an-tag an-tag--${x.outcome || 'unknown'}">${(x.outcome || 'unknown').replace(/_/g,' ')}</span></td>
+      <td>${renderOutcomeSelect(x)}</td>
       <td class="an-td-num">${x.duration_s || 0}s</td>
       <td class="an-td-num">${x.turns || 0}</td>
       <td class="an-td-num">${x.latency?.total_ms || 0}ms</td>
@@ -2258,6 +2421,10 @@ function renderAnalytics(d) {
       ${kpi('Answered',        t.connected, `${r.connect}% connect rate`)}
       ${kpi('Conversations',   t.conversations, `${r.conversation}% of calls`)}
       ${kpi('Interested',      t.interested, `${r.interest}% of calls`)}
+      ${kpi('Callbacks',       t.callback || 0)}
+      ${kpi('Skeptical',       t.skeptical || 0)}
+      ${kpi('Not interested',  t.not_interested || 0)}
+      ${kpi('Voicemail',       t.voicemail || 0)}
       ${kpi('Talk time',       t.minutes + 'm')}
       ${kpi('Total spend',     '$' + c.total.toFixed(2), 'Twilio + GPT-Live + legacy components')}
     </div>
@@ -2331,6 +2498,40 @@ function wirePresetButtons() {
       decodeURIComponent(btn.dataset.business || '')
     ));
   });
+  document.querySelectorAll('.an-outcome-select').forEach(sel => {
+    sel.addEventListener('change', () => updateAnalyticsOutcome(sel));
+  });
+}
+
+async function updateAnalyticsOutcome(sel) {
+  const callSid = sel.dataset.callSid || '';
+  const previous = sel.dataset.current || 'unknown';
+  const outcome = sel.value || 'unknown';
+  const business = sel.dataset.business || 'this business';
+  if (!callSid) {
+    sel.value = previous;
+    alert('Cannot update outcome because this call has no call SID.');
+    return;
+  }
+  if (!confirm(`Update ${business} from ${previous.replace(/_/g, ' ')} to ${outcome.replace(/_/g, ' ')}?`)) {
+    sel.value = previous;
+    return;
+  }
+  sel.disabled = true;
+  try {
+    const res = await fetch('/api/analytics/calls/outcomes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updates: [{ call_sid: callSid, outcome, reason: 'Manual analytics outcome update' }] }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.updated) throw new Error(data.results?.[0]?.error || data.error || 'Outcome update failed');
+    await loadAnalytics();
+  } catch (e) {
+    sel.disabled = false;
+    sel.value = previous;
+    alert(e.message);
+  }
 }
 
 async function openAnalyticsAiPanel(recording, business) {
@@ -2463,7 +2664,7 @@ async function loadAnalystPage() {
         <div class="analyst-main-head">
           <div>
             <div class="analyst-chat-title" id="analystChatTitle">AI Analyst</div>
-            <div class="analyst-sub">Ask across call history, cached transcripts, emails, numbers, outcomes, and follow-up messages.</div>
+            <div class="analyst-sub">Ask for verified counts, outcome updates, follow-up priorities, next actions, emails, and call summaries.</div>
           </div>
           <div class="analyst-title-actions">
             <button class="analyst-lite-btn analyst-email-connect" id="analystEmailConnectBtn">Connect Email</button>
@@ -2475,15 +2676,17 @@ async function loadAnalystPage() {
         <div class="analyst-attachments" id="analystAttachments"></div>
         <div class="analyst-suggestions" id="analystSuggestions">
           <button data-q="Is there anyone at least interested here? List who and why.">Interested?</button>
+          <button data-q="Look at the follow-up action plan and tell me exactly who I should call first, second, and third, with why.">Prioritize follow-ups</button>
           <button data-q="Which calls provided useful info like emails, phone numbers, names, or callback times?">Provided info?</button>
           <button data-q="Tell me more about what happened in the latest calls. I'm too lazy to listen.">Latest summary</button>
+          <button data-q="Classify and update the outcomes for calls with clear transcript evidence. Use only interested, skeptical, callback, not_interested, voicemail, gatekeeper, wrong_number, no_answer, ivr, conversation, busy, failed, do_not_call, or unknown.">Update outcomes</button>
           <button data-q="Create a professional follow-up email for the most promising lead. Separate the subject and a responsive HTML body I can copy.">Draft best email</button>
         </div>
         <div class="analyst-messages" id="analystMessages">
           <div class="analyst-empty">Create or select a chat, then ask about your calls.</div>
         </div>
         <div class="analyst-input-wrap">
-          <textarea id="analystInput" class="analyst-input" placeholder="Ask: tell me more about {business}, who gave an email, who sounded interested, draft a message..."></textarea>
+          <textarea id="analystInput" class="analyst-input" placeholder="Ask: prioritize my follow-ups, update outcomes with transcript evidence, who should I call next, who is interested, draft a follow-up email..."></textarea>
           <button id="analystSendBtn" class="analyst-send">Send</button>
         </div>
       </main>
@@ -2573,6 +2776,16 @@ async function createAnalystChat() {
   activeAnalystChatId = chat.id;
   await refreshAnalystChats();
   renderAnalystChat(chat);
+}
+
+async function openAnalystWithPrompt(prompt) {
+  await loadAnalystPage();
+  if (!activeAnalystChatId) await createAnalystChat();
+  const input = document.getElementById('analystInput');
+  if (input) {
+    input.value = prompt || '';
+    input.focus();
+  }
 }
 
 async function openAnalystChat(chatId) {
