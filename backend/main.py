@@ -838,7 +838,7 @@ async def _ask_transcript_agent(recording: str, question: str) -> dict:
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
             json={
-                "model": "gpt-4.5-mini",
+                "model": "gpt5",
                 "temperature": 0.2,
                 "messages": [
                     {"role": "system", "content": prompt},

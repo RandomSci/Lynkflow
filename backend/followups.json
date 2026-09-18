@@ -182,7 +182,7 @@
     {
       "id": "fu_58ced0dbeae2f786",
       "created_at": "2026-09-17T23:58:03",
-      "updated_at": "2026-09-18T01:59:42",
+      "updated_at": "2026-09-18T05:18:04",
       "status": "attempted",
       "priority": "warm",
       "business": "Robert Wilson Plumbing Heating & Air Conditioning LLC",
@@ -213,16 +213,17 @@
       "follow_up_goal": "Gauge further interest, offer demo, and answer questions about Lynkflow.",
       "agent_summary": "Office manager acknowledged missed calls, confirmed email, requested info be resent, and confirmed address is correct. No further questions or objections.",
       "context_summary": "Multiple follow-ups reached the office manager. Email sent and resent from lynkflowagent@gmail.com to office.robertwilsonplumbing@gmail.com. Prospect has not confirmed receipt. No new contact name provided. No further questions or objections.",
-      "details": "Original conversation on 2026-09-16 09:51 PM MDT with the office manager (name not provided). They acknowledged occasionally missing customer calls and said they call customers back when available. Said immediate AI voice receptionist/call coverage would be useful, responded 'possibly' to Lynkflow's AI receptionist, and provided/confirmed office.robertwilsonplumbing@gmail.com for follow-up. Later simulated/test calls used the name Pam; Pam is current_contact_name from those later calls only and must not be treated as the original previous contact. [2026-09-16 05:15 PM MDT] Office manager confirmed the correct email address but stated the follow-up email was not received. [2026-09-16 05:46 PM MDT] Anna reached the office manager, who confirmed they were waiting for the follow-up email and said they would check and get back if needed. [2026-09-17 07:45 AM MDT] Anna reached the office manager, who was available and polite but did not have any questions or objections. [2026-09-17 09:45 PM MDT] Anna reached the office manager again. The office manager confirmed they never received the email, Anna asked if they wanted to check spam/junk or have it resent, and the office manager requested it be resent to office.robertwilsonplumbing@gmail.com and confirmed it is the best address. Anna agreed to resend and offered to use another email if needed. No further questions or objections. The follow-up email was resent as requested.\n[2026-09-17 10:09 AM MDT] [2026-09-17 10:09 AM MDT] Follow-up call reached voicemail/IVR; no live contact. No new information gathered. Previous history: Office manager acknowledged missed calls, confirmed email, requested info be resent, and confirmed address is correct. Prospect has not confirmed receipt of the email.\n[2026-09-17 11:59 AM MDT] [2026-09-17 11:59 AM MDT] Follow-up call reached voicemail/IVR; no live contact. No new information gathered. Previous history: Office manager acknowledged missed calls, confirmed email, requested info be resent, and confirmed address is correct. Prospect has not confirmed receipt of the email.",
+      "details": "Original conversation on 2026-09-16 09:51 PM MDT with the office manager (name not provided). They acknowledged occasionally missing customer calls and said they call customers back when available. Said immediate AI voice receptionist/call coverage would be useful, responded 'possibly' to Lynkflow's AI receptionist, and provided/confirmed office.robertwilsonplumbing@gmail.com for follow-up. Later simulated/test calls used the name Pam; Pam is current_contact_name from those later calls only and must not be treated as the original previous contact. [2026-09-16 05:15 PM MDT] Office manager confirmed the correct email address but stated the follow-up email was not received. [2026-09-16 05:46 PM MDT] Anna reached the office manager, who confirmed they were waiting for the follow-up email and said they would check and get back if needed. [2026-09-17 07:45 AM MDT] Anna reached the office manager, who was available and polite but did not have any questions or objections. [2026-09-17 09:45 PM MDT] Anna reached the office manager again. The office manager confirmed they never received the email, Anna asked if they wanted to check spam/junk or have it resent, and the office manager requested it be resent to office.robertwilsonplumbing@gmail.com and confirmed it is the best address. Anna agreed to resend and offered to use another email if needed. No further questions or objections. The follow-up email was resent as requested.\n[2026-09-17 10:09 AM MDT] [2026-09-17 10:09 AM MDT] Follow-up call reached voicemail/IVR; no live contact. No new information gathered. Previous history: Office manager acknowledged missed calls, confirmed email, requested info be resent, and confirmed address is correct. Prospect has not confirmed receipt of the email.\n[2026-09-17 11:59 AM MDT] [2026-09-17 11:59 AM MDT] Follow-up call reached voicemail/IVR; no live contact. No new information gathered. Previous history: Office manager acknowledged missed calls, confirmed email, requested info be resent, and confirmed address is correct. Prospect has not confirmed receipt of the email.\n[2026-09-17 03:17 PM MDT] [2026-09-17 03:17 PM MDT] Follow-up call reached voicemail/IVR; no live contact. No new information gathered. Previous history: Office manager acknowledged missed calls, confirmed email, requested info be resent, and confirmed address is correct. Prospect has not confirmed receipt of the email.",
       "reason": "Decision maker reached and showed interest in Lynkflow's offer. Provided and confirmed email for follow-up information.",
       "scheduled_for": null,
-      "attempts": 2,
-      "last_attempt_at": "2026-09-18T01:59:18",
+      "attempts": 3,
+      "last_attempt_at": "2026-09-18T05:17:41",
       "result": "Reached voicemail/IVR; no live contact.",
-      "call_id": "CAe1cc32301db6356ec0818476288c654a",
+      "call_id": "CAaaa99db690a6b9376c81d741eaa87624",
       "call_ids": [
         "CAd9c287fa901635bf4b6294de84e1d4dd",
-        "CAe1cc32301db6356ec0818476288c654a"
+        "CAe1cc32301db6356ec0818476288c654a",
+        "CAaaa99db690a6b9376c81d741eaa87624"
       ],
       "analysis": {
         "follow_up": {
@@ -261,7 +262,7 @@
         "latest_follow_up_result": {
           "status": "pending",
           "result": "Reached voicemail/IVR; no live contact.",
-          "reason": "The follow-up call on 2026-09-17 11:59 AM MDT reached voicemail/IVR and did not reach a live person. No new information was gathered.",
+          "reason": "The follow-up call on 2026-09-17 03:17 PM MDT reached voicemail/IVR and did not reach a live person. No new information was gathered.",
           "scheduled_for": null,
           "contact_role": "office manager",
           "contact_name": null,
@@ -280,10 +281,10 @@
           "follow_up_goal": "Gauge further interest, offer demo, and answer questions about Lynkflow.",
           "agent_summary": "No live contact on this attempt; reached voicemail/IVR. Previous attempts reached the office manager, who confirmed the correct email address and requested the information be resent. Prospect has not confirmed receipt of the email.",
           "context_summary": "Multiple follow-ups reached the office manager. Email sent and resent from lynkflowagent@gmail.com to office.robertwilsonplumbing@gmail.com. Prospect has not confirmed receipt. No new contact name provided. No further questions or objections.",
-          "details": "[2026-09-17 11:59 AM MDT] Follow-up call reached voicemail/IVR; no live contact. No new information gathered. Previous history: Office manager acknowledged missed calls, confirmed email, requested info be resent, and confirmed address is correct. Prospect has not confirmed receipt of the email."
+          "details": "[2026-09-17 03:17 PM MDT] Follow-up call reached voicemail/IVR; no live contact. No new information gathered. Previous history: Office manager acknowledged missed calls, confirmed email, requested info be resent, and confirmed address is correct. Prospect has not confirmed receipt of the email."
         }
       },
-      "last_attempt_local_at": "2026-09-17T11:59:18-06:00",
+      "last_attempt_local_at": "2026-09-17T15:17:41-06:00",
       "attempt_history": [
         {
           "attempt": 1,
@@ -308,15 +309,30 @@
           "ended_at": "2026-09-18T01:59:42",
           "local_ended_at": "2026-09-17 11:59 AM MDT",
           "result": "Reached voicemail/IVR; no live contact."
+        },
+        {
+          "attempt": 3,
+          "call_id": "CAaaa99db690a6b9376c81d741eaa87624",
+          "started_at": "2026-09-18T05:17:41",
+          "local_started_at": "2026-09-17T15:17:41-06:00",
+          "status": "attempted",
+          "reason": "The follow-up call on 2026-09-17 03:17 PM MDT reached voicemail/IVR and did not reach a live person. No new information was gathered.",
+          "recording": "20260918_051802_Robert Wilson Plumbing Heating Air Conditi_663924_twilio.wav",
+          "ended_at": "2026-09-18T05:18:04",
+          "local_ended_at": "2026-09-17 03:17 PM MDT",
+          "result": "Reached voicemail/IVR; no live contact."
         }
       ],
-      "follow_up_recording": "20260918_015938_Robert Wilson Plumbing Heating Air Conditi_8596e5_twilio.wav",
+      "follow_up_recording": "20260918_051802_Robert Wilson Plumbing Heating Air Conditi_663924_twilio.wav",
       "follow_up_recordings": [
         "20260918_000955_Robert Wilson Plumbing Heating Air Conditi_e1d4dd.wav",
         "20260918_000959_Robert Wilson Plumbing Heating Air Conditi_5bb41b_twilio.wav",
         "20260918_001000_Robert Wilson Plumbing Heating Air Conditi_5bb41b_twilio.wav",
         "20260918_015935_Robert Wilson Plumbing Heating Air Conditi_8c654a.wav",
-        "20260918_015938_Robert Wilson Plumbing Heating Air Conditi_8596e5_twilio.wav"
+        "20260918_015938_Robert Wilson Plumbing Heating Air Conditi_8596e5_twilio.wav",
+        "20260918_051757_Robert Wilson Plumbing Heating Air Conditi_a87624.wav",
+        "20260918_051800_Robert Wilson Plumbing Heating Air Conditi_663924_twilio.wav",
+        "20260918_051802_Robert Wilson Plumbing Heating Air Conditi_663924_twilio.wav"
       ],
       "email_events": [
         {
@@ -336,6 +352,15 @@
           "prospect_reported_not_received": true,
           "details": "Sent from lynkflowagent@gmail.com to office.robertwilsonplumbing@gmail.com. Subject: Information from Lynkflow: Never Miss a Customer Call Again. Prospect requested the email be resent and confirmed the address.",
           "ts": "2026-09-18T01:59:42"
+        },
+        {
+          "type": "prospect_email_update",
+          "local_time": "2026-09-17 03:17 PM MDT",
+          "email_delivery_status": "email_sent",
+          "email_received": false,
+          "prospect_reported_not_received": true,
+          "details": "Sent from lynkflowagent@gmail.com to office.robertwilsonplumbing@gmail.com. Subject: Information from Lynkflow: Never Miss a Customer Call Again. Prospect requested the email be resent and confirmed the address.",
+          "ts": "2026-09-18T05:18:04"
         }
       ]
     },
@@ -904,6 +929,84 @@
           "previous_call_local_display": null,
           "scheduled_for": null,
           "previous_call_id": "CA6344bc03483509bd919dcc277ece3db3"
+        }
+      }
+    },
+    {
+      "id": "fu_3cc2f657658369b5",
+      "created_at": "2026-09-18T05:37:27",
+      "updated_at": "2026-09-18T05:37:27",
+      "status": "pending",
+      "priority": "warm",
+      "business": "Starfix Appliance Repair",
+      "phone": "+16022231312",
+      "contact_role": null,
+      "contact_name": "Sabah",
+      "previous_contact_role": null,
+      "previous_contact_name": "Sabah",
+      "current_contact_role": null,
+      "current_contact_name": null,
+      "email": null,
+      "previous_call_id": "CAff785db850ae80f203161b8fc1c2967a",
+      "previous_call_date": "2026-09-18T05:37:17",
+      "previous_call_local_date": null,
+      "previous_call_local_display": null,
+      "lead_timezone": null,
+      "lead_timezone_iana": null,
+      "previous_recording": "20260918_053721_Starfix Appliance Repair_231ee3_twilio.wav",
+      "pain_point": null,
+      "current_solution": null,
+      "interest_signal": "Contact offered callback and confirmed callback number.",
+      "previous_action": "Contact said decision maker is out of town and offered callback.",
+      "email_delivery_status": "unknown",
+      "email_received": false,
+      "prospect_reported_not_received": false,
+      "email_status_details": null,
+      "next_action": "Attempt to reach the decision maker when they return or follow up as instructed.",
+      "follow_up_goal": "Reach the decision maker to discuss the commercial opportunity.",
+      "agent_summary": "Spoke with Sabah, who stated the decision maker is out of town. Sabah offered to have them call back and confirmed the callback number. No pain points or solutions discussed. The goal is to reach the decision maker when available.",
+      "context_summary": "Contact Sabah answered, decision maker unavailable, callback offered.",
+      "details": "Spoke with Sabah (name provided). Sabah indicated the decision maker is out of town, confirmed callback number, and offered to have them call back. No commercial discussion occurred beyond arranging callback.",
+      "reason": "Contact offered to have the decision maker call back and confirmed callback number.",
+      "scheduled_for": null,
+      "attempts": 0,
+      "last_attempt_at": null,
+      "result": null,
+      "call_id": null,
+      "call_ids": [],
+      "analysis": {
+        "follow_up": {
+          "eligible": true,
+          "priority": "warm",
+          "reason": "Contact offered to have the decision maker call back and confirmed callback number.",
+          "business": "Starfix Appliance Repair",
+          "phone": "+16022231312",
+          "contact_role": null,
+          "contact_name": "Sabah",
+          "previous_contact_role": null,
+          "previous_contact_name": "Sabah",
+          "current_contact_role": null,
+          "current_contact_name": null,
+          "email": null,
+          "pain_point": null,
+          "current_solution": null,
+          "interest_signal": "Contact offered callback and confirmed callback number.",
+          "previous_action": "Contact said decision maker is out of town and offered callback.",
+          "email_delivery_status": "unknown",
+          "email_received": false,
+          "prospect_reported_not_received": false,
+          "email_status_details": null,
+          "next_action": "Attempt to reach the decision maker when they return or follow up as instructed.",
+          "follow_up_goal": "Reach the decision maker to discuss the commercial opportunity.",
+          "agent_summary": "Spoke with Sabah, who stated the decision maker is out of town. Sabah offered to have them call back and confirmed the callback number. No pain points or solutions discussed. The goal is to reach the decision maker when available.",
+          "context_summary": "Contact Sabah answered, decision maker unavailable, callback offered.",
+          "details": "Spoke with Sabah (name provided). Sabah indicated the decision maker is out of town, confirmed callback number, and offered to have them call back. No commercial discussion occurred beyond arranging callback.",
+          "lead_timezone": null,
+          "lead_timezone_iana": null,
+          "previous_call_local_date": null,
+          "previous_call_local_display": null,
+          "scheduled_for": null,
+          "previous_call_id": "CAff785db850ae80f203161b8fc1c2967a"
         }
       }
     }
